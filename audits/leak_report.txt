@@ -1,0 +1,17 @@
+=== Data Leakage / Alignment Checks ===
+data_root: databases
+xlsx: databases/video_databases.xlsx
+videos: 2100 | audios: 2100 | texts: 2100
+common(video,audio,text): 2099
+missing_video (in text not in video): 1
+missing_audio (in text not in audio): 1
+missing_text  (in video/audio not in text): 1
+conflicts (id with multiple labels across modalities/xlsx): 0
+label_mismatch (text label vs dir label): 0
+-- In text but missing video:
+  3677
+-- In text but missing audio:
+  3677
+-- In video/audio but missing text:
+  3667
+=== Done ===

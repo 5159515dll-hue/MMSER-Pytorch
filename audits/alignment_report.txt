@@ -1,0 +1,16 @@
+=== Batch Alignment Check (filesystem scan) ===
+data_root: databases
+videos: 2100 | audios: 2100 | texts: 2100
+common (video+audio+text): 2099
+batch_size (simulated): 16, batches: 132
+conflicts (same stem, multiple labels): 0
+missing_video (audio has, video missing): 0
+missing_audio (video has, audio missing): 0
+missing_text (video/audio has, text missing): 1
+text_only (only text, no video/audio): 1
+-- Missing text (show up to 20):
+  3667
+-- Text only (show up to 20):
+  3677
+text label mismatches vs video/audio: 0
+=== Done ===

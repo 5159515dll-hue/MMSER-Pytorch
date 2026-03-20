@@ -1,0 +1,38 @@
+=== Speaker Confound Audit ===
+xlsx: databases/video_databases.xlsx
+rows: 2100
+
+-- Label counts
+  angry: 300
+  surprise: 300
+  neutral: 300
+  disgusted: 300
+  happy: 300
+  sad: 300
+  fear: 300
+
+-- Speaker counts (inferred from label mapping)
+  A: 900
+  B: 600
+  C: 600
+
+-- Speaker -> labels
+  A: ['angry', 'fear', 'surprise']
+  B: ['disgusted', 'neutral']
+  C: ['happy', 'sad']
+
+-- Label -> speakers
+  angry: ['A']
+  disgusted: ['B']
+  fear: ['A']
+  happy: ['C']
+  neutral: ['B']
+  sad: ['C']
+  surprise: ['A']
+
+FINDING: Every emotion label is tied to exactly one speaker (speaker-confounded).
+Impact: Video-only/Audio-only accuracy can be near-perfect by recognizing the speaker, not emotion.
+Fix: Need multiple speakers per label (ideally each speaker covers all 7 labels), then do group split by speaker.
+
+fatal_confound: True
+=== Done ===
