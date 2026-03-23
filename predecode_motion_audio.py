@@ -41,7 +41,7 @@ _ensure_project_root_on_path()
 from prosody import ProsodyConfig, extract_prosody_features
 from audio_aug import normalize_wav
 from path_utils import default_databases_dir
-from video_motion import MotionConfig, RgbConfig, compute_face_flow_tensor, compute_face_rgb_tensor
+from video_motion import MotionConfig, RgbConfig, compute_face_flow_and_rgb_tensors, compute_face_flow_tensor, compute_face_rgb_tensor
 from manifest_utils import (
     detect_text_cue_flags as _detect_text_cue_flags,
     infer_speaker_id as _infer_speaker_id,
@@ -396,13 +396,20 @@ def _worker_process_one(
 
     flow = None
     rgb = None
-    if str(video_repr) in {"flow", "both"}:
+    if str(video_repr) == "both":
+        try:
+            flow_np, rgb_np = compute_face_flow_and_rgb_tensors(video_path, motion_cfg, rgb_cfg)
+            flow = torch.from_numpy(flow_np).to(torch.float16)
+            rgb = torch.from_numpy(rgb_np).to(torch.float16)
+        except Exception as e:
+            return {"ok": False, "error": f"video_error {type(e).__name__}: {e}", "seq": seq}
+    elif str(video_repr) == "flow":
         try:
             flow_np = compute_face_flow_tensor(video_path, motion_cfg)  # float32 (3,T-1,H,W)
             flow = torch.from_numpy(flow_np).to(torch.float16)
         except Exception as e:
             return {"ok": False, "error": f"flow_error {type(e).__name__}: {e}", "seq": seq}
-    if str(video_repr) in {"rgb", "both"}:
+    elif str(video_repr) == "rgb":
         try:
             rgb_np = compute_face_rgb_tensor(video_path, rgb_cfg)  # float32 (T,3,H,W)
             rgb = torch.from_numpy(rgb_np).to(torch.float16)
@@ -855,7 +862,23 @@ def main():
 
             flow = None
             rgb = None
-            if str(args.video_repr) in {"flow", "both"}:
+            if str(args.video_repr) == "both":
+                try:
+                    flow_np, rgb_np = compute_face_flow_and_rgb_tensors(video_path, motion_cfg, rgb_cfg)
+                    flow = torch.from_numpy(flow_np).to(torch.float16)
+                    rgb = torch.from_numpy(rgb_np).to(torch.float16)
+                except Exception as e:
+                    err = f"video_error {type(e).__name__}: {e}"
+                    missing.append(f"SKIP {seq}: {err}")
+                    skip_count += 1
+                    error_counts[err.split(":", 1)[0]] = error_counts.get(err.split(":", 1)[0], 0) + 1
+                    if _should_print_fail(idx):
+                        _log(f"{base_line} | SKIP stage={_err_stage(err)} | {err}")
+                    elif args.print_result not in {"fail", "all"}:
+                        if args.show_first_errors > 0 and skip_count <= int(args.show_first_errors):
+                            _log(f"{base_line} | SKIP stage={_err_stage(err)} | {err}")
+                    continue
+            elif str(args.video_repr) == "flow":
                 try:
                     flow_np = compute_face_flow_tensor(video_path, motion_cfg)  # float32
                     flow = torch.from_numpy(flow_np).to(torch.float16)  # 预缓存成 fp16，减小磁盘占用。
@@ -870,7 +893,7 @@ def main():
                         if args.show_first_errors > 0 and skip_count <= int(args.show_first_errors):
                             _log(f"{base_line} | SKIP stage={_err_stage(err)} | {err}")
                     continue
-            if str(args.video_repr) in {"rgb", "both"}:
+            elif str(args.video_repr) == "rgb":
                 try:
                     rgb_np = compute_face_rgb_tensor(video_path, rgb_cfg)  # float32
                     rgb = torch.from_numpy(rgb_np).to(torch.float16)

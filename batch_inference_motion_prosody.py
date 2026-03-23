@@ -50,7 +50,7 @@ from models import FusionClassifier
 from path_utils import default_databases_dir, default_xlsx_path
 from prosody import ProsodyConfig, extract_prosody_features
 from predecode_motion_audio import load_audio
-from video_motion import MotionConfig, RgbConfig, compute_face_flow_tensor, compute_face_rgb_tensor
+from video_motion import MotionConfig, RgbConfig, compute_face_flow_and_rgb_tensors, compute_face_flow_tensor, compute_face_rgb_tensor
 
 
 def _read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
@@ -1160,10 +1160,14 @@ def main() -> None:
                             )
                     else:
                         assert video_path is not None
-                        if str(video_backbone) in {"videomae", "dual"}:
+                        if str(video_backbone) == "dual":
+                            flow_np, rgb_np = compute_face_flow_and_rgb_tensors(video_path, motion_cfg, rgb_cfg)
+                            rgb = torch.from_numpy(rgb_np).unsqueeze(0).to(torch.float32)
+                            flow = torch.from_numpy(flow_np).unsqueeze(0).to(torch.float32)
+                        elif str(video_backbone) == "videomae":
                             rgb_np = compute_face_rgb_tensor(video_path, rgb_cfg)
                             rgb = torch.from_numpy(rgb_np).unsqueeze(0).to(torch.float32)
-                        if str(video_backbone) in {"flow", "dual"}:
+                        elif str(video_backbone) == "flow":
                             flow_np = compute_face_flow_tensor(video_path, motion_cfg)
                             flow = torch.from_numpy(flow_np).unsqueeze(0).to(torch.float32)
 

@@ -33,6 +33,27 @@ class RgbConfig:
     rgb_size: int = 224
 
 
+def _resolve_haar_cascade(cascade: Optional[cv2.CascadeClassifier] = None) -> cv2.CascadeClassifier:
+    """构造 Haar 人脸检测器。"""
+
+    if cascade is not None:
+        return cascade
+    haar_root = getattr(getattr(cv2, "data", None), "haarcascades", "")
+    if not haar_root:
+        haar_root = str(Path(cv2.__file__).resolve().parent / "data" / "haarcascades")
+    return cv2.CascadeClassifier(str(Path(haar_root) / "haarcascade_frontalface_default.xml"))
+
+
+def _fallback_face_box(frame_bgr: np.ndarray) -> Tuple[int, int, int, int]:
+    """在人脸检测失败时退回到中心裁剪框。"""
+
+    h, w = frame_bgr.shape[:2]
+    side = int(min(h, w) * 0.8)
+    x = (w - side) // 2
+    y = (h - side) // 2
+    return (x, y, side, side)
+
+
 def _read_video_frames_cv2(path: Path) -> List[np.ndarray]:
     """用 OpenCV 读取整段视频帧。
 
@@ -101,12 +122,7 @@ def compute_face_flow_tensor(
 
     Channels: u, v, magnitude. Flow is computed on grayscale cropped face.
     """
-    # cv2.data is available at runtime, but some type checkers don't know it.
-    haar_root = getattr(getattr(cv2, "data", None), "haarcascades", "")
-    if not haar_root:
-        # Best-effort fallback; may be empty depending on OpenCV build.
-        haar_root = str(Path(cv2.__file__).resolve().parent / "data" / "haarcascades")
-    cascade = cascade or cv2.CascadeClassifier(str(Path(haar_root) / "haarcascade_frontalface_default.xml"))
+    cascade = _resolve_haar_cascade(cascade)
     frames = _read_video_frames_cv2(video_path)
     if not frames:
         # return zeros
@@ -117,12 +133,7 @@ def compute_face_flow_tensor(
 
     first_box = _detect_face_box_haar(sampled[0], cascade)
     if first_box is None:
-        # fall back to center crop
-        h, w = sampled[0].shape[:2]
-        side = int(min(h, w) * 0.8)
-        x = (w - side) // 2
-        y = (h - side) // 2
-        first_box = (x, y, side, side)
+        first_box = _fallback_face_box(sampled[0])
 
     # 这里只在首帧做人脸检测，后续沿用同一个框。
     # 这样虽然不如逐帧跟踪精细，但计算稳定、成本低，也避免人脸框抖动反而污染光流。
@@ -173,10 +184,7 @@ def compute_face_rgb_tensor(
     - Frames are face-cropped using Haar cascade, then resized to (rgb_size, rgb_size).
     - Pixel values are scaled to [0, 1]. Normalization is handled in the model.
     """
-    haar_root = getattr(getattr(cv2, "data", None), "haarcascades", "")
-    if not haar_root:
-        haar_root = str(Path(cv2.__file__).resolve().parent / "data" / "haarcascades")
-    cascade = cascade or cv2.CascadeClassifier(str(Path(haar_root) / "haarcascade_frontalface_default.xml"))
+    cascade = _resolve_haar_cascade(cascade)
 
     frames = _read_video_frames_cv2(video_path)
     if not frames:
@@ -187,11 +195,7 @@ def compute_face_rgb_tensor(
 
     first_box = _detect_face_box_haar(sampled[0], cascade)
     if first_box is None:
-        h, w = sampled[0].shape[:2]
-        side = int(min(h, w) * 0.8)
-        x = (w - side) // 2
-        y = (h - side) // 2
-        first_box = (x, y, side, side)
+        first_box = _fallback_face_box(sampled[0])
 
     # 与光流分支保持同样的人脸框来源，减少两路视频表征的空间错位。
     face_imgs = [_crop_and_resize(f, first_box, cfg.rgb_size) for f in sampled]
@@ -199,3 +203,66 @@ def compute_face_rgb_tensor(
     rgb = np.stack(rgb_frames, axis=0).astype(np.float32) / 255.0  # (T,H,W,3)
     rgb = np.transpose(rgb, (0, 3, 1, 2))  # (T,3,H,W)
     return rgb
+
+
+def compute_face_flow_and_rgb_tensors(
+    video_path: Path,
+    motion_cfg: MotionConfig,
+    rgb_cfg: RgbConfig,
+    cascade: Optional[cv2.CascadeClassifier] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """一次解码同时生成 flow 与 RGB，避免 `both` 模式重复读视频。"""
+
+    cascade = _resolve_haar_cascade(cascade)
+    frames = _read_video_frames_cv2(video_path)
+    if not frames:
+        flow = np.zeros((3, motion_cfg.num_frames - 1, motion_cfg.flow_size, motion_cfg.flow_size), dtype=np.float32)
+        rgb = np.zeros((rgb_cfg.num_frames, 3, rgb_cfg.rgb_size, rgb_cfg.rgb_size), dtype=np.float32)
+        return flow, rgb
+
+    first_box = _detect_face_box_haar(frames[0], cascade)
+    if first_box is None:
+        first_box = _fallback_face_box(frames[0])
+
+    flow_idxs = _select_indices(len(frames), motion_cfg.num_frames)
+    rgb_idxs = flow_idxs if motion_cfg.num_frames == rgb_cfg.num_frames else _select_indices(len(frames), rgb_cfg.num_frames)
+
+    flow_sampled = [frames[i] for i in flow_idxs]
+    rgb_sampled = flow_sampled if flow_idxs == rgb_idxs else [frames[i] for i in rgb_idxs]
+
+    flow_faces = [_crop_and_resize(f, first_box, motion_cfg.flow_size) for f in flow_sampled]
+    rgb_faces = [_crop_and_resize(f, first_box, rgb_cfg.rgb_size) for f in rgb_sampled]
+
+    grays = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in flow_faces]
+    flows = []
+    for t in range(1, len(grays)):
+        prev = grays[t - 1]
+        nxt = grays[t]
+        flow = cv2.calcOpticalFlowFarneback(
+            prev,
+            nxt,
+            None,
+            pyr_scale=0.5,
+            levels=3,
+            winsize=15,
+            iterations=3,
+            poly_n=5,
+            poly_sigma=1.2,
+            flags=0,
+        )
+        u = flow[..., 0]
+        v = flow[..., 1]
+        mag = np.sqrt(u * u + v * v)
+        flows.append(np.stack([u, v, mag], axis=0))
+
+    flow_out = np.stack(flows, axis=1).astype(np.float32)
+    mag = flow_out[2]
+    scale = np.percentile(np.abs(mag), 95)
+    if scale and scale > 1e-6:
+        flow_out = flow_out / float(scale)
+    flow_out = np.clip(flow_out, -5.0, 5.0)
+
+    rgb_frames = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in rgb_faces]
+    rgb_out = np.stack(rgb_frames, axis=0).astype(np.float32) / 255.0
+    rgb_out = np.transpose(rgb_out, (0, 3, 1, 2))
+    return flow_out, rgb_out
