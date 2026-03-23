@@ -157,6 +157,39 @@ def infer_speaker_id(label_en: str | None) -> str:
     return "UNKNOWN"
 
 
+def _ensure_text_control_fields(item: dict[str, Any]) -> dict[str, Any]:
+    """Backfill prompt/text-control fields for older manifests.
+
+    Scientific evaluation may run against manifests created before these fields
+    were introduced. Rebuilding a 2k-sample manifest is cheap, but rebuilding on
+    a remote machine is still unnecessary churn, so we derive missing fields
+    lazily when they are absent.
+    """
+
+    enriched = dict(item)
+    label_raw = str(enriched.get("label_raw") or "")
+    label_en = str(enriched.get("label_en") or "")
+    mn = str(enriched.get("mn") or "")
+    zh = str(enriched.get("zh") or "")
+    cue_details = enriched.get("text_cue_details") or {}
+
+    if not enriched.get("masked_mn"):
+        enriched["masked_mn"] = mask_emotion_cues(mn, label_raw=label_raw, label_en=label_en)
+    if not enriched.get("masked_zh"):
+        enriched["masked_zh"] = mask_emotion_cues(zh, label_raw=label_raw, label_en=label_en)
+    if not enriched.get("normalized_mn"):
+        enriched["normalized_mn"] = normalize_text_for_grouping(mn)
+    if not enriched.get("normalized_zh"):
+        enriched["normalized_zh"] = normalize_text_for_grouping(zh)
+    if not enriched.get("prompt_group_text"):
+        enriched["prompt_group_text"] = build_prompt_group_text(mn, zh, label_raw=label_raw, label_en=label_en)
+    if not enriched.get("prompt_group_id"):
+        enriched["prompt_group_id"] = build_prompt_group_id(mn, zh, label_raw=label_raw, label_en=label_en)
+    if not enriched.get("cue_severity"):
+        enriched["cue_severity"] = derive_cue_severity(cue_details)
+    return enriched
+
+
 def resolve_task_mode(task_mode: str | None) -> str:
     """规范化任务模式字符串。"""
 
@@ -436,6 +469,7 @@ def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
     usable_count = 0
     raw_usable_count = 0
     for item in items:
+        item = _ensure_text_control_fields(item)
         label_en = item.get("label_en")
         speaker_id = item.get("speaker_id", "UNKNOWN")
         split = item.get("split", "excluded")
@@ -615,8 +649,9 @@ def _group_items_by_key(items: list[dict[str, Any]], group_key: str) -> list[lis
 
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in items:
-        key = str(item.get(group_key, "") or item.get("seq", ""))
-        buckets[key].append(item)
+        enriched = _ensure_text_control_fields(item)
+        key = str(enriched.get(group_key, "") or enriched.get("seq", ""))
+        buckets[key].append(enriched)
     groups = list(buckets.values())
     groups.sort(key=lambda bucket: (str(bucket[0].get(group_key, "")), str(bucket[0].get("seq", ""))))
     return groups
@@ -670,11 +705,14 @@ def resolve_grouped_cv_splits(
         best_fold = 0
         best_score: tuple[float, int, int] | None = None
         for fold_idx in range(feasible_splits):
-            score_balance = 0.0
+            score_load = 0.0
             for label in label_names:
+                target = max(float(target_per_fold.get(label, 0.0)), 1.0)
                 after = fold_counts[fold_idx].get(label, 0) + group_counts.get(label, 0)
-                score_balance += (after - target_per_fold.get(label, 0.0)) ** 2
-            score = (score_balance, fold_sizes[fold_idx] + len(group), fold_idx)
+                # Lower is better: assign the next group to the fold that is
+                # currently *least filled* for the labels carried by this group.
+                score_load += (after / target) ** 2
+            score = (score_load, fold_sizes[fold_idx] + len(group), fold_idx)
             if best_score is None or score < best_score:
                 best_score = score
                 best_fold = fold_idx
@@ -722,7 +760,7 @@ def build_manifest_from_split_items(
 
     derived_items: list[dict[str, Any]] = []
     for item in base_manifest.get("items", []):
-        copied = dict(item)
+        copied = _ensure_text_control_fields(item)
         seq = str(copied.get("seq", ""))
         if seq in train_ids:
             copied["split"] = "train"

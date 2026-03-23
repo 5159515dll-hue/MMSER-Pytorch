@@ -299,6 +299,7 @@ def main() -> None:
                         validity = metrics.get("validity", {})
                         run_rows.append(
                             {
+                                "task_mode": "within_speaker",
                                 "speaker_id": speaker_id,
                                 "text_policy": text_policy,
                                 "ablation": ablation,
@@ -328,6 +329,7 @@ def main() -> None:
             cwd=repo_root,
         )
         auxiliary_report = {
+            "task_mode": "confounded_7way",
             "run_dir": str(aux_run_dir),
             "best_f1": float(aux_metrics.get("best", {}).get("best_f1", 0.0)),
             "best_acc": float(aux_metrics.get("best", {}).get("best_acc", 0.0)),
@@ -351,6 +353,8 @@ def main() -> None:
         comparison_report = str(out_dir / "comparison_mmsa_am" / "comparison_report.json")
 
     aggregated = _aggregate_runs(run_rows)
+    primary = aggregated.get("primary") or {}
+    secondary = aggregated.get("secondary") or {}
     suite_summary = {
         "suite": {
             "split_manifest": str(args.split_manifest.expanduser()),
@@ -364,6 +368,8 @@ def main() -> None:
             "group_key": str(args.group_key),
             "seed": int(args.seed),
         },
+        "primary_mean_macro_f1": primary.get("speaker_mean_macro_f1"),
+        "secondary_mean_macro_f1": secondary.get("speaker_mean_macro_f1"),
         "runs": run_rows,
         "aggregated": aggregated,
         "auxiliary_confounded_7way": auxiliary_report,
