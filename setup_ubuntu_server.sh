@@ -13,6 +13,7 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+BASE_PYTHON_BIN="${BASE_PYTHON_BIN:-$PYTHON_BIN}"
 INSTALL_LEGACY_EXTRAS="${INSTALL_LEGACY_EXTRAS:-1}"
 TRY_INSTALL_DECORD="${TRY_INSTALL_DECORD:-1}"
 UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-0}"
@@ -49,11 +50,51 @@ if [ "$USE_VENV" = "1" ] && [ "$BOOTSTRAPPED_VENV" != "1" ]; then
     log "Creating isolated virtualenv at $VENV_DIR (inherits system PyTorch via --system-site-packages)"
     "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
   fi
+  BASE_SITE_PATHS="$("$BASE_PYTHON_BIN" - <<'PY'
+import os
+import site
+import sys
+
+paths = []
+for getter in (getattr(site, "getsitepackages", None), getattr(site, "getusersitepackages", None)):
+    if getter is None:
+        continue
+    try:
+        value = getter()
+    except Exception:
+        continue
+    if isinstance(value, str):
+        value = [value]
+    for item in value:
+        if item and os.path.isdir(item):
+            paths.append(os.path.realpath(item))
+
+for item in sys.path:
+    if item and any(tag in item for tag in ("site-packages", "dist-packages")) and os.path.isdir(item):
+        paths.append(os.path.realpath(item))
+
+seen = []
+for item in paths:
+    if item not in seen:
+        seen.append(item)
+
+print("\n".join(seen))
+PY
+)"
+  VENV_PURELIB="$("$VENV_DIR/bin/python" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)"
+  if [ -n "$BASE_SITE_PATHS" ]; then
+    printf '%s\n' "$BASE_SITE_PATHS" > "$VENV_PURELIB/_base_site_paths.pth"
+  fi
   log "Re-entering setup inside virtualenv: $VENV_DIR"
   exec env \
     BOOTSTRAPPED_VENV=1 \
     USE_VENV=1 \
     VENV_DIR="$VENV_DIR" \
+    BASE_PYTHON_BIN="$BASE_PYTHON_BIN" \
     INSTALL_LEGACY_EXTRAS="$INSTALL_LEGACY_EXTRAS" \
     TRY_INSTALL_DECORD="$TRY_INSTALL_DECORD" \
     UPGRADE_PIP_TOOLS="$UPGRADE_PIP_TOOLS" \
@@ -77,7 +118,8 @@ if missing:
     raise SystemExit(
         "Missing preinstalled PyTorch runtime: "
         + ", ".join(missing)
-        + ". This script intentionally does not install torch itself."
+        + ". This script intentionally does not install torch itself. "
+        + "If the server provides torch globally, remove the venv and rerun the script after updating it."
     )
 print("torch runtime detected")
 PY
