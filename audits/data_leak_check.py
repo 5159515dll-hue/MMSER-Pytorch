@@ -6,6 +6,19 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_REPO_ROOT = _ensure_repo_root_on_path()
+
+from path_utils import default_databases_dir, default_xlsx_path
+
 EMOTIONS = ["angry", "disgusted", "fear", "happy", "neutral", "sad", "surprise"]
 
 
@@ -24,8 +37,8 @@ ZH2EN = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Data leakage / alignment checks")
-    p.add_argument("--data-root", type=Path, default=Path("databases"))
-    p.add_argument("--xlsx", type=Path, default=Path("databases/video_databases.xlsx"))
+    p.add_argument("--data-root", type=Path, default=default_databases_dir(_REPO_ROOT))
+    p.add_argument("--xlsx", type=Path, default=default_xlsx_path(_REPO_ROOT, "video_databases.xlsx"))
     p.add_argument(
         "--report",
         type=Path,
@@ -176,7 +189,7 @@ def main() -> None:
 ID 唯一性与跨模态标签冲突（视频/音频/文本）
 视频/音频/文本的缺失情况
 xlsx 中的标签与目录标签是否一致
-默认读取：--data-root databases，--xlsx databases/video_databases.xlsx
+默认读取：优先仓库内 databases；若不存在则回退到仓库同级 ../databases
 运行示例（在项目根目录）：
 输出会包含：样本数、交集数、缺失列表（截取最多 20 条）、标签冲突/不一致明细等
 """

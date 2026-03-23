@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -19,7 +20,7 @@ CN_TO_EN = {
 
 def parse_args():
     p = argparse.ArgumentParser(description="Batch-level modality alignment check (filesystem + optional text_map JSON/XLSX)")
-    p.add_argument("--data-root", type=Path, default=Path("databases"))
+    p.add_argument("--data-root", type=Path, default=default_databases_dir(_REPO_ROOT))
     p.add_argument("--text-map", type=Path, default=None, help="Optional text_map JSON or XLSX (stem -> text)")
     p.add_argument("--batch-size", type=int, default=16, help="Batch size for simulated grouping")
     p.add_argument("--report", type=Path, default=None, help="Optional report path")
@@ -191,3 +192,15 @@ def main():
 """
 if __name__ == "__main__":
     main()
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_REPO_ROOT = _ensure_repo_root_on_path()
+
+from path_utils import default_databases_dir

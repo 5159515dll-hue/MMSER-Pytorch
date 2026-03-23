@@ -1,12 +1,26 @@
 import argparse
 import warnings
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_REPO_ROOT = _ensure_repo_root_on_path()
+
+from path_utils import default_xlsx_path
 
 from src.config import DEFAULT_CONFIG, EMOTIONS
 from src.data.dataset import MultiModalEmotionDataset
@@ -67,7 +81,11 @@ def parse_args():
     cfg = DEFAULT_CONFIG
     parser = argparse.ArgumentParser(description="Pre-decode dataset and save to disk")
     parser.add_argument("--data-root", default=cfg.data.data_root)
-    parser.add_argument("--xlsx", default="databases/视频数据集对应文档.xlsx", help="Excel with columns 序号/蒙文/中文/情感类别")
+    parser.add_argument(
+        "--xlsx",
+        default=default_xlsx_path(_REPO_ROOT, "视频数据集对应文档.xlsx", "video_databases.xlsx"),
+        help="Excel with columns 序号/蒙文/中文/情感类别",
+    )
     parser.add_argument("--output", default=None, help="Output .pt path; default auto under outputs/predecoded")
     parser.add_argument("--text-map", type=Path, default=None)
     parser.add_argument("--num-frames", type=int, default=cfg.data.num_frames)

@@ -18,14 +18,16 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from manifest_utils import build_split_manifest
+from path_utils import default_databases_dir, default_xlsx_path
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
 
+    repo_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Build a split manifest for motion_prosody experiments")
-    parser.add_argument("--data-root", type=Path, default=Path("databases"))
-    parser.add_argument("--xlsx", type=Path, default=Path("databases/video_databases.xlsx"))
+    parser.add_argument("--data-root", type=Path, default=default_databases_dir(repo_root))
+    parser.add_argument("--xlsx", type=Path, default=default_xlsx_path(repo_root, "video_databases.xlsx"))
     parser.add_argument(
         "--output",
         type=Path,

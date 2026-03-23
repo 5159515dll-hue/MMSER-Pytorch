@@ -1,5 +1,20 @@
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
+
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[3]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_REPO_ROOT = _ensure_repo_root_on_path()
+
+from path_utils import default_databases_dir
 
 
 EMOTIONS: List[str] = [
@@ -15,7 +30,7 @@ EMOTIONS: List[str] = [
 
 @dataclass
 class DataConfig:
-    data_root: str = "databases"
+    data_root: str = field(default_factory=lambda: str(default_databases_dir(_REPO_ROOT)))
     num_frames: int = 16
     frame_strategy: str = "random"  # random | uniform
     sample_rate: int = 16000

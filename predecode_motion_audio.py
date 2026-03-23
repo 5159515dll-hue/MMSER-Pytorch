@@ -40,6 +40,7 @@ _ensure_project_root_on_path()
 
 from prosody import ProsodyConfig, extract_prosody_features
 from audio_aug import normalize_wav
+from path_utils import default_databases_dir
 from video_motion import MotionConfig, RgbConfig, compute_face_flow_tensor, compute_face_rgb_tensor
 from manifest_utils import (
     detect_text_cue_flags as _detect_text_cue_flags,
@@ -153,8 +154,9 @@ def _normalize_seq(raw: Any) -> str:
 def parse_args():
     """解析预解码命令行参数。"""
 
+    repo_root = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(description="Predecode motion(flow) / rgb + audio + prosody into shards")
-    p.add_argument("--data-root", type=Path, default=Path("databases"))
+    p.add_argument("--data-root", type=Path, default=default_databases_dir(repo_root))
     p.add_argument("--xlsx", type=Path, required=True)
     p.add_argument("--num-frames", type=int, default=64)
     p.add_argument("--flow-size", type=int, default=112)

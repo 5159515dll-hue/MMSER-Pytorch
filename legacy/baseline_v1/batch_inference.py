@@ -1,11 +1,25 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import torch
 from transformers import AutoTokenizer
+
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_REPO_ROOT = _ensure_repo_root_on_path()
+
+from path_utils import default_databases_dir, default_xlsx_path
 
 from src.config import DEFAULT_CONFIG, EMOTIONS
 from src.data.dataset import MultiModalEmotionDataset
@@ -69,13 +83,13 @@ def _paths_for_seq(data_root: Path, label_en: str, seq: str) -> Tuple[Optional[P
 def parse_args() -> argparse.Namespace:
     cfg = DEFAULT_CONFIG
     p = argparse.ArgumentParser(
-        description="Batch inference from databases/video_databases.xlsx (序号/蒙文/中文/情感类别)"
+        description="Batch inference from the dataset XLSX (序号/蒙文/中文/情感类别)"
     )
-    p.add_argument("--data-root", type=Path, default=Path("databases"))
+    p.add_argument("--data-root", type=Path, default=default_databases_dir(_REPO_ROOT))
     p.add_argument(
         "--xlsx",
         type=Path,
-        default=Path("databases/video_databases.xlsx"),
+        default=default_xlsx_path(_REPO_ROOT, "video_databases.xlsx"),
         help="Excel path with columns: 序号/蒙文/中文/情感类别",
     )
     p.add_argument(

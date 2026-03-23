@@ -47,6 +47,7 @@ from manifest_utils import (
 )
 from metrics_utils import classification_summary, speaker_majority_baseline
 from models import FusionClassifier
+from path_utils import default_databases_dir, default_xlsx_path
 from prosody import ProsodyConfig, extract_prosody_features
 from predecode_motion_audio import load_audio
 from video_motion import MotionConfig, RgbConfig, compute_face_flow_tensor, compute_face_rgb_tensor
@@ -117,11 +118,12 @@ def _paths_for_seq(data_root: Path, label_en: str, seq: str) -> Tuple[Optional[P
 def parse_args() -> argparse.Namespace:
     """解析批量推理命令行参数。"""
 
+    repo_root = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(
         description="Batch inference for motion_prosody (flow/rgb + audio + prosody) from XLSX (序号/蒙文/中文/情感类别)"
     )
-    p.add_argument("--data-root", type=Path, default=Path("databases"))
-    p.add_argument("--xlsx", type=Path, default=Path("databases/video_databases.xlsx"))
+    p.add_argument("--data-root", type=Path, default=default_databases_dir(repo_root))
+    p.add_argument("--xlsx", type=Path, default=default_xlsx_path(repo_root, "video_databases.xlsx"))
     p.add_argument(
         "--split-manifest",
         type=Path,
