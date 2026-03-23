@@ -63,6 +63,7 @@ from manifest_utils import (
     resolve_paths_for_seq as _shared_resolve_paths_for_seq,
     select_manifest_items,
 )
+from text_policy_utils import build_prompt_group_id, derive_cue_severity, mask_emotion_cues
 
 
 CN_TO_EN = {
@@ -479,6 +480,9 @@ def _worker_process_one(
     mn = str(task.get("mn", ""))
     speaker_id = str(task.get("speaker_id", "UNKNOWN"))
     text_cue_flag = bool(task.get("text_cue_flag", False))
+    cue_severity = str(task.get("cue_severity", "none"))
+    prompt_group_id = str(task.get("prompt_group_id", ""))
+    masked_mn = str(task.get("masked_mn", ""))
     intensity = task.get("intensity", None)
     video_path = Path(task["video_path"])
     audio_path = Path(task["audio_path"])
@@ -538,8 +542,11 @@ def _worker_process_one(
         "label": torch.tensor(label, dtype=torch.long),
         "stem": seq,
         "mn": mn,
+        "masked_mn": masked_mn,
         "speaker_id": speaker_id,
         "text_cue_flag": text_cue_flag,
+        "cue_severity": cue_severity,
+        "prompt_group_id": prompt_group_id,
         "intensity": torch.tensor(float(intensity), dtype=torch.float32) if intensity is not None else torch.tensor(float("nan"), dtype=torch.float32),
     }
     if str(audio_repr) in {"raw", "both"}:
@@ -621,6 +628,9 @@ def main():
                     "intensity": _parse_intensity(item.get("intensity", None)),
                     "speaker_id": str(item.get("speaker_id", _infer_speaker_id(label_name))),
                     "text_cue_flag": bool(item.get("text_cue_flag", False)),
+                    "cue_severity": str(item.get("cue_severity", "none")),
+                    "prompt_group_id": str(item.get("prompt_group_id", "")),
+                    "masked_mn": str(item.get("masked_mn", "") or "").strip(),
                     "video_path": str(item.get("video_path")) if item.get("video_path") else None,
                     "audio_path": str(item.get("audio_path")) if item.get("audio_path") else None,
                     "split": str(item.get("split", "")),
@@ -651,6 +661,9 @@ def main():
                     "intensity": intensity,
                     "speaker_id": _infer_speaker_id(label_name),
                     "text_cue_flag": any(_detect_text_cue_flags(mn, zh, label_raw).values()),
+                    "cue_severity": derive_cue_severity(_detect_text_cue_flags(mn, zh, label_raw)),
+                    "prompt_group_id": build_prompt_group_id(mn, zh, label_raw=label_raw, label_en=label_name),
+                    "masked_mn": mask_emotion_cues(mn, label_raw=label_raw, label_en=label_name),
                     "video_path": None,
                     "audio_path": None,
                     "split": "",
@@ -707,8 +720,11 @@ def main():
                 "label_name": item.get("label_name", emotion),
                 "emotion": emotion,
                 "mn": item.get("mn", ""),
+                "masked_mn": item.get("masked_mn", ""),
                 "speaker_id": item.get("speaker_id", "UNKNOWN"),
                 "text_cue_flag": bool(item.get("text_cue_flag", False)),
+                "cue_severity": str(item.get("cue_severity", "none")),
+                "prompt_group_id": str(item.get("prompt_group_id", "")),
                 "intensity": item.get("intensity", None),
                 "video_path": str(video_path),
                 "audio_path": str(audio_path),
@@ -1126,8 +1142,11 @@ def main():
                 "label": torch.tensor(label, dtype=torch.long),
                 "stem": seq,
                 "mn": str(task.get("mn", "")),
+                "masked_mn": str(task.get("masked_mn", "")),
                 "speaker_id": str(task.get("speaker_id", "UNKNOWN")),
                 "text_cue_flag": bool(task.get("text_cue_flag", False)),
+                "cue_severity": str(task.get("cue_severity", "none")),
+                "prompt_group_id": str(task.get("prompt_group_id", "")),
                 "intensity": torch.tensor(float(task.get("intensity")), dtype=torch.float32)
                 if task.get("intensity", None) is not None
                 else torch.tensor(float("nan"), dtype=torch.float32),

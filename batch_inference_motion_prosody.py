@@ -67,6 +67,7 @@ from runtime_adapt import (
     resolve_worker_count,
     select_device,
 )
+from text_policy_utils import resolve_text_policy, select_text_for_policy
 from video_motion import MotionConfig, RgbConfig, compute_face_flow_and_rgb_tensors, compute_face_flow_tensor, compute_face_rgb_tensor
 
 
@@ -178,6 +179,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="default",
         help="Free-form benchmark name recorded in metrics output",
+    )
+    p.add_argument(
+        "--text-policy",
+        type=str,
+        default="full",
+        choices=["full", "mask_emotion_cues", "drop"],
+        help="How text should be exposed to the model: full text, masked cues, or dropped entirely.",
     )
     p.add_argument(
         "--cached-dataset",
@@ -409,6 +417,7 @@ def _load_model(
     gate_scale = 1.0
     delta_scale = 1.0
     modality_dropout = 0.0
+    text_policy = "full"
     use_intensity = False
     if isinstance(ckpt, dict):
         ckpt_args = ckpt.get("args", None)
@@ -454,6 +463,9 @@ def _load_model(
             tm_speaker = ckpt_args.get("speaker_id", "")
             if isinstance(tm_speaker, str) and tm_speaker.strip():
                 task_speaker_id = tm_speaker.strip().upper()
+            tp = ckpt_args.get("text_policy", "")
+            if isinstance(tp, str) and tp.strip():
+                text_policy = tp.strip()
         if isinstance(ckpt.get("label_names"), list) and ckpt.get("label_names"):
             label_names = [str(x) for x in ckpt.get("label_names")]
         validity_obj = ckpt.get("validity", None)
@@ -469,6 +481,8 @@ def _load_model(
         audio_model_revision = str(args.audio_model_revision).strip()
     if isinstance(getattr(args, "task_mode", ""), str) and str(args.task_mode).strip():
         task_mode = str(args.task_mode).strip()
+    if isinstance(getattr(args, "text_policy", ""), str) and str(args.text_policy).strip():
+        text_policy = str(args.text_policy).strip()
     if isinstance(getattr(args, "speaker_id", ""), str) and str(args.speaker_id).strip():
         task_speaker_id = str(args.speaker_id).strip().upper()
     if isinstance(getattr(args, "video_backbone", ""), str) and str(args.video_backbone).strip():
@@ -488,6 +502,7 @@ def _load_model(
 
     # 推理阶段不关心 requires_grad，但某些编码器初始化路径仍然需要 freeze 参数。
     task_mode = resolve_task_mode(task_mode)
+    args.text_policy = resolve_text_policy(text_policy)
     normalized_speaker_id = str(task_speaker_id).strip().upper() if task_speaker_id is not None and str(task_speaker_id).strip() else None
     if not label_names or label_names == list(EMOTIONS):
         label_names = resolve_task_label_names(task_mode, normalized_speaker_id)
@@ -729,8 +744,17 @@ def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_le
         return
     if all("_text_input_ids" in s and "_text_attention_mask" in s for s in ds.samples):
         return
+    text_policy = resolve_text_policy(getattr(tokenizer, "_motion_text_policy", "full"))
     enc = tokenizer(
-        [str(s.get("mn", "")) for s in ds.samples],
+        [
+            select_text_for_policy(
+                full_text=str(s.get("mn", "")),
+                masked_text=str(s.get("masked_mn", "")),
+                label_en=str(s.get("_global_label_en", "")) or None,
+                policy=text_policy,
+            )
+            for s in ds.samples
+        ],
         padding="max_length",
         truncation=True,
         max_length=int(max_text_len),
@@ -897,7 +921,15 @@ def _run_cached_batched(
                 text_inputs = {k: v.to(device, non_blocking=nb) for k, v in text_inputs.items()}
             elif text_emb is None and not bool(args.zero_text):
                 text_inputs = tokenizer(
-                    [str(x) for x in batch.get("mn", [])],
+                    [
+                        select_text_for_policy(
+                            full_text=str(batch.get("mn", [])[i]),
+                            masked_text=str(batch.get("masked_mn", [""] * len(batch.get("mn", [])))[i]),
+                            label_en=str(batch.get("_global_label_en", [""] * len(batch.get("mn", [])))[i]) or None,
+                            policy=str(args.text_policy),
+                        )
+                        for i in range(len(batch.get("mn", [])))
+                    ],
                     padding=True,
                     truncation=True,
                     max_length=int(args.max_text_len),
@@ -1058,6 +1090,7 @@ def main() -> None:
     """
 
     args = parse_args()
+    args.text_policy = resolve_text_policy(args.text_policy)
 
     data_root = args.data_root.expanduser()
     xlsx = args.xlsx.expanduser()
@@ -1077,6 +1110,8 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     zero_video, zero_audio, zero_text = _resolve_ablation_flags(args)
+    if str(args.text_policy) == "drop":
+        zero_text = True
     args.zero_video = zero_video
     args.zero_audio = zero_audio
     args.zero_text = zero_text
@@ -1172,6 +1207,7 @@ def main() -> None:
         if not text_model_name:
             text_model_name = "bert-base-multilingual-cased"
         tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+        setattr(tokenizer, "_motion_text_policy", str(args.text_policy))
 
     print(
         json.dumps(
@@ -1245,6 +1281,14 @@ def main() -> None:
         if cached_input is not None:
             ds = cached_ds if cached_ds is not None else CachedMotionAudioDataset(cached_input)
             label_names = _prepare_cached_dataset_for_task(ds, task_mode, task_speaker_id)
+            feature_cfg = ds.config.get("feature_cache", {}) if isinstance(ds.config, dict) else {}
+            cached_text_policy = str(feature_cfg.get("text_policy", "") or "").strip().lower()
+            if cached_text_policy and str(args.text_policy) != "drop" and any("text_emb" in s for s in ds.samples):
+                if cached_text_policy != str(args.text_policy):
+                    raise RuntimeError(
+                        f"Feature-cache text_policy mismatch: cache={cached_text_policy} current={args.text_policy}. "
+                        "Rebuild feature cache or switch --text-policy."
+                    )
             subset_indices = list(range(len(ds)))
             if allowed_stems is not None:
                 cache_stems = {str(sample.get("stem", "")) for sample in ds.samples}
@@ -1266,6 +1310,26 @@ def main() -> None:
                 ]
             if limit > 0:
                 subset_indices = subset_indices[:limit]
+            if (not bool(args.zero_text)) and tokenizer is None and not all("text_emb" in s for s in ds.samples):
+                try:
+                    from transformers import AutoTokenizer
+                except Exception as e:
+                    raise RuntimeError(
+                        "transformers is required for cached inference when text_emb is absent. "
+                        "Install with: pip install transformers"
+                    ) from e
+                text_model_name = ""
+                if isinstance(getattr(args, "text_model", None), str) and str(args.text_model).strip():
+                    text_model_name = str(args.text_model).strip()
+                if not text_model_name:
+                    try:
+                        text_model_name = str(getattr(model.text, "model_name", "") or "")
+                    except Exception:
+                        text_model_name = ""
+                if not text_model_name:
+                    text_model_name = "bert-base-multilingual-cased"
+                tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+                setattr(tokenizer, "_motion_text_policy", str(args.text_policy))
             if (not bool(args.zero_text)) and tokenizer is not None and not all("text_emb" in s for s in ds.samples):
                 _cache_text_tokens(ds, tokenizer, int(args.max_text_len))
 
@@ -1511,7 +1575,15 @@ def main() -> None:
                                 "Provide local text model files or switch to cached/feature-cache inference."
                             )
                         text_inputs = tokenizer(
-                            [str(row.get("mn", mn_text))],
+                            [
+                                select_text_for_policy(
+                                    full_text=str(row.get("mn", mn_text)),
+                                    masked_text=str(row.get("masked_mn", "")),
+                                    label_raw=str(row.get("情感类别", "") or "").strip(),
+                                    label_en=label_en,
+                                    policy=str(args.text_policy),
+                                )
+                            ],
                             padding=True,
                             truncation=True,
                             max_length=int(args.max_text_len),
@@ -1682,6 +1754,7 @@ def main() -> None:
         "ablation": str(args.ablation),
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,
+        "text_policy": str(args.text_policy),
         "label_names": label_names,
         "zero_video": bool(args.zero_video),
         "zero_audio": bool(args.zero_audio),

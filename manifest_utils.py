@@ -18,6 +18,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from text_policy_utils import (
+    build_prompt_group_id,
+    build_prompt_group_text,
+    derive_cue_severity,
+    mask_emotion_cues,
+    normalize_text_for_grouping,
+)
+
 
 CN_TO_EN = {
     "愤怒": "angry",
@@ -421,6 +429,8 @@ def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
     split_counts = Counter()
     speaker_counts = Counter()
     text_cue_counts = Counter()
+    cue_severity_counts = Counter()
+    prompt_group_counts = Counter()
     speaker_to_labels: dict[str, set[str]] = defaultdict(set)
     label_to_speakers: dict[str, set[str]] = defaultdict(set)
     usable_count = 0
@@ -444,6 +454,10 @@ def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
         for key, value in item.get("text_cue_details", {}).items():
             if value:
                 text_cue_counts[str(key)] += 1
+        cue_severity_counts[str(item.get("cue_severity", "none"))] += 1
+        prompt_group_id = str(item.get("prompt_group_id", "") or "")
+        if prompt_group_id:
+            prompt_group_counts[prompt_group_id] += 1
 
     labels_single_speaker = [
         label for label, speakers in label_to_speakers.items() if len({s for s in speakers if s != "UNKNOWN"}) == 1
@@ -462,6 +476,9 @@ def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
         "speaker_to_labels": {k: sorted(v) for k, v in sorted(speaker_to_labels.items())},
         "label_to_speakers": {k: sorted(v) for k, v in sorted(label_to_speakers.items())},
         "text_cue_counts": dict(sorted(text_cue_counts.items())),
+        "cue_severity_counts": dict(sorted(cue_severity_counts.items())),
+        "prompt_groups": int(len(prompt_group_counts)),
+        "duplicate_prompt_groups": int(sum(1 for _, count in prompt_group_counts.items() if count > 1)),
         "fatal_confound": bool(labels_single_speaker and not labels_multi_speaker),
         "speaker_group_split_feasible": bool(labels_multi_speaker),
     }
@@ -501,6 +518,11 @@ def build_split_manifest(
         intensity = parse_intensity(row.get("情感强度"))
         speaker_id = infer_speaker_id(label_en)
         cue_details = detect_text_cue_flags(mn, zh, label_raw)
+        cue_severity = derive_cue_severity(cue_details)
+        masked_mn = mask_emotion_cues(mn, label_raw=label_raw, label_en=label_en)
+        masked_zh = mask_emotion_cues(zh, label_raw=label_raw, label_en=label_en)
+        prompt_group_text = build_prompt_group_text(mn, zh, label_raw=label_raw, label_en=label_en)
+        prompt_group_id = build_prompt_group_id(mn, zh, label_raw=label_raw, label_en=label_en)
         video_path = None
         audio_path = None
         if seq and label_en:
@@ -512,6 +534,12 @@ def build_split_manifest(
             "label_idx": EMOTIONS.index(label_en) if label_en in EMOTIONS else None,
             "mn": mn,
             "zh": zh,
+            "masked_mn": masked_mn,
+            "masked_zh": masked_zh,
+            "normalized_mn": normalize_text_for_grouping(mn),
+            "normalized_zh": normalize_text_for_grouping(zh),
+            "prompt_group_text": prompt_group_text,
+            "prompt_group_id": prompt_group_id,
             "intensity": intensity,
             "speaker_id": speaker_id,
             "video_path": str(video_path) if video_path is not None else None,
@@ -521,6 +549,7 @@ def build_split_manifest(
             "has_text": bool(mn or zh),
             "text_cue_flag": any(cue_details.values()),
             "text_cue_details": cue_details,
+            "cue_severity": cue_severity,
             "is_usable": bool(seq and label_en),
             "is_raw_usable": bool(seq and label_en and video_path is not None and audio_path is not None),
             "split": "excluded",
@@ -579,3 +608,143 @@ def select_manifest_items(manifest: dict[str, Any], subset: str = "all") -> list
     if subset == "all":
         return [item for item in items if item.get("is_usable")]
     return [item for item in items if item.get("is_usable") and str(item.get("split", "")).lower() == subset]
+
+
+def _group_items_by_key(items: list[dict[str, Any]], group_key: str) -> list[list[dict[str, Any]]]:
+    """Pack manifest items into stable groups by a shared key."""
+
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        key = str(item.get(group_key, "") or item.get("seq", ""))
+        buckets[key].append(item)
+    groups = list(buckets.values())
+    groups.sort(key=lambda bucket: (str(bucket[0].get(group_key, "")), str(bucket[0].get("seq", ""))))
+    return groups
+
+
+def resolve_grouped_cv_splits(
+    items: list[dict[str, Any]],
+    *,
+    label_names: list[str],
+    group_key: str = "prompt_group_id",
+    requested_splits: int = 5,
+    seed: int = 42,
+) -> tuple[list[tuple[list[dict[str, Any]], list[dict[str, Any]]]], int]:
+    """Create grouped folds with approximate label balance.
+
+    The algorithm is intentionally deterministic and dependency-light:
+    - group samples by `group_key`
+    - sort by group size / label diversity
+    - greedily assign each group to the fold that best improves label balance
+    """
+
+    if requested_splits < 2:
+        raise RuntimeError("Grouped CV requires at least 2 splits.")
+    groups = _group_items_by_key(items, group_key)
+    if len(groups) < 2:
+        raise RuntimeError(f"Not enough distinct groups for grouped CV: {len(groups)}")
+
+    total_counts = Counter(str(item.get("label_en", "")) for item in items if str(item.get("label_en", "")) in label_names)
+    feasible_splits = min(int(requested_splits), len(groups))
+    if feasible_splits < 2:
+        raise RuntimeError("Grouped CV became infeasible after group counting.")
+
+    rng = random.Random(int(seed))
+    shuffled = list(groups)
+    rng.shuffle(shuffled)
+    shuffled.sort(
+        key=lambda bucket: (
+            -len(bucket),
+            -len({str(item.get("label_en", "")) for item in bucket}),
+            str(bucket[0].get(group_key, "")),
+        )
+    )
+
+    fold_groups: list[list[list[dict[str, Any]]]] = [[] for _ in range(feasible_splits)]
+    fold_counts: list[Counter[str]] = [Counter() for _ in range(feasible_splits)]
+    fold_sizes: list[int] = [0 for _ in range(feasible_splits)]
+    target_per_fold = {label: total_counts.get(label, 0) / float(feasible_splits) for label in label_names}
+
+    for group in shuffled:
+        group_counts = Counter(str(item.get("label_en", "")) for item in group if str(item.get("label_en", "")) in label_names)
+        best_fold = 0
+        best_score: tuple[float, int, int] | None = None
+        for fold_idx in range(feasible_splits):
+            score_balance = 0.0
+            for label in label_names:
+                after = fold_counts[fold_idx].get(label, 0) + group_counts.get(label, 0)
+                score_balance += (after - target_per_fold.get(label, 0.0)) ** 2
+            score = (score_balance, fold_sizes[fold_idx] + len(group), fold_idx)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_fold = fold_idx
+        fold_groups[best_fold].append(group)
+        fold_counts[best_fold].update(group_counts)
+        fold_sizes[best_fold] += len(group)
+
+    folds: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+    for fold_idx in range(feasible_splits):
+        val_items = [item for group in fold_groups[fold_idx] for item in group]
+        train_items = [
+            item
+            for other_idx, other_groups in enumerate(fold_groups)
+            if other_idx != fold_idx
+            for group in other_groups
+            for item in group
+        ]
+        if not train_items or not val_items:
+            raise RuntimeError("Grouped CV produced an empty train or val fold.")
+        train_groups = {str(item.get(group_key, "")) for item in train_items}
+        val_groups = {str(item.get(group_key, "")) for item in val_items}
+        overlap = train_groups & val_groups
+        if overlap:
+            preview = ", ".join(sorted(list(overlap))[:10])
+            raise RuntimeError(f"Grouped CV leakage detected: train/val share {group_key}. Example(s): {preview}")
+        folds.append((train_items, val_items))
+    return folds, feasible_splits
+
+
+def build_manifest_from_split_items(
+    base_manifest: dict[str, Any],
+    *,
+    train_items: list[dict[str, Any]],
+    val_items: list[dict[str, Any]],
+    split_strategy: str,
+    extra_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a derived manifest with explicit train/val items."""
+
+    train_ids = {str(item.get("seq", "")) for item in train_items}
+    val_ids = {str(item.get("seq", "")) for item in val_items}
+    if train_ids & val_ids:
+        preview = ", ".join(sorted(list(train_ids & val_ids))[:10])
+        raise RuntimeError(f"Derived manifest has overlapping train/val seq values. Example(s): {preview}")
+
+    derived_items: list[dict[str, Any]] = []
+    for item in base_manifest.get("items", []):
+        copied = dict(item)
+        seq = str(copied.get("seq", ""))
+        if seq in train_ids:
+            copied["split"] = "train"
+        elif seq in val_ids:
+            copied["split"] = "val"
+        elif bool(copied.get("is_usable")):
+            copied["split"] = "excluded"
+        derived_items.append(copied)
+
+    manifest = {
+        "manifest_version": 2,
+        "data_root": base_manifest.get("data_root"),
+        "xlsx": base_manifest.get("xlsx"),
+        "seed": base_manifest.get("seed"),
+        "train_split": base_manifest.get("train_split"),
+        "split_strategy": split_strategy,
+        "summary": _summarize_manifest_items(derived_items),
+        "items": derived_items,
+    }
+    if extra_meta:
+        manifest["derived"] = dict(extra_meta)
+    manifest["manifest_sha256"] = hashlib.sha256(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return manifest

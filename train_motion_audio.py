@@ -59,6 +59,7 @@ from runtime_adapt import (
     resolve_worker_count,
     select_device,
 )
+from text_policy_utils import resolve_text_policy, select_text_for_policy
 
 
 def parse_args():
@@ -177,6 +178,13 @@ def parse_args():
         default="xlm-roberta-large",
         help="HF model name for text encoder",
     )
+    p.add_argument(
+        "--text-policy",
+        type=str,
+        default="full",
+        choices=["full", "mask_emotion_cues", "drop"],
+        help="How text should be exposed to the model: full text, masked cues, or dropped entirely.",
+    )
     p.add_argument("--freeze-text", action="store_true", help="Freeze the text (mBERT) encoder")
     p.add_argument(
         "--max-text-len",
@@ -284,7 +292,7 @@ def _autocast_context(device: torch.device, amp_mode: str) -> contextlib.Abstrac
     return torch.cuda.amp.autocast(enabled=True)
 
 
-def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_len: int) -> None:
+def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_len: int, *, text_policy: str) -> None:
     """预先把整集文本分词，避免每个 epoch / batch 重复 tokenizer。"""
 
     if not ds.samples:
@@ -293,7 +301,15 @@ def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_le
         return
     if all("_text_input_ids" in s and "_text_attention_mask" in s for s in ds.samples):
         return
-    texts = [str(s.get("mn", "")) for s in ds.samples]
+    texts = [
+        select_text_for_policy(
+            full_text=str(s.get("mn", "")),
+            masked_text=str(s.get("masked_mn", "")),
+            label_en=str(s.get("_global_label_en", "")) or None,
+            policy=text_policy,
+        )
+        for s in ds.samples
+    ]
     enc = tokenizer(
         texts,
         padding="max_length",
@@ -316,6 +332,9 @@ def _validate_cache_compatibility(ds: CachedMotionAudioDataset, args: argparse.N
 
     sample = ds[0]
     video_backbone = str(args.video_backbone)
+    text_policy = resolve_text_policy(getattr(args, "text_policy", "full"))
+    feature_cfg = ds.config.get("feature_cache", {}) if isinstance(ds.config, dict) else {}
+    cached_text_policy = str(feature_cfg.get("text_policy", "") or "").strip().lower()
 
     if video_backbone == "dual":
         if bool(args.freeze_flow):
@@ -346,6 +365,12 @@ def _validate_cache_compatibility(ds: CachedMotionAudioDataset, args: argparse.N
             raise RuntimeError("Training requires audio_emb or audio in cache, but neither is present.")
     elif "audio" not in sample:
         raise RuntimeError("Current config trains audio branch, but cache has no raw 'audio'. Freeze audio or rebuild cache.")
+
+    if bool(args.freeze_text) and text_policy != "drop" and cached_text_policy and cached_text_policy != text_policy:
+        raise RuntimeError(
+            f"Feature-cache text_policy mismatch: cache={cached_text_policy} current={text_policy}. "
+            "Rebuild feature cache or switch --text-policy."
+        )
 
     if not bool(args.zero_text):
         if not bool(args.freeze_text) and "mn" not in sample:
@@ -675,12 +700,14 @@ def _write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
     validity = metrics.get("validity", {})
     speaker_majority = metrics.get("speaker_majority_baseline", {})
     speaker_only = metrics.get("speaker_only_baseline", {})
+    meta = metrics.get("meta", {})
     best_val = best.get("best_val_summary", {})
     lines = [
         "# Run Summary",
         "",
         f"- task_mode: `{validity.get('task_mode', 'confounded_7way')}`",
         f"- speaker_id: `{validity.get('speaker_id')}`",
+        f"- text_policy: `{meta.get('text_policy', 'full')}`",
         f"- scientific_validity: `{validity.get('scientific_validity')}`",
         f"- claim_scope: `{validity.get('claim_scope')}`",
         f"- recommended_interpretation: {validity.get('recommended_interpretation', '')}",
@@ -725,7 +752,10 @@ def main():
     if args.cached_dataset is None and args.feature_cache is None:
         raise RuntimeError("Provide at least one of --cached-dataset or --feature-cache")
     set_seed(args.seed)
+    args.text_policy = resolve_text_policy(args.text_policy)
     zero_video, zero_audio, zero_text = _resolve_ablation_flags(args)
+    if str(args.text_policy) == "drop":
+        zero_text = True
     args.zero_video = zero_video
     args.zero_audio = zero_audio
     args.zero_text = zero_text
@@ -922,7 +952,7 @@ def main():
             ) from e
 
         tokenizer = AutoTokenizer.from_pretrained(str(args.text_model))
-        _cache_text_tokens(ds, tokenizer, int(args.max_text_len))
+        _cache_text_tokens(ds, tokenizer, int(args.max_text_len), text_policy=str(args.text_policy))
 
     model = FusionClassifier(
         num_classes=len(task_label_names),
@@ -1141,7 +1171,15 @@ def main():
                             "Rebuild a feature cache with text embeddings or provide local text model files."
                         )
                     text_inputs = tokenizer(
-                        [str(x) for x in mn_list],
+                        [
+                            select_text_for_policy(
+                                full_text=str(mn_list[i]),
+                                masked_text=str(batch.get("masked_mn", [""] * len(mn_list))[i]),
+                                label_en=str(batch.get("_global_label_en", [""] * len(mn_list))[i]) or None,
+                                policy=str(args.text_policy),
+                            )
+                            for i in range(len(mn_list))
+                        ],
                         padding=True,
                         truncation=True,
                         max_length=int(args.max_text_len),
@@ -1340,7 +1378,15 @@ def main():
                                 "Rebuild a feature cache with text embeddings or provide local text model files."
                             )
                         text_inputs = tokenizer(
-                            [str(x) for x in mn_list],
+                            [
+                                select_text_for_policy(
+                                    full_text=str(mn_list[i]),
+                                    masked_text=str(batch.get("masked_mn", [""] * len(mn_list))[i]),
+                                    label_en=str(batch.get("_global_label_en", [""] * len(mn_list))[i]) or None,
+                                    policy=str(args.text_policy),
+                                )
+                                for i in range(len(mn_list))
+                            ],
                             padding=True,
                             truncation=True,
                             max_length=int(args.max_text_len),
@@ -1517,6 +1563,7 @@ def main():
                 "label_names": task_label_names,
                 "task_mode": task_mode,
                 "speaker_id": task_speaker_id,
+                "text_policy": str(args.text_policy),
                 "validity": validity_summary,
                 "cache_config": ds.config,
                 "resolved_runtime": {
@@ -1532,6 +1579,7 @@ def main():
                 "split_manifest": str(args.split_manifest.expanduser()) if args.split_manifest is not None else None,
                 "manifest_sha256": manifest_hash,
                 "ablation": str(args.ablation),
+                "text_policy": str(args.text_policy),
                 "zero_video": bool(args.zero_video),
                 "zero_audio": bool(args.zero_audio),
                 "zero_text": bool(args.zero_text),
@@ -1569,6 +1617,7 @@ def main():
                 "checkpoint": str(best_ckpt_path),
                 "task_mode": task_mode,
                 "speaker_id": task_speaker_id,
+                "text_policy": str(args.text_policy),
                 "label_names": task_label_names,
                 "attempted": len(val_records),
                 "ok": len(val_records),
@@ -1607,6 +1656,7 @@ def main():
         "label_names": task_label_names,
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,
+        "text_policy": str(args.text_policy),
         "validity": validity_summary,
         "cache_config": ds.config,
     }
@@ -1622,6 +1672,7 @@ def main():
         "manifest_sha256": manifest_hash,
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,
+        "text_policy": str(args.text_policy),
         "label_names": task_label_names,
         "train_size": len(train_indices),
         "val_size": len(val_indices),

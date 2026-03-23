@@ -27,6 +27,7 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from data import CachedMotionAudioDataset, collate
+from manifest_utils import EMOTIONS
 from models import FusionClassifier
 from runtime_adapt import (
     detect_runtime,
@@ -36,6 +37,7 @@ from runtime_adapt import (
     resolve_worker_count,
     select_device,
 )
+from text_policy_utils import resolve_text_policy, select_text_for_policy
 
 
 def _atomic_torch_save(obj: Any, dst: Path) -> None:
@@ -93,6 +95,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--text-model", type=str, default="xlm-roberta-large")
     p.add_argument("--max-text-len", type=int, default=128)
+    p.add_argument(
+        "--text-policy",
+        type=str,
+        default="full",
+        choices=["full", "mask_emotion_cues", "drop"],
+        help="How text should be represented before caching text embeddings.",
+    )
     p.add_argument("--freeze-audio", action="store_true", help="Cache audio encoder output to audio_emb")
     p.add_argument("--freeze-flow", action="store_true", help="Cache flow encoder output to flow_emb")
     p.add_argument("--freeze-rgb", action="store_true", help="Cache RGB VideoMAE output to rgb_emb")
@@ -236,7 +245,9 @@ def main() -> None:
         raise RuntimeError("transformers is required for build_feature_cache.py") from e
 
     tokenizer = None
-    if bool(args.freeze_text):
+    text_policy = resolve_text_policy(args.text_policy)
+    effective_freeze_text = bool(args.freeze_text) and text_policy != "drop"
+    if effective_freeze_text:
         tokenizer = AutoTokenizer.from_pretrained(str(model_args["text_model"]))
 
     model = FusionClassifier(
@@ -273,7 +284,8 @@ def main() -> None:
                 "freeze_audio": bool(args.freeze_audio),
                 "freeze_flow": bool(args.freeze_flow),
                 "freeze_rgb": bool(args.freeze_rgb),
-                "freeze_text": bool(args.freeze_text),
+                "freeze_text": bool(effective_freeze_text),
+                "text_policy": text_policy,
                 "retain_raw": bool(args.retain_raw),
             },
             ensure_ascii=False,
@@ -297,9 +309,31 @@ def main() -> None:
             raw_audio_emb = batch.get("audio_emb", None)
             text_inputs = _resolve_text_inputs(batch, device) if batch.get("text_inputs", None) is not None else None
 
-            if bool(args.freeze_text) and text_inputs is None and tokenizer is not None:
+            if effective_freeze_text and text_inputs is None and tokenizer is not None:
+                batch_texts = []
+                global_labels = []
+                for i in range(int(batch["labels"].shape[0])):
+                    raw_label = str(batch.get("_global_label_en", [""] * int(batch["labels"].shape[0]))[i] if "_global_label_en" in batch else "")
+                    if not raw_label:
+                        try:
+                            label_idx = int(batch["labels"][i].item())
+                            raw_label = EMOTIONS[label_idx] if 0 <= label_idx < len(EMOTIONS) else ""
+                        except Exception:
+                            raw_label = ""
+                    global_labels.append(raw_label)
+                masked_texts = [str(x) for x in batch.get("masked_mn", [""] * int(batch["labels"].shape[0]))]
+                full_texts = [str(x) for x in batch.get("mn", [""] * int(batch["labels"].shape[0]))]
+                for i in range(int(batch["labels"].shape[0])):
+                    batch_texts.append(
+                        select_text_for_policy(
+                            full_text=full_texts[i],
+                            masked_text=masked_texts[i],
+                            label_en=global_labels[i] or None,
+                            policy=text_policy,
+                        )
+                    )
                 text_inputs = tokenizer(
-                    [str(x) for x in batch["mn"]],
+                    batch_texts,
                     padding=True,
                     truncation=True,
                     max_length=int(model_args["max_text_len"]),
@@ -358,7 +392,7 @@ def main() -> None:
                             batch_audio_emb = model.audio(wav)
                     else:
                         batch_audio_emb = model.audio(wav)
-                if bool(args.freeze_text) and batch_text_emb is None:
+                if effective_freeze_text and batch_text_emb is None:
                     if text_inputs is None:
                         raise RuntimeError("Cannot build text_emb without text inputs")
                     batch_text_emb = model.text(text_inputs)
@@ -370,8 +404,11 @@ def main() -> None:
                     "label": batch["labels"][i].detach().cpu().to(torch.long),
                     "stem": str(batch["stems"][i]),
                     "mn": str(batch["mn"][i]),
+                    "masked_mn": str(batch.get("masked_mn", [""] * batch_size_actual)[i]),
                     "speaker_id": str(batch["speaker_id"][i]),
                     "text_cue_flag": bool(batch["text_cue_flag"][i].item()),
+                    "cue_severity": str(batch.get("cue_severity", ["none"] * batch_size_actual)[i]),
+                    "prompt_group_id": str(batch.get("prompt_group_id", [""] * batch_size_actual)[i]),
                     "intensity": batch["intensity"][i].detach().cpu().to(torch.float32),
                 }
                 if bool(args.freeze_flow):
@@ -407,7 +444,7 @@ def main() -> None:
                     elif "audio_emb" in batch:
                         sample["audio_emb"] = batch["audio_emb"][i].detach().cpu().to(torch.float16)
 
-                if bool(args.freeze_text):
+                if effective_freeze_text:
                     if batch_text_emb is None:
                         raise RuntimeError("Requested text feature cache but text_emb is missing")
                     sample["text_emb"] = batch_text_emb[i].detach().cpu().to(torch.float16)
@@ -435,7 +472,8 @@ def main() -> None:
                                     "freeze_audio": bool(args.freeze_audio),
                                     "freeze_flow": bool(args.freeze_flow),
                                     "freeze_rgb": bool(args.freeze_rgb),
-                                    "freeze_text": bool(args.freeze_text),
+                                    "freeze_text": bool(effective_freeze_text),
+                                    "text_policy": text_policy,
                                     "retain_raw": bool(args.retain_raw),
                                 },
                             },
@@ -470,7 +508,8 @@ def main() -> None:
                         "freeze_audio": bool(args.freeze_audio),
                         "freeze_flow": bool(args.freeze_flow),
                         "freeze_rgb": bool(args.freeze_rgb),
-                        "freeze_text": bool(args.freeze_text),
+                        "freeze_text": bool(effective_freeze_text),
+                        "text_policy": text_policy,
                         "retain_raw": bool(args.retain_raw),
                     },
                 },
