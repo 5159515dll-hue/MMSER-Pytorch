@@ -63,6 +63,8 @@ EMOTION_DESC_CN = [
     "非常厌恶",
 ]
 
+TASK_MODES = ("confounded_7way", "within_speaker")
+
 
 def normalize_seq(raw: Any) -> str:
     """把各种形态的序号字段归一成稳定字符串。
@@ -145,6 +147,114 @@ def infer_speaker_id(label_en: str | None) -> str:
         if label_en in labels:
             return speaker_id
     return "UNKNOWN"
+
+
+def resolve_task_mode(task_mode: str | None) -> str:
+    """规范化任务模式字符串。"""
+
+    mode = str(task_mode or "confounded_7way").strip().lower()
+    if mode not in TASK_MODES:
+        raise RuntimeError(f"Unsupported task mode: {task_mode}")
+    return mode
+
+
+def resolve_task_label_names(task_mode: str | None = "confounded_7way", speaker_id: str | None = None) -> list[str]:
+    """返回当前任务模式对应的标签集合。
+
+    - `confounded_7way`: 使用全局 7 类标签。
+    - `within_speaker`: 只保留某个 speaker 实际覆盖的标签，并按 `EMOTIONS`
+      的全局顺序输出，避免不同脚本各自定义局部类别顺序。
+    """
+
+    mode = resolve_task_mode(task_mode)
+    if mode == "confounded_7way":
+        return list(EMOTIONS)
+
+    speaker = str(speaker_id or "").strip().upper()
+    if speaker not in SPEAKER_LABELS_EN:
+        raise RuntimeError("within_speaker mode requires --speaker-id in {A,B,C}")
+    speaker_labels = SPEAKER_LABELS_EN[speaker]
+    return [label for label in EMOTIONS if label in speaker_labels]
+
+
+def map_label_to_task_index(
+    label_en: str | None,
+    task_mode: str | None = "confounded_7way",
+    speaker_id: str | None = None,
+) -> int | None:
+    """把全局标签映射到当前任务模式下的局部标签索引。"""
+
+    if label_en is None:
+        return None
+    label_names = resolve_task_label_names(task_mode, speaker_id)
+    if label_en not in label_names:
+        return None
+    return int(label_names.index(label_en))
+
+
+def filter_manifest_items_for_task(
+    items: list[dict[str, Any]],
+    task_mode: str | None = "confounded_7way",
+    speaker_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """按任务模式过滤 manifest 条目。"""
+
+    mode = resolve_task_mode(task_mode)
+    if mode == "confounded_7way":
+        return list(items)
+
+    speaker = str(speaker_id or "").strip().upper()
+    label_names = set(resolve_task_label_names(mode, speaker))
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        if str(item.get("speaker_id", "UNKNOWN")).strip().upper() != speaker:
+            continue
+        if str(item.get("label_en", "")) not in label_names:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def build_validity_summary(
+    manifest_summary: dict[str, Any] | None,
+    task_mode: str | None = "confounded_7way",
+    speaker_id: str | None = None,
+) -> dict[str, Any]:
+    """把 manifest 审计结果翻译成实验结果可直接消费的有效性摘要。"""
+
+    summary = manifest_summary or {}
+    mode = resolve_task_mode(task_mode)
+    label_names = resolve_task_label_names(mode, speaker_id)
+    fatal_confound = bool(summary.get("fatal_confound", False))
+    speaker_group_split_feasible = bool(summary.get("speaker_group_split_feasible", False))
+
+    if mode == "within_speaker":
+        speaker = str(speaker_id or "").strip().upper()
+        claim_scope = f"within_speaker_emotion_discrimination:{speaker}"
+        recommended = (
+            f"Current result is scientifically usable only as within-speaker emotion discrimination for speaker {speaker}. "
+            "Do not extrapolate it to cross-speaker 7-way generalization."
+        )
+        scientific_valid = True
+    else:
+        claim_scope = "multimodal_confounded_7way_benchmark" if fatal_confound else "multimodal_7way_benchmark"
+        recommended = (
+            "Current result must be interpreted as a confounded 7-way benchmark, not as emotion generalization."
+            if fatal_confound
+            else "Current result may be interpreted as a 7-way benchmark under the manifest's split assumptions."
+        )
+        scientific_valid = not fatal_confound
+
+    return {
+        "task_mode": mode,
+        "speaker_id": str(speaker_id).strip().upper() if speaker_id is not None and str(speaker_id).strip() else None,
+        "label_names": label_names,
+        "fatal_confound": fatal_confound,
+        "speaker_group_split_feasible": speaker_group_split_feasible,
+        "scientific_validity": bool(scientific_valid),
+        "claim_scope": claim_scope,
+        "recommended_interpretation": recommended,
+    }
 
 
 def _contains_keyword(text: str, keywords: list[str], *, lowercase: bool) -> bool:

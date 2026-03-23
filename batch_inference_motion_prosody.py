@@ -38,16 +38,23 @@ from audio_aug import normalize_wav
 from data import CachedMotionAudioDataset, collate
 from manifest_utils import (
     EMOTIONS,
+    TASK_MODES,
+    build_validity_summary,
+    filter_manifest_items_for_task,
+    infer_speaker_id as _shared_infer_speaker_id,
+    map_label_to_task_index,
     load_split_manifest,
     manifest_sha256,
     normalize_seq as _shared_normalize_seq,
     parse_intensity as _shared_parse_intensity,
     read_xlsx_rows as _shared_read_xlsx_rows,
+    resolve_task_label_names,
+    resolve_task_mode,
     resolve_label_en as _shared_resolve_label_en,
     resolve_paths_for_seq as _shared_resolve_paths_for_seq,
     select_manifest_items,
 )
-from metrics_utils import classification_summary, speaker_majority_baseline
+from metrics_utils import classification_summary, speaker_majority_baseline, speaker_only_baseline
 from models import FusionClassifier
 from path_utils import default_databases_dir, default_xlsx_path
 from prosody import ProsodyConfig, extract_prosody_features
@@ -119,6 +126,12 @@ def _resolve_label_en(row: Any) -> Optional[str]:
     return _shared_resolve_label_en(row.get("情感类别"))
 
 
+def _infer_speaker_id(label_en: Optional[str]) -> str:
+    """从标签反推 speaker；主要用于 raw XLSX 模式下的 within_speaker 过滤。"""
+
+    return _shared_infer_speaker_id(label_en)
+
+
 def _paths_for_seq(data_root: Path, label_en: str, seq: str) -> Tuple[Optional[Path], Optional[Path]]:
     """根据数据根目录、标签和序号推断媒体文件路径。"""
 
@@ -146,6 +159,19 @@ def parse_args() -> argparse.Namespace:
         default="all",
         choices=["all", "train", "val"],
         help="Subset to evaluate when --split-manifest is provided",
+    )
+    p.add_argument(
+        "--task-mode",
+        type=str,
+        default="confounded_7way",
+        choices=list(TASK_MODES),
+        help="Task definition. within_speaker expects --speaker-id or a checkpoint that already recorded it.",
+    )
+    p.add_argument(
+        "--speaker-id",
+        type=str,
+        default="",
+        help="Required for --task-mode within_speaker when checkpoint metadata does not already contain it.",
     )
     p.add_argument(
         "--benchmark-tag",
@@ -352,7 +378,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace) -> tuple[FusionClassifier, bool]:
+def _load_model(
+    ckpt_path: Path,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> tuple[FusionClassifier, bool, list[str], str, str | None, dict[str, Any] | None]:
     """加载 checkpoint，并从其中恢复默认推理配置。
 
     推理侧默认优先相信 checkpoint 里的训练参数，只在用户显式传入
@@ -367,6 +397,10 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
     audio_model_revision = ""
     video_backbone = "dual"
     video_model = "MCG-NJU/videomae-large"
+    task_mode = "confounded_7way"
+    task_speaker_id: str | None = None
+    label_names = list(EMOTIONS)
+    validity = None
     fusion_mode = "gated_text"
     gate_temperature = 1.0
     gate_scale = 1.0
@@ -411,6 +445,17 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
             except Exception:
                 pass
             use_intensity = bool(ckpt_args.get("use_intensity", False))
+            tm_mode = ckpt_args.get("task_mode", "")
+            if isinstance(tm_mode, str) and tm_mode.strip():
+                task_mode = tm_mode.strip()
+            tm_speaker = ckpt_args.get("speaker_id", "")
+            if isinstance(tm_speaker, str) and tm_speaker.strip():
+                task_speaker_id = tm_speaker.strip().upper()
+        if isinstance(ckpt.get("label_names"), list) and ckpt.get("label_names"):
+            label_names = [str(x) for x in ckpt.get("label_names")]
+        validity_obj = ckpt.get("validity", None)
+        if isinstance(validity_obj, dict):
+            validity = validity_obj
 
     # CLI overrides
     if isinstance(getattr(args, "text_model", ""), str) and str(args.text_model).strip():
@@ -419,6 +464,10 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
         audio_model = str(args.audio_model).strip()
     if isinstance(getattr(args, "audio_model_revision", ""), str) and str(args.audio_model_revision).strip():
         audio_model_revision = str(args.audio_model_revision).strip()
+    if isinstance(getattr(args, "task_mode", ""), str) and str(args.task_mode).strip():
+        task_mode = str(args.task_mode).strip()
+    if isinstance(getattr(args, "speaker_id", ""), str) and str(args.speaker_id).strip():
+        task_speaker_id = str(args.speaker_id).strip().upper()
     if isinstance(getattr(args, "video_backbone", ""), str) and str(args.video_backbone).strip():
         video_backbone = str(args.video_backbone).strip()
     if isinstance(getattr(args, "video_model", ""), str) and str(args.video_model).strip():
@@ -435,8 +484,20 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
         modality_dropout = float(args.modality_dropout)
 
     # 推理阶段不关心 requires_grad，但某些编码器初始化路径仍然需要 freeze 参数。
+    task_mode = resolve_task_mode(task_mode)
+    normalized_speaker_id = str(task_speaker_id).strip().upper() if task_speaker_id is not None and str(task_speaker_id).strip() else None
+    if not label_names or label_names == list(EMOTIONS):
+        label_names = resolve_task_label_names(task_mode, normalized_speaker_id)
+    if (
+        validity is None
+        or str(validity.get("task_mode", "")).strip().lower() != task_mode
+        or (validity.get("speaker_id") or None) != normalized_speaker_id
+    ):
+        validity = build_validity_summary({}, task_mode, normalized_speaker_id)
+    task_speaker_id = normalized_speaker_id
+
     model = FusionClassifier(
-        num_classes=len(EMOTIONS),
+        num_classes=len(label_names),
         freeze_audio=True,
         text_model=text_model,
         freeze_text=True,
@@ -463,7 +524,7 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
             )
     model.to(device)
     model.eval()
-    return model, bool(use_intensity)
+    return model, bool(use_intensity), label_names, task_mode, task_speaker_id, validity
 
 
 def _select_device() -> torch.device:
@@ -665,6 +726,33 @@ def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_le
             sample["_text_token_type_ids"] = token_type_ids[idx].to(torch.long).clone()
 
 
+def _prepare_cached_dataset_for_task(
+    ds: CachedMotionAudioDataset,
+    task_mode: str,
+    speaker_id: str | None,
+) -> list[str]:
+    """把 cached 样本标签映射到当前任务模式的局部标签空间。"""
+
+    label_names = resolve_task_label_names(task_mode, speaker_id)
+    for sample in ds.samples:
+        raw_label = sample.get("label", None)
+        raw_label_idx: int | None = None
+        if isinstance(raw_label, torch.Tensor):
+            raw_label_idx = int(raw_label.item())
+        elif raw_label is not None:
+            raw_label_idx = int(raw_label)
+        global_label_en = EMOTIONS[raw_label_idx] if raw_label_idx is not None and 0 <= raw_label_idx < len(EMOTIONS) else None
+        sample["_global_label_en"] = global_label_en
+        task_label_idx = map_label_to_task_index(global_label_en, task_mode, speaker_id)
+        if task_label_idx is None:
+            continue
+        if isinstance(raw_label, torch.Tensor):
+            sample["label"] = torch.tensor(task_label_idx, dtype=torch.long)
+        else:
+            sample["label"] = int(task_label_idx)
+    return label_names
+
+
 def _run_cached_batched(
     *,
     ds: CachedMotionAudioDataset,
@@ -678,6 +766,7 @@ def _run_cached_batched(
     amp_mod: Any,
     video_backbone: str,
     ckpt_use_intensity: bool,
+    label_names: list[str],
     manifest_by_seq: dict[str, dict[str, Any]],
     print_result: str,
     print_every: int,
@@ -828,7 +917,7 @@ def _run_cached_batched(
             err_types[type(e).__name__] += batch_n
             for i, stem in enumerate(stems):
                 label_idx = int(labels[i].item())
-                label_en = EMOTIONS[label_idx] if 0 <= label_idx < len(EMOTIONS) else None
+                label_en = label_names[label_idx] if 0 <= label_idx < len(label_names) else None
                 rec = {
                     "stem": stem,
                     "status": "error",
@@ -850,7 +939,7 @@ def _run_cached_batched(
 
         for i, stem in enumerate(stems):
             label_idx = int(labels[i].item())
-            if not (0 <= label_idx < len(EMOTIONS)):
+            if not (0 <= label_idx < len(label_names)):
                 skip_count += 1
                 rec = {
                     "stem": stem,
@@ -863,9 +952,9 @@ def _run_cached_batched(
 
             seen += 1
             ok_count += 1
-            label_en = EMOTIONS[label_idx]
+            label_en = label_names[label_idx]
             pred_idx = int(pred_indices[i].item())
-            pred = EMOTIONS[pred_idx]
+            pred = label_names[pred_idx]
             prob = float(probs[i, pred_idx].item())
             match = bool(pred_idx == label_idx)
             correct += int(match)
@@ -977,7 +1066,11 @@ def main() -> None:
     resolved_amp_mode = resolve_amp_mode(requested_amp_mode, profile)
     use_amp = resolved_amp_mode != "off" and device.type == "cuda"
 
-    model, ckpt_use_intensity = _load_model(ckpt_path, device=device, args=args)
+    model, ckpt_use_intensity, label_names, task_mode, task_speaker_id, validity = _load_model(
+        ckpt_path,
+        device=device,
+        args=args,
+    )
     video_backbone = str(getattr(model, "video_backbone", "flow"))
 
     try:
@@ -1005,8 +1098,13 @@ def main() -> None:
     manifest_hash: str | None = None
     if split_manifest_path is not None:
         manifest = load_split_manifest(split_manifest_path)
-        manifest_items = select_manifest_items(manifest, args.subset)
+        manifest_items = filter_manifest_items_for_task(
+            select_manifest_items(manifest, args.subset),
+            task_mode,
+            task_speaker_id,
+        )
         manifest_hash = manifest_sha256(split_manifest_path)
+        validity = build_validity_summary(manifest.get("summary", {}), task_mode, task_speaker_id)
     cached_input = feature_cache if feature_cache is not None else cached_dataset
     if cached_input is not None:
         if manifest_items:
@@ -1019,6 +1117,17 @@ def main() -> None:
             rows = manifest_items
         else:
             rows = _read_xlsx_rows(xlsx)
+            if task_mode == "within_speaker":
+                filtered_rows: list[dict[str, Any]] = []
+                for row in rows:
+                    label_en = _resolve_label_en(row)
+                    speaker_id = str(row.get("speaker_id") or _infer_speaker_id(label_en)).strip().upper()
+                    if speaker_id != str(task_speaker_id or ""):
+                        continue
+                    if label_en not in set(label_names):
+                        continue
+                    filtered_rows.append(row)
+                rows = filtered_rows
         total = len(rows)
         limit = args.limit if args.limit and args.limit > 0 else total
     allowed_stems = {str(item.get("seq", "")) for item in manifest_items} if manifest_items else None
@@ -1046,9 +1155,9 @@ def main() -> None:
     y_pred_indices: list[int] = []
 
     # Macro-F1 counts over ok samples.
-    tp = [0 for _ in range(len(EMOTIONS))]
-    fp = [0 for _ in range(len(EMOTIONS))]
-    fn = [0 for _ in range(len(EMOTIONS))]
+    tp = [0 for _ in range(len(label_names))]
+    fp = [0 for _ in range(len(label_names))]
+    fn = [0 for _ in range(len(label_names))]
 
     # Regression accumulators over samples with GT intensity.
     reg_pred: list[float] = []
@@ -1095,6 +1204,7 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         if cached_input is not None:
             ds = CachedMotionAudioDataset(cached_input)
+            label_names = _prepare_cached_dataset_for_task(ds, task_mode, task_speaker_id)
             subset_indices = list(range(len(ds)))
             if allowed_stems is not None:
                 cache_stems = {str(sample.get("stem", "")) for sample in ds.samples}
@@ -1107,6 +1217,13 @@ def main() -> None:
                         flush=True,
                     )
                 subset_indices = [idx for idx, sample in enumerate(ds.samples) if str(sample.get("stem", "")) in allowed_stems]
+            elif task_mode == "within_speaker":
+                subset_indices = [
+                    idx
+                    for idx, sample in enumerate(ds.samples)
+                    if str(sample.get("speaker_id", "UNKNOWN")).strip().upper() == str(task_speaker_id or "")
+                    and str(sample.get("_global_label_en", "")) in set(label_names)
+                ]
             if limit > 0:
                 subset_indices = subset_indices[:limit]
             if (not bool(args.zero_text)) and tokenizer is not None:
@@ -1124,6 +1241,7 @@ def main() -> None:
                 amp_mod=amp_mod,
                 video_backbone=video_backbone,
                 ckpt_use_intensity=bool(ckpt_use_intensity),
+                label_names=label_names,
                 manifest_by_seq=manifest_by_seq,
                 print_result=print_result,
                 print_every=print_every,
@@ -1159,7 +1277,7 @@ def main() -> None:
                     break
 
                 mn_text = _fmt_text(row.get("mn", row.get("蒙文")))
-                speaker_id = str(row.get("speaker_id", "UNKNOWN"))
+                speaker_id = str(row.get("speaker_id") or "UNKNOWN").strip().upper()
 
                 seq = _normalize_seq(row.get("seq", row.get("序号")))
                 if not seq:
@@ -1198,6 +1316,11 @@ def main() -> None:
                             print(f"    mn={mn_text}")
                         sys.stdout.flush()
                     continue
+                if speaker_id == "UNKNOWN":
+                    speaker_id = _infer_speaker_id(label_en)
+                if task_mode == "within_speaker":
+                    if speaker_id != str(task_speaker_id or "") or label_en not in set(label_names):
+                        continue
 
                 video_path = Path(str(row["video_path"])) if row.get("video_path") else None
                 audio_path = Path(str(row["audio_path"])) if row.get("audio_path") else None
@@ -1373,7 +1496,7 @@ def main() -> None:
 
                     probs = torch.softmax(logits, dim=1)[0]
                     pred_idx = int(torch.argmax(probs).item())
-                    pred = EMOTIONS[pred_idx]
+                    pred = label_names[pred_idx]
                     prob = float(probs[pred_idx].item())
 
                     pred_intensity_val: Optional[float] = None
@@ -1414,8 +1537,8 @@ def main() -> None:
 
                 ok = pred == label_en
                 correct += int(ok)
-                y = EMOTIONS.index(label_en)
-                yhat = EMOTIONS.index(pred)
+                y = label_names.index(label_en)
+                yhat = label_names.index(pred)
                 y_true_indices.append(y)
                 y_pred_indices.append(yhat)
                 if y == yhat:
@@ -1485,7 +1608,7 @@ def main() -> None:
                         pass
 
     acc = correct / max(1, seen)
-    class_summary = classification_summary(y_true_indices, y_pred_indices, EMOTIONS)
+    class_summary = classification_summary(y_true_indices, y_pred_indices, label_names)
     mse = None
     mae = None
     ccc = None
@@ -1497,10 +1620,12 @@ def main() -> None:
         mae = float(diff.abs().mean().item())
         ccc = _ccc(rp, rt)
     speaker_baseline = None
-    if manifest is not None and args.subset in {"train", "val"}:
-        train_items = select_manifest_items(manifest, "train")
-        eval_items = select_manifest_items(manifest, args.subset)
-        speaker_baseline = speaker_majority_baseline(train_items, eval_items, EMOTIONS)
+    speaker_only = None
+    if manifest is not None and args.subset in {"train", "val"} and task_mode == "confounded_7way":
+        train_items = filter_manifest_items_for_task(select_manifest_items(manifest, "train"), task_mode, task_speaker_id)
+        eval_items = filter_manifest_items_for_task(select_manifest_items(manifest, args.subset), task_mode, task_speaker_id)
+        speaker_baseline = speaker_majority_baseline(train_items, eval_items, label_names)
+        speaker_only = speaker_only_baseline(train_items, eval_items, label_names)
 
     metrics_summary = {
         "xlsx": str(xlsx) if cached_input is None and split_manifest_path is None else None,
@@ -1510,6 +1635,9 @@ def main() -> None:
         "subset": str(args.subset),
         "benchmark_tag": str(args.benchmark_tag),
         "ablation": str(args.ablation),
+        "task_mode": task_mode,
+        "speaker_id": task_speaker_id,
+        "label_names": label_names,
         "zero_video": bool(args.zero_video),
         "zero_audio": bool(args.zero_audio),
         "zero_text": bool(args.zero_text),
@@ -1536,11 +1664,14 @@ def main() -> None:
         "amp": bool(use_amp),
         "error_types": dict(err_types),
         "manifest_sha256": manifest_hash,
+        "validity": validity,
     }
     if manifest is not None:
         metrics_summary["manifest_summary"] = manifest.get("summary", {})
     if speaker_baseline is not None:
         metrics_summary["speaker_majority_baseline"] = speaker_baseline
+    if speaker_only is not None:
+        metrics_summary["speaker_only_baseline"] = speaker_only
 
     metrics_path = out_path.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics_summary, ensure_ascii=False, indent=2), encoding="utf-8")

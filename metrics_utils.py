@@ -122,3 +122,70 @@ def speaker_majority_baseline(
         }
     )
     return summary
+
+
+def speaker_only_baseline(
+    train_items: list[dict[str, Any]],
+    eval_items: list[dict[str, Any]],
+    label_names: list[str],
+) -> dict[str, Any]:
+    """构造一个“只看 speaker_id”的分布基线。
+
+    这个基线和 majority baseline 的区别是，它保留了每个 speaker 在训练集中的
+    标签后验分布。最终 top-1 预测仍然会退化到每个 speaker 的多数类，但结果里
+    会明确暴露“模型只凭 speaker 最多能知道什么”。
+    """
+
+    speaker_label_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    for item in train_items:
+        if not item.get("is_usable"):
+            continue
+        label_en = item.get("label_en")
+        speaker_id = item.get("speaker_id", "UNKNOWN")
+        if label_en in label_names and speaker_id:
+            speaker_label_counts[str(speaker_id)][str(label_en)] += 1
+
+    speaker_posteriors: dict[str, dict[str, float]] = {}
+    speaker_argmax_label: dict[str, str] = {}
+    for speaker_id, counts in sorted(speaker_label_counts.items()):
+        total = sum(counts.values())
+        if total <= 0:
+            continue
+        posterior = {
+            label_name: float(counts.get(label_name, 0) / total)
+            for label_name in label_names
+        }
+        speaker_posteriors[speaker_id] = posterior
+        speaker_argmax_label[speaker_id] = sorted(
+            posterior.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[0][0]
+
+    y_true: list[int] = []
+    y_pred: list[int] = []
+    uncovered = 0
+    for item in eval_items:
+        if not item.get("is_usable"):
+            continue
+        label_en = item.get("label_en")
+        speaker_id = str(item.get("speaker_id", "UNKNOWN"))
+        pred_label = speaker_argmax_label.get(speaker_id)
+        if label_en not in label_names or pred_label not in label_names:
+            uncovered += 1
+            continue
+        y_true.append(label_names.index(str(label_en)))
+        y_pred.append(label_names.index(str(pred_label)))
+
+    summary = classification_summary(y_true, y_pred, label_names)
+    summary.update(
+        {
+            "coverage": int(len(y_true)),
+            "uncovered": int(uncovered),
+            "speaker_label_posteriors": speaker_posteriors,
+            "speaker_argmax_label": speaker_argmax_label,
+            "speaker_train_label_counts": {
+                speaker_id: dict(sorted(counts.items())) for speaker_id, counts in sorted(speaker_label_counts.items())
+            },
+        }
+    )
+    return summary
