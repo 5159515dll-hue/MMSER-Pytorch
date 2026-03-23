@@ -193,12 +193,21 @@ class HFAudioEncoder(nn.Module):
     - lengths: (B,) 每条音频的有效长度（可选，用于掩码池化）
     """
 
-    def __init__(self, model_name: str = "microsoft/wavlm-large", freeze: bool = True):
+    def __init__(
+        self,
+        model_name: str = "microsoft/wavlm-large",
+        freeze: bool = True,
+        revision: Optional[str] = None,
+        use_safetensors: bool = True,
+    ):
         """初始化 HuggingFace 音频编码器。
 
         Args:
             model_name: 例如 `microsoft/wavlm-large`。
             freeze: 是否冻结参数，仅训练上层融合头。
+            revision: HuggingFace revision / commit hash。用于固定到一个
+                已提供 `model.safetensors` 的版本。
+            use_safetensors: 是否强制只使用 safetensors 权重文件。
         """
         super().__init__()
         try:
@@ -209,7 +218,22 @@ class HFAudioEncoder(nn.Module):
             ) from e
 
         self.model_name = str(model_name)
-        self.model = AutoModel.from_pretrained(self.model_name)
+        self.revision = str(revision).strip() if revision is not None and str(revision).strip() else None
+        self.use_safetensors = bool(use_safetensors)
+        load_kwargs: dict[str, object] = {"use_safetensors": self.use_safetensors}
+        if self.revision is not None:
+            load_kwargs["revision"] = self.revision
+        try:
+            self.model = AutoModel.from_pretrained(self.model_name, **load_kwargs)
+        except Exception as e:  # pragma: no cover
+            revision_hint = self.revision if self.revision is not None else "<default>"
+            raise RuntimeError(
+                "Failed to load HuggingFace audio model with safetensors. "
+                f"model={self.model_name!r}, revision={revision_hint!r}, "
+                f"use_safetensors={self.use_safetensors}. "
+                "If the default branch only provides pytorch_model.bin, pass "
+                "--audio-model-revision pointing at a revision that contains model.safetensors."
+            ) from e
         hidden_size = int(getattr(self.model.config, "hidden_size", 768))
         # 前向里对时序 hidden state 做了 mean+std 池化并拼接，因此最终音频维度是 2 * hidden_size。
         self.out_dim = 2 * hidden_size
@@ -387,6 +411,7 @@ class FusionClassifier(nn.Module):
         hidden: int = 512,
         dropout: float = 0.1,
         audio_model: str = "microsoft/wavlm-large",
+        audio_model_revision: Optional[str] = None,
         freeze_audio: bool = True,
         freeze_video: bool = False,
         freeze_flow: Optional[bool] = None,
@@ -422,6 +447,8 @@ class FusionClassifier(nn.Module):
             freeze_text: 是否冻结文本编码器。
             hidden: 融合 MLP 隐藏层维度。
             dropout: dropout 概率。
+            audio_model: 音频编码器模型名或本地目录。
+            audio_model_revision: HuggingFace 音频模型 revision / commit hash。
             freeze_audio: 是否冻结音频编码器。
             freeze_video: 是否冻结视频编码器。
             freeze_prosody: 是否冻结韵律编码器。
@@ -457,7 +484,12 @@ class FusionClassifier(nn.Module):
         if str(audio_model) == "wav2vec2_base":
             self.audio = Wav2Vec2Encoder(freeze=freeze_audio)
         else:
-            self.audio = HFAudioEncoder(model_name=audio_model, freeze=freeze_audio)
+            self.audio = HFAudioEncoder(
+                model_name=audio_model,
+                freeze=freeze_audio,
+                revision=audio_model_revision,
+                use_safetensors=True,
+            )
         self.prosody = ProsodyMLP(in_dim=10, out_dim=prosody_dim)
         self.text = MbertTextEncoder(model_name=text_model, freeze=freeze_text)
 

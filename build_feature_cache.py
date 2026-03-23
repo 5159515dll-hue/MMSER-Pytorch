@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video-backbone", type=str, default="dual", choices=["flow", "videomae", "dual"])
     p.add_argument("--video-model", type=str, default="MCG-NJU/videomae-large")
     p.add_argument("--audio-model", type=str, default="microsoft/wavlm-large")
+    p.add_argument(
+        "--audio-model-revision",
+        type=str,
+        default="",
+        help="Optional HuggingFace revision / commit hash for the audio model. Use this when the default branch lacks model.safetensors.",
+    )
     p.add_argument("--text-model", type=str, default="xlm-roberta-large")
     p.add_argument("--max-text-len", type=int, default=128)
     p.add_argument("--freeze-audio", action="store_true", help="Cache audio encoder output to audio_emb")
@@ -129,6 +135,7 @@ def _resolve_model_args(args: argparse.Namespace) -> tuple[dict[str, Any], Optio
         "video_backbone": str(_pick("video_backbone", "dual")),
         "video_model": str(_pick("video_model", "MCG-NJU/videomae-large")),
         "audio_model": str(_pick("audio_model", "microsoft/wavlm-large")),
+        "audio_model_revision": str(_pick("audio_model_revision", "")),
         "text_model": str(_pick("text_model", "xlm-roberta-large")),
         "max_text_len": int(_pick("max_text_len", 128)),
     }
@@ -237,6 +244,7 @@ def main() -> None:
         text_model=str(model_args["text_model"]),
         freeze_text=True,
         audio_model=str(model_args["audio_model"]),
+        audio_model_revision=(str(model_args["audio_model_revision"]).strip() or None),
         freeze_audio=True,
         video_backbone=str(model_args["video_backbone"]),
         video_model=str(model_args["video_model"]),
@@ -421,6 +429,7 @@ def main() -> None:
                                     "video_backbone": str(model_args["video_backbone"]),
                                     "video_model": str(model_args["video_model"]),
                                     "audio_model": str(model_args["audio_model"]),
+                                    "audio_model_revision": str(model_args["audio_model_revision"]),
                                     "text_model": str(model_args["text_model"]),
                                     "max_text_len": int(model_args["max_text_len"]),
                                     "freeze_audio": bool(args.freeze_audio),
@@ -455,6 +464,7 @@ def main() -> None:
                         "video_backbone": str(model_args["video_backbone"]),
                         "video_model": str(model_args["video_model"]),
                         "audio_model": str(model_args["audio_model"]),
+                        "audio_model_revision": str(model_args["audio_model_revision"]),
                         "text_model": str(model_args["text_model"]),
                         "max_text_len": int(model_args["max_text_len"]),
                         "freeze_audio": bool(args.freeze_audio),

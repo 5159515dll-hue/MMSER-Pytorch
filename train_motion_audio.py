@@ -93,6 +93,12 @@ def parse_args():
         default="microsoft/wavlm-large",
         help="HF model name for audio encoder (use 'wav2vec2_base' for torchaudio wav2vec2)",
     )
+    p.add_argument(
+        "--audio-model-revision",
+        type=str,
+        default="",
+        help="Optional HuggingFace revision / commit hash for the audio model. Use this when the default branch lacks model.safetensors.",
+    )
 
     # Fusion settings
     p.add_argument(
@@ -747,6 +753,7 @@ def main():
         text_model=str(args.text_model),
         freeze_text=bool(args.freeze_text),
         audio_model=str(args.audio_model),
+        audio_model_revision=(str(args.audio_model_revision).strip() or None),
         video_backbone=str(args.video_backbone),
         video_model=str(args.video_model),
         fusion_mode=str(args.fusion_mode),

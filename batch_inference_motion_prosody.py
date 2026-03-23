@@ -283,6 +283,12 @@ def parse_args() -> argparse.Namespace:
         help="HF model name for audio encoder. If empty, read from checkpoint args.",
     )
     p.add_argument(
+        "--audio-model-revision",
+        type=str,
+        default="",
+        help="Optional HuggingFace revision / commit hash for the audio model. If empty, read from checkpoint args.",
+    )
+    p.add_argument(
         "--fusion-mode",
         type=str,
         default="",
@@ -358,6 +364,7 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
 
     text_model = "bert-base-multilingual-cased"
     audio_model = "wav2vec2_base"
+    audio_model_revision = ""
     video_backbone = "dual"
     video_model = "MCG-NJU/videomae-large"
     fusion_mode = "gated_text"
@@ -375,6 +382,9 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
             am = ckpt_args.get("audio_model", "")
             if isinstance(am, str) and am.strip():
                 audio_model = am.strip()
+            amr = ckpt_args.get("audio_model_revision", "")
+            if isinstance(amr, str) and amr.strip():
+                audio_model_revision = amr.strip()
             vb = ckpt_args.get("video_backbone", "")
             if isinstance(vb, str) and vb.strip():
                 video_backbone = vb.strip()
@@ -407,6 +417,8 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
         text_model = str(args.text_model).strip()
     if isinstance(getattr(args, "audio_model", ""), str) and str(args.audio_model).strip():
         audio_model = str(args.audio_model).strip()
+    if isinstance(getattr(args, "audio_model_revision", ""), str) and str(args.audio_model_revision).strip():
+        audio_model_revision = str(args.audio_model_revision).strip()
     if isinstance(getattr(args, "video_backbone", ""), str) and str(args.video_backbone).strip():
         video_backbone = str(args.video_backbone).strip()
     if isinstance(getattr(args, "video_model", ""), str) and str(args.video_model).strip():
@@ -429,6 +441,7 @@ def _load_model(ckpt_path: Path, device: torch.device, args: argparse.Namespace)
         text_model=text_model,
         freeze_text=True,
         audio_model=audio_model,
+        audio_model_revision=(audio_model_revision or None),
         video_backbone=video_backbone,
         video_model=video_model,
         fusion_mode=fusion_mode,
