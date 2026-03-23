@@ -1183,7 +1183,7 @@ def main():
             history["val_ccc"].append(float(val_ccc))
             history["val_intensity_n"].append(float(val_intensity_n))
 
-        if val_acc > best_acc:
+        if best_epoch == 0 or val_acc > best_acc:
             # 目前以验证集 accuracy 作为最佳 checkpoint 的主排序指标，
             # 同时把宏平均 F1 和详细分类摘要一并写进 checkpoint 元数据。
             best_acc = val_acc
