@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +114,21 @@ def _validate_one_shard(path: Path, expected_kind: str) -> tuple[Path, bool, str
         return path, False, "unknown", f"{type(e).__name__}: {e}"
 
 
+def _format_bytes(num_bytes: int) -> str:
+    """Render a byte size into a compact human-readable string."""
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(max(0, int(num_bytes)))
+    unit = units[0]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{int(value)}{unit}"
+    return f"{value:.1f}{unit}"
+
+
 def main() -> None:
     """并行读取 shard，检查是否损坏或格式异常。"""
 
@@ -128,14 +143,44 @@ def main() -> None:
     bad: list[tuple[Path, str]] = []
     kind_counts: dict[str, int] = {"raw": 0, "feature": 0}
 
-    with ThreadPoolExecutor(max_workers=max(1, int(num_workers))) as ex:
-        for path, success, detected_kind, err in ex.map(lambda p: _validate_one_shard(p, str(args.cache_kind)), shards):
-            if success:
-                ok += 1
-                if detected_kind in kind_counts:
-                    kind_counts[detected_kind] += 1
-            else:
-                bad.append((path, err))
+    print(
+        f"Validating {len(shards)} shard(s) under {args.cached_dataset} "
+        f"(cache_kind={args.cache_kind}, workers={int(num_workers)})",
+        flush=True,
+    )
+
+    if len(shards) == 1:
+        shard = shards[0]
+        try:
+            size_text = _format_bytes(shard.stat().st_size)
+        except Exception:
+            size_text = "unknown"
+        print(f"Loading shard 1/1: {shard} ({size_text})", flush=True)
+        path, success, detected_kind, err = _validate_one_shard(shard, str(args.cache_kind))
+        if success:
+            ok += 1
+            if detected_kind in kind_counts:
+                kind_counts[detected_kind] += 1
+        else:
+            bad.append((path, err))
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, int(num_workers))) as ex:
+            futures = {
+                ex.submit(_validate_one_shard, shard, str(args.cache_kind)): shard
+                for shard in shards
+            }
+            completed = 0
+            total = len(futures)
+            for future in as_completed(futures):
+                path, success, detected_kind, err = future.result()
+                completed += 1
+                print(f"Validated {completed}/{total}: {path.name}", flush=True)
+                if success:
+                    ok += 1
+                    if detected_kind in kind_counts:
+                        kind_counts[detected_kind] += 1
+                else:
+                    bad.append((path, err))
 
     print(
         f"Shards: {len(shards)} | OK: {ok} | Corrupt: {len(bad)} | "
