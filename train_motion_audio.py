@@ -637,6 +637,19 @@ def _prepare_dataset_for_task(ds: CachedMotionAudioDataset, task_mode: str, spea
     return label_names
 
 
+def _infer_cached_embedding_dims(samples: list[dict[str, Any]]) -> dict[str, int]:
+    """从缓存样本里探测 embedding 维度，用于跳过已冻结编码器的初始化。"""
+
+    dims: dict[str, int] = {}
+    for key in ("audio_emb", "text_emb", "rgb_emb", "flow_emb"):
+        for sample in samples:
+            value = sample.get(key, None)
+            if isinstance(value, torch.Tensor) and value.ndim >= 1:
+                dims[key] = int(value.shape[-1])
+                break
+    return dims
+
+
 def _write_best_val_inference_outputs(
     out_dir: Path,
     *,
@@ -760,6 +773,7 @@ def main():
     task_mode = resolve_task_mode(args.task_mode)
     task_speaker_id = str(args.speaker_id).strip().upper() or None
     task_label_names = _prepare_dataset_for_task(ds, task_mode, task_speaker_id)
+    cached_embedding_dims = _infer_cached_embedding_dims(ds.samples)
     _validate_cache_compatibility(ds, args)
     split_manifest = None
     manifest_hash = None
@@ -913,11 +927,14 @@ def main():
     model = FusionClassifier(
         num_classes=len(task_label_names),
         freeze_audio=args.freeze_audio,
+        audio_dim=cached_embedding_dims.get("audio_emb"),
+        rgb_dim=cached_embedding_dims.get("rgb_emb"),
         freeze_video=bool(args.freeze_video),
         freeze_flow=bool(args.freeze_video or args.freeze_flow),
         freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
         freeze_prosody=bool(args.freeze_prosody),
         text_model=str(args.text_model),
+        text_dim=cached_embedding_dims.get("text_emb"),
         freeze_text=bool(args.freeze_text),
         audio_model=str(args.audio_model),
         audio_model_revision=(str(args.audio_model_revision).strip() or None),
@@ -928,6 +945,14 @@ def main():
         gate_temperature=float(args.gate_temperature),
         gate_scale=float(args.gate_scale),
         delta_scale=float(args.delta_scale),
+        skip_audio_encoder_init=bool(using_feature_cache and args.freeze_audio and ("audio_emb" in cached_embedding_dims)),
+        skip_text_encoder_init=bool(using_feature_cache and args.freeze_text and ("text_emb" in cached_embedding_dims)),
+        skip_rgb_encoder_init=bool(
+            using_feature_cache
+            and (bool(args.freeze_video) or bool(args.freeze_rgb))
+            and ("rgb_emb" in cached_embedding_dims)
+            and str(args.video_backbone) in {"dual", "videomae"}
+        ),
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.CrossEntropyLoss()

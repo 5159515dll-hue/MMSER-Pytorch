@@ -382,6 +382,9 @@ def _load_model(
     ckpt_path: Path,
     device: torch.device,
     args: argparse.Namespace,
+    *,
+    cached_embedding_dims: dict[str, int] | None = None,
+    using_feature_cache: bool = False,
 ) -> tuple[FusionClassifier, bool, list[str], str, str | None, dict[str, Any] | None]:
     """加载 checkpoint，并从其中恢复默认推理配置。
 
@@ -495,11 +498,22 @@ def _load_model(
     ):
         validity = build_validity_summary({}, task_mode, normalized_speaker_id)
     task_speaker_id = normalized_speaker_id
+    cached_embedding_dims = dict(cached_embedding_dims or {})
+    skip_audio_encoder_init = bool(using_feature_cache and ("audio_emb" in cached_embedding_dims))
+    skip_text_encoder_init = bool(using_feature_cache and ("text_emb" in cached_embedding_dims))
+    skip_rgb_encoder_init = bool(
+        using_feature_cache
+        and ("rgb_emb" in cached_embedding_dims)
+        and str(video_backbone) in {"dual", "videomae"}
+    )
 
     model = FusionClassifier(
         num_classes=len(label_names),
         freeze_audio=True,
+        audio_dim=cached_embedding_dims.get("audio_emb"),
+        rgb_dim=cached_embedding_dims.get("rgb_emb"),
         text_model=text_model,
+        text_dim=cached_embedding_dims.get("text_emb"),
         freeze_text=True,
         audio_model=audio_model,
         audio_model_revision=(audio_model_revision or None),
@@ -510,6 +524,10 @@ def _load_model(
         gate_scale=gate_scale,
         delta_scale=delta_scale,
         modality_dropout=modality_dropout,
+        freeze_rgb=skip_rgb_encoder_init,
+        skip_audio_encoder_init=skip_audio_encoder_init,
+        skip_text_encoder_init=skip_text_encoder_init,
+        skip_rgb_encoder_init=skip_rgb_encoder_init,
     )
     # Allow loading older classification-only checkpoints that don't have regression head weights.
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -751,6 +769,19 @@ def _prepare_cached_dataset_for_task(
         else:
             sample["label"] = int(task_label_idx)
     return label_names
+
+
+def _infer_cached_embedding_dims(samples: list[dict[str, Any]]) -> dict[str, int]:
+    """从 cached/feature-cache 样本里探测 embedding 维度。"""
+
+    dims: dict[str, int] = {}
+    for key in ("audio_emb", "text_emb", "rgb_emb", "flow_emb"):
+        for sample in samples:
+            value = sample.get(key, None)
+            if isinstance(value, torch.Tensor) and value.ndim >= 1:
+                dims[key] = int(value.shape[-1])
+                break
+    return dims
 
 
 def _run_cached_batched(
@@ -1066,19 +1097,25 @@ def main() -> None:
     resolved_amp_mode = resolve_amp_mode(requested_amp_mode, profile)
     use_amp = resolved_amp_mode != "off" and device.type == "cuda"
 
+    rows: list[dict[str, Any]] = []
+    manifest: dict[str, Any] | None = None
+    manifest_items: list[dict[str, Any]] = []
+    manifest_hash: str | None = None
+    cached_input = feature_cache if feature_cache is not None else cached_dataset
+    cached_ds: CachedMotionAudioDataset | None = CachedMotionAudioDataset(cached_input) if cached_input is not None else None
+    cached_embedding_dims = _infer_cached_embedding_dims(cached_ds.samples) if cached_ds is not None else {}
+
     model, ckpt_use_intensity, label_names, task_mode, task_speaker_id, validity = _load_model(
         ckpt_path,
         device=device,
         args=args,
+        cached_embedding_dims=cached_embedding_dims,
+        using_feature_cache=bool(feature_cache is not None),
     )
     video_backbone = str(getattr(model, "video_backbone", "flow"))
 
     tokenizer = None
 
-    rows: list[dict[str, Any]] = []
-    manifest: dict[str, Any] | None = None
-    manifest_items: list[dict[str, Any]] = []
-    manifest_hash: str | None = None
     if split_manifest_path is not None:
         manifest = load_split_manifest(split_manifest_path)
         manifest_items = filter_manifest_items_for_task(
@@ -1088,7 +1125,6 @@ def main() -> None:
         )
         manifest_hash = manifest_sha256(split_manifest_path)
         validity = build_validity_summary(manifest.get("summary", {}), task_mode, task_speaker_id)
-    cached_input = feature_cache if feature_cache is not None else cached_dataset
     if cached_input is not None:
         if manifest_items:
             total = len(manifest_items)
@@ -1207,7 +1243,7 @@ def main() -> None:
 
     with open(out_path, "w", encoding="utf-8") as f:
         if cached_input is not None:
-            ds = CachedMotionAudioDataset(cached_input)
+            ds = cached_ds if cached_ds is not None else CachedMotionAudioDataset(cached_input)
             label_names = _prepare_cached_dataset_for_task(ds, task_mode, task_speaker_id)
             subset_indices = list(range(len(ds)))
             if allowed_stems is not None:
