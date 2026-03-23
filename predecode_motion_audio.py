@@ -4,8 +4,10 @@ import argparse
 import sys
 import math
 import os
+import queue
 import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -114,6 +116,60 @@ def _atomic_torch_save(obj: Any, dst: Path, *, temp_dir: Path | None = None) -> 
                 tmp_path.unlink()
             except Exception:
                 pass
+
+
+class AsyncShardWriter:
+    """后台异步写 shard，避免主流程在 `torch.save` 上长时间阻塞。"""
+
+    def __init__(self, *, temp_dir: Path, max_pending: int = 2):
+        self.temp_dir = temp_dir
+        self._queue: queue.Queue[tuple[Path, Any] | None] = queue.Queue(maxsize=max(1, int(max_pending)))
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="predecode-shard-writer", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                dst, payload = item
+                if self._error is None:
+                    _atomic_torch_save(payload, dst, temp_dir=self.temp_dir)
+            except BaseException as e:  # pragma: no cover - best effort relay to main thread
+                if self._error is None:
+                    self._error = e
+            finally:
+                self._queue.task_done()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(f"async_shard_write_failed: {type(self._error).__name__}: {self._error}") from self._error
+
+    def submit(self, dst: Path, payload: Any) -> None:
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put((dst, payload), timeout=0.2)
+                break
+            except queue.Full:
+                self._raise_if_failed()
+                continue
+        self._raise_if_failed()
+
+    def close(self) -> None:
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put(None, timeout=0.2)
+                break
+            except queue.Full:
+                self._raise_if_failed()
+                continue
+        self._queue.join()
+        self._thread.join()
+        self._raise_if_failed()
 
 
 def _get_wavlm_model(model_name: str) -> Any:
@@ -677,7 +733,9 @@ def main():
     scratch_dir = choose_scratch_dir(args.scratch_dir, output_dir=out_dir)
     scratch_dir.mkdir(parents=True, exist_ok=True)
     print(
-        f"Runtime: device={profile.device_type} cpu={profile.cpu_count} workers={resolved_num_workers} "
+        f"Runtime: device={profile.device_type} cpu={profile.cpu_count} "
+        f"(host={profile.host_cpu_count}, quota={profile.cpu_quota_count}, affinity={profile.cpu_affinity_count}, cpuset={profile.cpu_cpuset_count}) "
+        f"workers={resolved_num_workers} "
         f"mp_start={resolved_mp_start_method} mp_chunksize={resolved_mp_chunksize} scratch={scratch_dir}",
         flush=True,
     )
@@ -742,6 +800,34 @@ def main():
             return "prosody"
         return head or "unknown"
 
+    def _build_shard_payload(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """为异步 writer 构造当前 shard 的稳定快照。"""
+
+        return {
+            "samples": samples,
+            "config": {
+                "num_frames": args.num_frames,
+                "flow_size": args.flow_size,
+                "rgb_size": args.rgb_size,
+                "video_repr": args.video_repr,
+                "audio_repr": args.audio_repr,
+                "audio_model": args.audio_model,
+                "sample_rate": args.sample_rate,
+                "max_audio_sec": args.max_audio_sec,
+                "emotions": EMOTIONS,
+                "split_manifest": str(split_manifest_path) if split_manifest_path is not None else None,
+                "manifest_sha256": manifest_hash,
+                "subset": str(args.subset),
+                "limit": int(args.limit),
+            },
+            "missing": list(missing),
+        }
+
+    writer = AsyncShardWriter(
+        temp_dir=scratch_dir,
+        max_pending=2 if int(resolved_num_workers) > 0 else 1,
+    )
+
     def _handle_ok(sample: Dict[str, Any]) -> None:
         """缓存成功样本，并在达到 shard 大小时立刻落盘。"""
 
@@ -749,33 +835,13 @@ def main():
         cached.append(sample)
         ok_count += 1
         if args.shard_size > 0 and len(cached) >= args.shard_size:
+            shard_samples = cached
+            shard_num = shard_id
             shard_path = out_dir / f"{shard_id}.pt"
-            _atomic_torch_save(
-                {
-                    "samples": cached,
-                    "config": {
-                        "num_frames": args.num_frames,
-                        "flow_size": args.flow_size,
-                        "rgb_size": args.rgb_size,
-                        "video_repr": args.video_repr,
-                        "audio_repr": args.audio_repr,
-                        "audio_model": args.audio_model,
-                        "sample_rate": args.sample_rate,
-                        "max_audio_sec": args.max_audio_sec,
-                        "emotions": EMOTIONS,
-                        "split_manifest": str(split_manifest_path) if split_manifest_path is not None else None,
-                        "manifest_sha256": manifest_hash,
-                        "subset": str(args.subset),
-                        "limit": int(args.limit),
-                    },
-                    "missing": missing,
-                },
-                shard_path,
-                temp_dir=scratch_dir,
-            )
-            print(f"Saved shard {shard_id} ({len(cached)} samples) -> {shard_path}", flush=True)
-            shard_id += 1
             cached = []
+            shard_id += 1
+            writer.submit(shard_path, _build_shard_payload(shard_samples))
+            print(f"Queued shard {shard_num} ({len(shard_samples)} samples) -> {shard_path}", flush=True)
 
     def _format_task_line(idx: int, task: Dict[str, Any]) -> str:
         """格式化统一的 per-sample 日志头。"""
@@ -1086,31 +1152,14 @@ def main():
                 pass
 
     if cached:
+        shard_samples = cached
+        shard_num = shard_id
         shard_path = out_dir / f"{shard_id}.pt"
-        _atomic_torch_save(
-            {
-                "samples": cached,
-                "config": {
-                    "num_frames": args.num_frames,
-                    "flow_size": args.flow_size,
-                    "rgb_size": args.rgb_size,
-                    "video_repr": args.video_repr,
-                    "audio_repr": args.audio_repr,
-                    "audio_model": args.audio_model,
-                    "sample_rate": args.sample_rate,
-                    "max_audio_sec": args.max_audio_sec,
-                    "emotions": EMOTIONS,
-                    "split_manifest": str(split_manifest_path) if split_manifest_path is not None else None,
-                    "manifest_sha256": manifest_hash,
-                    "subset": str(args.subset),
-                    "limit": int(args.limit),
-                },
-                "missing": missing,
-            },
-            shard_path,
-            temp_dir=scratch_dir,
-        )
-        print(f"Saved shard {shard_id} ({len(cached)} samples) -> {shard_path}", flush=True)
+        writer.submit(shard_path, _build_shard_payload(shard_samples))
+        print(f"Queued shard {shard_num} ({len(shard_samples)} samples) -> {shard_path}", flush=True)
+
+    writer.close()
+    print("Async shard writer flushed all pending saves.", flush=True)
 
     if missing:
         (out_dir / "missing.txt").write_text("\n".join(missing), encoding="utf-8")

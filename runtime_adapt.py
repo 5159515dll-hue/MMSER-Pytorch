@@ -16,6 +16,10 @@ class RuntimeProfile:
 
     platform: str
     cpu_count: int
+    host_cpu_count: int
+    cpu_quota_count: Optional[int]
+    cpu_affinity_count: Optional[int]
+    cpu_cpuset_count: Optional[int]
     available_mem_bytes: Optional[int]
     device_type: str
     device_index: Optional[int]
@@ -50,6 +54,109 @@ def _available_mem_bytes() -> Optional[int]:
     return None
 
 
+def _parse_cpuset_count(raw: str) -> Optional[int]:
+    """把 cpuset 字符串如 `0-3,8,10-11` 解析成 CPU 数。"""
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    total = 0
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            try:
+                start = int(left)
+                end = int(right)
+            except Exception:
+                continue
+            if end >= start:
+                total += (end - start + 1)
+        else:
+            try:
+                int(part)
+            except Exception:
+                continue
+            total += 1
+    return total if total > 0 else None
+
+
+def _cpu_affinity_count() -> Optional[int]:
+    """读取当前进程的 CPU affinity 数量。"""
+
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        return None
+
+
+def _cpu_cpuset_count() -> Optional[int]:
+    """读取 cgroup cpuset 限制。"""
+
+    candidates = [
+        Path("/sys/fs/cgroup/cpuset.cpus.effective"),
+        Path("/sys/fs/cgroup/cpuset.cpus"),
+        Path("/sys/fs/cgroup/cpuset/cpuset.cpus.effective"),
+        Path("/sys/fs/cgroup/cpuset/cpuset.cpus"),
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                parsed = _parse_cpuset_count(path.read_text(encoding="utf-8").strip())
+                if parsed is not None:
+                    return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _cpu_quota_count() -> Optional[int]:
+    """读取 cgroup CPU quota，并换算成容器可用核数。"""
+
+    try:
+        cpu_max = Path("/sys/fs/cgroup/cpu.max")
+        if cpu_max.exists():
+            quota_text = cpu_max.read_text(encoding="utf-8").strip()
+            quota_str, period_str = quota_text.split()[:2]
+            if quota_str != "max":
+                quota = int(quota_str)
+                period = int(period_str)
+                if quota > 0 and period > 0:
+                    return max(1, int(math.floor(quota / period)))
+    except Exception:
+        pass
+
+    try:
+        quota_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        period_path = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if quota_path.exists() and period_path.exists():
+            quota = int(quota_path.read_text(encoding="utf-8").strip())
+            period = int(period_path.read_text(encoding="utf-8").strip())
+            if quota > 0 and period > 0:
+                return max(1, int(math.floor(quota / period)))
+    except Exception:
+        pass
+    return None
+
+
+def _effective_cpu_count() -> tuple[int, Optional[int], Optional[int], Optional[int], int]:
+    """综合 host / affinity / cpuset / quota 推断容器实际可用核数。"""
+
+    host_cpu_count = max(1, int(os.cpu_count() or 1))
+    affinity_count = _cpu_affinity_count()
+    cpuset_count = _cpu_cpuset_count()
+    quota_count = _cpu_quota_count()
+
+    candidates = [host_cpu_count]
+    for value in (affinity_count, cpuset_count, quota_count):
+        if value is not None and value > 0:
+            candidates.append(int(value))
+    effective = max(1, min(candidates))
+    return effective, quota_count, affinity_count, cpuset_count, host_cpu_count
+
+
 def select_device(preference: str = "auto") -> torch.device:
     """按用户偏好选择 torch device。"""
 
@@ -75,6 +182,7 @@ def detect_runtime(preference: str = "auto") -> RuntimeProfile:
     """汇总 CPU / 内存 / GPU 的关键运行时信息。"""
 
     device = select_device(preference)
+    cpu_count, cpu_quota_count, cpu_affinity_count, cpu_cpuset_count, host_cpu_count = _effective_cpu_count()
     gpu_name = None
     total_vram_bytes = None
     bf16_supported = False
@@ -96,7 +204,11 @@ def detect_runtime(preference: str = "auto") -> RuntimeProfile:
 
     return RuntimeProfile(
         platform=platform.platform(),
-        cpu_count=max(1, int(os.cpu_count() or 1)),
+        cpu_count=cpu_count,
+        host_cpu_count=host_cpu_count,
+        cpu_quota_count=cpu_quota_count,
+        cpu_affinity_count=cpu_affinity_count,
+        cpu_cpuset_count=cpu_cpuset_count,
         available_mem_bytes=_available_mem_bytes(),
         device_type=str(device.type),
         device_index=device_index,
