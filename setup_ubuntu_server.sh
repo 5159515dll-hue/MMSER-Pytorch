@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 INSTALL_LEGACY_EXTRAS="${INSTALL_LEGACY_EXTRAS:-1}"
 TRY_INSTALL_DECORD="${TRY_INSTALL_DECORD:-1}"
-UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-1}"
+UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-0}"
 RUN_SMOKE_TESTS="${RUN_SMOKE_TESTS:-1}"
 
 log() {
@@ -60,7 +60,9 @@ PY
 
 if [ "$UPGRADE_PIP_TOOLS" = "1" ]; then
   log "Upgrading pip/setuptools/wheel"
-  "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel
+  if ! "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel; then
+    warn "pip/setuptools/wheel upgrade failed; continuing with the server's existing tooling."
+  fi
 fi
 
 # These pins are chosen to stay compatible with the repo's verified local environment
@@ -159,3 +161,4 @@ log "Notes:"
 log "- This script does not install torch/torchaudio/torchvision."
 log "- Hugging Face model weights are downloaded lazily on first real train/inference run."
 log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh"
+log "- pip/setuptools/wheel upgrade is disabled by default; enable it explicitly with: UPGRADE_PIP_TOOLS=1 bash setup_ubuntu_server.sh"
