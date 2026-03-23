@@ -1073,24 +1073,7 @@ def main() -> None:
     )
     video_backbone = str(getattr(model, "video_backbone", "flow"))
 
-    try:
-        from transformers import AutoTokenizer
-    except Exception as e:
-        raise RuntimeError(
-            "transformers is required for tri-modal inference (text branch). Install with: pip install transformers"
-        ) from e
-
-    text_model_name = ""
-    if isinstance(getattr(args, "text_model", None), str) and str(args.text_model).strip():
-        text_model_name = str(args.text_model).strip()
-    if not text_model_name:
-        try:
-            text_model_name = str(getattr(model.text, "model_name", "") or "")
-        except Exception:
-            text_model_name = ""
-    if not text_model_name:
-        text_model_name = "bert-base-multilingual-cased"
-    tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+    tokenizer = None
 
     rows: list[dict[str, Any]] = []
     manifest: dict[str, Any] | None = None
@@ -1132,6 +1115,27 @@ def main() -> None:
         limit = args.limit if args.limit and args.limit > 0 else total
     allowed_stems = {str(item.get("seq", "")) for item in manifest_items} if manifest_items else None
     manifest_by_seq = {str(item.get("seq", "")): item for item in manifest_items} if manifest_items else {}
+
+    need_tokenizer_for_raw = cached_input is None and (not bool(args.zero_text))
+    if need_tokenizer_for_raw:
+        try:
+            from transformers import AutoTokenizer
+        except Exception as e:
+            raise RuntimeError(
+                "transformers is required for tri-modal inference (text branch). Install with: pip install transformers"
+            ) from e
+
+        text_model_name = ""
+        if isinstance(getattr(args, "text_model", None), str) and str(args.text_model).strip():
+            text_model_name = str(args.text_model).strip()
+        if not text_model_name:
+            try:
+                text_model_name = str(getattr(model.text, "model_name", "") or "")
+            except Exception:
+                text_model_name = ""
+        if not text_model_name:
+            text_model_name = "bert-base-multilingual-cased"
+        tokenizer = AutoTokenizer.from_pretrained(text_model_name)
 
     print(
         json.dumps(
@@ -1226,7 +1230,7 @@ def main() -> None:
                 ]
             if limit > 0:
                 subset_indices = subset_indices[:limit]
-            if (not bool(args.zero_text)) and tokenizer is not None:
+            if (not bool(args.zero_text)) and tokenizer is not None and not all("text_emb" in s for s in ds.samples):
                 _cache_text_tokens(ds, tokenizer, int(args.max_text_len))
 
             cached_run_stats = _run_cached_batched(
@@ -1465,6 +1469,11 @@ def main() -> None:
 
                     text_inputs = None
                     if not bool(args.zero_text):
+                        if tokenizer is None:
+                            raise RuntimeError(
+                                "Text tokenizer is unavailable for raw XLSX inference. "
+                                "Provide local text model files or switch to cached/feature-cache inference."
+                            )
                         text_inputs = tokenizer(
                             [str(row.get("mn", mn_text))],
                             padding=True,

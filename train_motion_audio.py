@@ -897,15 +897,17 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=int(resolved_batch_size), shuffle=True, **dl_kwargs)
     val_loader = DataLoader(val_ds, batch_size=int(resolved_batch_size), shuffle=False, **dl_kwargs)
 
-    try:
-        from transformers import AutoTokenizer
-    except Exception as e:
-        raise RuntimeError(
-            "transformers is required for tri-modal training (text branch). Install with: pip install transformers"
-        ) from e
+    tokenizer = None
+    needs_text_tokenizer = (not bool(args.zero_text)) and (not all("text_emb" in s for s in ds.samples))
+    if needs_text_tokenizer:
+        try:
+            from transformers import AutoTokenizer
+        except Exception as e:
+            raise RuntimeError(
+                "transformers is required for tri-modal training (text branch). Install with: pip install transformers"
+            ) from e
 
-    tokenizer = AutoTokenizer.from_pretrained(str(args.text_model))
-    if not bool(args.zero_text) and not all("text_emb" in s for s in ds.samples):
+        tokenizer = AutoTokenizer.from_pretrained(str(args.text_model))
         _cache_text_tokens(ds, tokenizer, int(args.max_text_len))
 
     model = FusionClassifier(
@@ -1108,6 +1110,11 @@ def main():
                 if text_inputs is not None:
                     text_inputs = {k: v.to(device, non_blocking=nb) for k, v in text_inputs.items()}
                 elif text_emb_t is None:
+                    if tokenizer is None:
+                        raise RuntimeError(
+                            "Text tokenizer is unavailable and batch is missing text_emb/text_inputs. "
+                            "Rebuild a feature cache with text embeddings or provide local text model files."
+                        )
                     text_inputs = tokenizer(
                         [str(x) for x in mn_list],
                         padding=True,
@@ -1302,6 +1309,11 @@ def main():
                     if text_inputs is not None:
                         text_inputs = {k: v.to(device, non_blocking=nb) for k, v in text_inputs.items()}
                     elif text_emb_t is None:
+                        if tokenizer is None:
+                            raise RuntimeError(
+                                "Text tokenizer is unavailable and batch is missing text_emb/text_inputs. "
+                                "Rebuild a feature cache with text embeddings or provide local text model files."
+                            )
                         text_inputs = tokenizer(
                             [str(x) for x in mn_list],
                             padding=True,
