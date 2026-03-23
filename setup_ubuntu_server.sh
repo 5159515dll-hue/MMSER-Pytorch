@@ -21,6 +21,8 @@ RUN_SMOKE_TESTS="${RUN_SMOKE_TESTS:-1}"
 USE_VENV="${USE_VENV:-1}"
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv-server}"
 BOOTSTRAPPED_VENV="${BOOTSTRAPPED_VENV:-0}"
+ENABLE_PYPI_FALLBACK="${ENABLE_PYPI_FALLBACK:-1}"
+PYPI_FALLBACK_INDEX_URL="${PYPI_FALLBACK_INDEX_URL:-https://pypi.org/simple}"
 
 log() {
   printf '[setup] %s\n' "$*"
@@ -41,6 +43,19 @@ require_cmd() {
 
 run_python_check() {
   "$PYTHON_BIN" - "$@"
+}
+
+pip_install() {
+  if "$PYTHON_BIN" -m pip install "$@"; then
+    return 0
+  fi
+
+  if [ "$ENABLE_PYPI_FALLBACK" != "1" ]; then
+    return 1
+  fi
+
+  warn "Primary pip install failed; retrying with official PyPI: $PYPI_FALLBACK_INDEX_URL"
+  "$PYTHON_BIN" -m pip install --index-url "$PYPI_FALLBACK_INDEX_URL" "$@"
 }
 
 require_cmd "$PYTHON_BIN"
@@ -133,7 +148,7 @@ PY
 
 if [ "$UPGRADE_PIP_TOOLS" = "1" ]; then
   log "Upgrading pip/setuptools/wheel"
-  if ! "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel; then
+  if ! pip_install --upgrade pip setuptools wheel; then
     warn "pip/setuptools/wheel upgrade failed; continuing with the server's existing tooling."
   fi
 fi
@@ -170,7 +185,7 @@ done
 
 if [ "${#MISSING_CORE_PACKAGES[@]}" -gt 0 ]; then
   log "Installing missing mainline + audit dependencies"
-  "$PYTHON_BIN" -m pip install "${MISSING_CORE_PACKAGES[@]}"
+  pip_install "${MISSING_CORE_PACKAGES[@]}"
 else
   log "All mainline + audit dependencies are already available"
 fi
@@ -198,7 +213,7 @@ PY
     else
       log "Installing archived baseline extras"
       # Avoid pulling a different torch stack from pip.
-      "$PYTHON_BIN" -m pip install --no-deps "facenet-pytorch>=2.6,<2.7"
+      pip_install --no-deps "facenet-pytorch>=2.6,<2.7"
     fi
   else
     warn "Skipped facenet-pytorch because torchvision is not available in the active torch environment."
@@ -214,7 +229,7 @@ PY
     log "Optional decord accelerator already available"
   else
     log "Trying to install optional decord accelerator"
-    if ! "$PYTHON_BIN" -m pip install decord; then
+    if ! pip_install decord; then
       warn "decord install failed; the project will fall back to OpenCV video decoding."
     fi
   fi
@@ -271,3 +286,4 @@ log "- This script does not install torch/torchaudio/torchvision."
 log "- Hugging Face model weights are downloaded lazily on first real train/inference run."
 log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh"
 log "- pip/setuptools/wheel upgrade is disabled by default; enable it explicitly with: UPGRADE_PIP_TOOLS=1 bash setup_ubuntu_server.sh"
+log "- If the default mirror returns 403/timeout, pip install automatically retries with official PyPI. Disable this with: ENABLE_PYPI_FALLBACK=0 ..."
