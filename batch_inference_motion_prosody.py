@@ -1097,6 +1097,15 @@ def main() -> None:
             ds = CachedMotionAudioDataset(cached_input)
             subset_indices = list(range(len(ds)))
             if allowed_stems is not None:
+                cache_stems = {str(sample.get("stem", "")) for sample in ds.samples}
+                missing_stems = sorted(allowed_stems - cache_stems)
+                if missing_stems:
+                    preview = ", ".join(missing_stems[:10])
+                    print(
+                        f"WARNING: split manifest contains {len(missing_stems)} stem(s) missing from cached input; "
+                        f"they will be skipped. Example(s): {preview}",
+                        flush=True,
+                    )
                 subset_indices = [idx for idx, sample in enumerate(ds.samples) if str(sample.get("stem", "")) in allowed_stems]
             if limit > 0:
                 subset_indices = subset_indices[:limit]

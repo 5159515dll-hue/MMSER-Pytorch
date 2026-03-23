@@ -655,24 +655,35 @@ def main():
             shown = ", ".join(sorted(list(duplicate_stems))[:10])
             print(f"WARNING: duplicate stems in cached dataset; first occurrence will be used. Example(s): {shown}")
 
-        def _indices_for_manifest(items: list[dict[str, Any]], name: str) -> list[int]:
-            """把 manifest 中的样本序号映射成缓存数据集索引。"""
+        def _indices_for_manifest(items: list[dict[str, Any]], name: str) -> tuple[list[int], list[dict[str, Any]]]:
+            """把 manifest 中的样本序号映射成缓存数据集索引。
+
+            manifest 是基于 XLSX 生成的，可能包含“有标签但缺少原始媒体”的样本。
+            这些样本不会出现在 raw/feature cache 里，因此这里选择告警并跳过，
+            而不是让整轮训练因为 1 条缺失样本直接失败。
+            """
 
             indices: list[int] = []
+            kept_items: list[dict[str, Any]] = []
             missing_stems: list[str] = []
             for item in items:
                 stem = str(item.get("seq", ""))
                 if stem in stem_to_index:
                     indices.append(stem_to_index[stem])
+                    kept_items.append(item)
                 else:
                     missing_stems.append(stem)
             if missing_stems:
                 preview = ", ".join(missing_stems[:10])
-                raise RuntimeError(f"{name} split manifest contains stems missing from cache: {preview}")
-            return indices
+                print(
+                    f"WARNING: {name} split manifest contains {len(missing_stems)} stem(s) missing from cache; "
+                    f"they will be skipped. Example(s): {preview}",
+                    flush=True,
+                )
+            return indices, kept_items
 
-        train_indices = _indices_for_manifest(train_manifest_items, "train")
-        val_indices = _indices_for_manifest(val_manifest_items, "val")
+        train_indices, train_manifest_items = _indices_for_manifest(train_manifest_items, "train")
+        val_indices, val_manifest_items = _indices_for_manifest(val_manifest_items, "val")
         if not train_indices or not val_indices:
             raise RuntimeError("Split manifest produced an empty train or val subset.")
         print(f"Using split manifest: {args.split_manifest.expanduser()}")
