@@ -553,9 +553,9 @@ def _forward_outputs(
                 pred_intensity = model.reg_head(x).squeeze(1)
             return logits, pred_intensity, "skip_encoder"
 
-        if str(video_backbone) in {"videomae", "dual"} and rgb is None:
+        if str(video_backbone) in {"videomae", "dual"} and rgb is None and rgb_emb is None:
             raise ValueError("rgb_missing")
-        if str(video_backbone) in {"flow", "dual"} and flow is None:
+        if str(video_backbone) in {"flow", "dual"} and flow is None and flow_emb is None:
             raise ValueError("flow_missing")
         if bool(return_intensity):
             logits, pred_intensity = model(
