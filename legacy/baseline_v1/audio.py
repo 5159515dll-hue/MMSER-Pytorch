@@ -7,6 +7,7 @@ LastEditors: Dai Lu Lu
 LastEditTime: 2026-01-22 18:06:05
 '''
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -38,9 +39,19 @@ try:
 except Exception:
     SOUNDFILE_AVAILABLE = False
 
-from experiments.motion_prosody.audio_aug import normalize_wav
-from experiments.motion_prosody.prosody import ProsodyConfig, extract_prosody_features
-from experiments.motion_prosody.models import ProsodyMLP
+
+def _ensure_repo_root_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+
+_ensure_repo_root_on_path()
+
+from motion_prosody.audio_aug import normalize_wav
+from motion_prosody.prosody import ProsodyConfig, extract_prosody_features
+from motion_prosody.models import ProsodyMLP
 
 # ================== 中文支持 ==================
 rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']  # 黑体

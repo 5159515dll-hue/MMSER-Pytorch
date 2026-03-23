@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# One-click environment bootstrap for a fresh Ubuntu compute server.
+# Scope:
+# - installs project Python dependencies that are not part of the server's prebuilt PyTorch stack
+# - verifies the current mainline entrypoints
+# - optionally installs archived baseline extras
+#
+# Assumptions:
+# - python and torch are already available in the active environment
+# - if you need the archived baseline, torchvision should already match the server's torch build
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+INSTALL_LEGACY_EXTRAS="${INSTALL_LEGACY_EXTRAS:-1}"
+TRY_INSTALL_DECORD="${TRY_INSTALL_DECORD:-1}"
+UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-1}"
+RUN_SMOKE_TESTS="${RUN_SMOKE_TESTS:-1}"
+
+log() {
+  printf '[setup] %s\n' "$*"
+}
+
+warn() {
+  printf '[setup][warn] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[setup][error] %s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+run_python_check() {
+  "$PYTHON_BIN" - "$@"
+}
+
+require_cmd "$PYTHON_BIN"
+
+log "Repo root: $REPO_ROOT"
+log "Python: $("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
+
+run_python_check <<'PY'
+import importlib.util
+import sys
+
+missing = [name for name in ("torch",) if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit(
+        "Missing preinstalled PyTorch runtime: "
+        + ", ".join(missing)
+        + ". This script intentionally does not install torch itself."
+    )
+print("torch runtime detected")
+PY
+
+if [ "$UPGRADE_PIP_TOOLS" = "1" ]; then
+  log "Upgrading pip/setuptools/wheel"
+  "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel
+fi
+
+# These pins are chosen to stay compatible with the repo's verified local environment
+# while avoiding torch/torchvision/torchaudio upgrades on the server.
+CORE_PACKAGES=(
+  "numpy>=1.26,<2.0"
+  "opencv-python>=4.11,<4.12"
+  "openpyxl>=3.1,<3.2"
+  "pandas>=2.0,<2.3"
+  "soundfile>=0.13,<0.14"
+  "transformers>=4.57,<4.58"
+  "sentencepiece>=0.2,<0.3"
+  "tqdm>=4.66,<5"
+  "matplotlib>=3.7,<3.9"
+  "Pillow>=10,<11"
+)
+
+log "Installing mainline + audit dependencies"
+"$PYTHON_BIN" -m pip install "${CORE_PACKAGES[@]}"
+
+TORCHVISION_READY=0
+if run_python_check <<'PY'
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("torchvision") is not None else 1)
+PY
+then
+  TORCHVISION_READY=1
+  log "torchvision detected in the server image"
+else
+  warn "torchvision not found. Current mainline can still run, but legacy/baseline_v1 extras will be skipped."
+fi
+
+if [ "$INSTALL_LEGACY_EXTRAS" = "1" ]; then
+  if [ "$TORCHVISION_READY" = "1" ]; then
+    log "Installing archived baseline extras"
+    # Avoid pulling a different torch stack from pip.
+    "$PYTHON_BIN" -m pip install --no-deps "facenet-pytorch>=2.6,<2.7"
+  else
+    warn "Skipped facenet-pytorch because torchvision is not available in the active torch environment."
+  fi
+fi
+
+if [ "$TRY_INSTALL_DECORD" = "1" ]; then
+  log "Trying to install optional decord accelerator"
+  if ! "$PYTHON_BIN" -m pip install decord; then
+    warn "decord install failed; the project will fall back to OpenCV video decoding."
+  fi
+fi
+
+log "Running import checks"
+run_python_check <<'PY'
+import cv2
+import openpyxl
+import pandas
+import sentencepiece
+import soundfile
+import transformers
+import tqdm
+import matplotlib
+
+print("core_imports_ok")
+print("cv2", cv2.__version__)
+print("transformers", transformers.__version__)
+print("pandas", pandas.__version__)
+PY
+
+if [ "$INSTALL_LEGACY_EXTRAS" = "1" ] && [ "$TORCHVISION_READY" = "1" ]; then
+  if run_python_check <<'PY'
+from facenet_pytorch import MTCNN
+print("facenet_pytorch_ok", MTCNN.__name__)
+PY
+  then
+    log "facenet-pytorch import check passed"
+  else
+    warn "facenet-pytorch import check failed; legacy baseline may need a stricter torch/torchvision pairing."
+  fi
+fi
+
+if [ "$RUN_SMOKE_TESTS" = "1" ]; then
+  log "Running CLI smoke tests"
+  pushd "$REPO_ROOT" >/dev/null
+  "$PYTHON_BIN" build_split_manifest.py --help >/dev/null
+  "$PYTHON_BIN" predecode_dataset.py --help >/dev/null
+  "$PYTHON_BIN" train.py --help >/dev/null
+  "$PYTHON_BIN" batch_inference.py --help >/dev/null
+  "$PYTHON_BIN" validate_cached_shards.py --help >/dev/null
+
+  if [ "$INSTALL_LEGACY_EXTRAS" = "1" ] && [ "$TORCHVISION_READY" = "1" ]; then
+    "$PYTHON_BIN" legacy/baseline_v1/train.py --help >/dev/null
+  fi
+  popd >/dev/null
+fi
+
+log "Setup finished"
+log "Notes:"
+log "- This script does not install torch/torchaudio/torchvision."
+log "- Hugging Face model weights are downloaded lazily on first real train/inference run."
+log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh"

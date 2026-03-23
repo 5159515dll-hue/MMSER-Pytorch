@@ -1,3 +1,9 @@
+"""评估指标工具。
+
+这里的实现故意保持纯 Python / 轻依赖，原因是这些统计逻辑需要同时在
+训练和推理阶段复用，而且希望最终写进 JSON 时结构足够直观。
+"""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -5,6 +11,8 @@ from typing import Any
 
 
 def confusion_matrix_counts(y_true: list[int], y_pred: list[int], num_classes: int) -> list[list[int]]:
+    """根据真实标签和预测标签构造混淆矩阵计数。"""
+
     matrix = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
     for truth, pred in zip(y_true, y_pred):
         if 0 <= truth < num_classes and 0 <= pred < num_classes:
@@ -13,6 +21,13 @@ def confusion_matrix_counts(y_true: list[int], y_pred: list[int], num_classes: i
 
 
 def macro_f1_from_confusion(matrix: list[list[int]]) -> float:
+    """从混淆矩阵直接计算 macro-F1。
+
+    对每个类别都使用
+    `F1 = 2TP / (2TP + FP + FN)`，
+    最后对所有类别做算术平均。
+    """
+
     num_classes = len(matrix)
     if num_classes == 0:
         return 0.0
@@ -27,6 +42,8 @@ def macro_f1_from_confusion(matrix: list[list[int]]) -> float:
 
 
 def classification_summary(y_true: list[int], y_pred: list[int], label_names: list[str]) -> dict[str, Any]:
+    """汇总分类任务常用指标，便于直接写入训练/推理结果。"""
+
     num_classes = len(label_names)
     matrix = confusion_matrix_counts(y_true, y_pred, num_classes)
     total = sum(sum(row) for row in matrix)
@@ -57,6 +74,12 @@ def speaker_majority_baseline(
     eval_items: list[dict[str, Any]],
     label_names: list[str],
 ) -> dict[str, Any]:
+    """构造一个“按 speaker 记忆多数类”的朴素基线。
+
+    这个基线不是为了性能，而是为了量化 speaker confound 有多严重：
+    如果它已经很高，说明模型很可能主要在识别说话人，而不是情绪。
+    """
+
     speaker_label_counts: dict[str, Counter[str]] = defaultdict(Counter)
     for item in train_items:
         if not item.get("is_usable"):
@@ -99,4 +122,3 @@ def speaker_majority_baseline(
         }
     )
     return summary
-

@@ -6,12 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
-# Make project root importable
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.config import EMOTIONS
+EMOTIONS = ["angry", "disgusted", "fear", "happy", "neutral", "sad", "surprise"]
 
 
 ZH2EN = {

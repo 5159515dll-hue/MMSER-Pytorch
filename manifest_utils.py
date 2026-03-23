@@ -1,3 +1,13 @@
+"""split manifest 读写与数据审计工具。
+
+这个模块是当前主线的数据“事实层”：
+- 它把 XLSX 中的行解析成统一样本项；
+- 为每条样本补齐 speaker、文本泄漏提示、文件路径、split 等元数据；
+- 最后把这些信息固化成 manifest，供训练和推理共享。
+
+这样做的目的，是把“数据事实”和“模型逻辑”分开，减少实验口径漂移。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -55,6 +65,13 @@ EMOTION_DESC_CN = [
 
 
 def normalize_seq(raw: Any) -> str:
+    """把各种形态的序号字段归一成稳定字符串。
+
+    XLSX 里的序号经常会出现 `1`、`1.0`、`"1"`、空字符串等混杂情况。
+    这个函数的目标不是保留原始格式，而是尽量把“语义上同一个样本 ID”
+    归并到一个统一表示上，便于后续查路径、对齐缓存和 manifest。
+    """
+
     if raw is None or isinstance(raw, bool):
         return ""
     if isinstance(raw, float) and math.isnan(raw):
@@ -88,6 +105,8 @@ def normalize_seq(raw: Any) -> str:
 
 
 def parse_intensity(raw: Any) -> float | None:
+    """把强度字段解析成浮点数；无效值统一返回 `None`。"""
+
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, float) and math.isnan(raw):
@@ -105,6 +124,8 @@ def parse_intensity(raw: Any) -> float | None:
 
 
 def resolve_label_en(raw: Any) -> str | None:
+    """把中文标签或英文标签统一映射到主工程使用的英文类别名。"""
+
     if raw is None:
         return None
     label = CN_TO_EN.get(str(raw).strip(), str(raw).strip().lower()).strip().lower()
@@ -112,6 +133,12 @@ def resolve_label_en(raw: Any) -> str | None:
 
 
 def infer_speaker_id(label_en: str | None) -> str:
+    """根据当前已知规则，从情绪标签反推出 speaker ID。
+
+    这是一个带有先验假设的推断，不是数据集中显式给出的字段。
+    它主要用于审计当前数据是否存在严重的 speaker confound。
+    """
+
     if not label_en:
         return "UNKNOWN"
     for speaker_id, labels in SPEAKER_LABELS_EN.items():
@@ -121,6 +148,8 @@ def infer_speaker_id(label_en: str | None) -> str:
 
 
 def _contains_keyword(text: str, keywords: list[str], *, lowercase: bool) -> bool:
+    """判断文本是否包含任一关键词。"""
+
     if lowercase:
         haystack = text.lower()
         return any(kw.lower() in haystack for kw in keywords)
@@ -128,6 +157,12 @@ def _contains_keyword(text: str, keywords: list[str], *, lowercase: bool) -> boo
 
 
 def detect_text_cue_flags(mn_text: str, zh_text: str, label_raw: str) -> dict[str, bool]:
+    """检测文本里是否包含潜在的情绪泄漏线索。
+
+    返回值是一个布尔字典，而不是单一标志位，原因是后续既要判断
+    “是否有问题”，也要知道“问题具体来自哪一种文本线索”。
+    """
+
     text = " ".join(x for x in [mn_text.strip(), zh_text.strip()] if x).strip()
     text_lower = text.lower()
     label_en = resolve_label_en(label_raw)
@@ -147,6 +182,13 @@ def detect_text_cue_flags(mn_text: str, zh_text: str, label_raw: str) -> dict[st
 
 
 def read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
+    """读取 XLSX 并规范化成字典列表。
+
+    兼容两类表头：
+    1. 显式列名版本，包含 `序号/蒙文/中文/情感类别/...`；
+    2. 老式无表头或弱表头版本，只能按列位置猜测字段含义。
+    """
+
     try:
         from openpyxl import load_workbook
     except Exception as e:
@@ -183,6 +225,8 @@ def read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
         col_to_idx = {name: i for i, name in enumerate(header) if name}
 
         def _get_value(record: tuple[Any, ...], name: str) -> Any:
+            """按列名安全读取单元格，越界或缺列时返回 `None`。"""
+
             idx = col_to_idx.get(name)
             if idx is None or idx >= len(record):
                 return None
@@ -233,6 +277,8 @@ def read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def resolve_paths_for_seq(data_root: Path, label_en: str, seq: str) -> tuple[Path | None, Path | None]:
+    """根据标签目录约定或全局搜索，为样本定位视频和音频路径。"""
+
     video = data_root / label_en / f"{seq}.mp4"
     audio = data_root / label_en / f"{label_en}_audio" / f"{seq}.wav"
     if video.exists() and audio.exists():
@@ -246,10 +292,21 @@ def resolve_paths_for_seq(data_root: Path, label_en: str, seq: str) -> tuple[Pat
 
 
 def manifest_sha256(path: Path) -> str:
+    """计算 manifest 文件内容的 SHA256，用于实验可复现追踪。"""
+
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """从 manifest 条目列表生成数据摘要。
+
+    这个摘要会被直接写进 manifest，后续训练/推理都可以快速看到：
+    - usable/raw_usable 数量；
+    - 每类标签和 speaker 计数；
+    - 文本泄漏统计；
+    - 是否存在一类情绪只对应一个 speaker 的严重混淆。
+    """
+
     label_counts = Counter()
     split_counts = Counter()
     speaker_counts = Counter()
@@ -308,6 +365,19 @@ def build_split_manifest(
     seed: int = 42,
     split_strategy: str = "stratified_random_by_label",
 ) -> dict[str, Any]:
+    """构建主工程使用的 split manifest。
+
+    处理流程：
+    1. 读取 XLSX；
+    2. 规范化序号、标签、文本和强度；
+    3. 补齐 speaker、文本线索标记、媒体文件路径和可用性；
+    4. 按标签做分层 train/val 划分；
+    5. 生成摘要和内容级哈希。
+
+    Returns:
+        一个可直接序列化为 JSON 的 manifest 字典。
+    """
+
     rows = read_xlsx_rows(xlsx)
     items: list[dict[str, Any]] = []
     usable_indices_by_label: dict[str, list[int]] = defaultdict(list)
@@ -357,6 +427,7 @@ def build_split_manifest(
         else:
             shuffled = sorted(indices, key=lambda idx: items[idx]["seq"])
         cutoff = int(len(shuffled) * float(train_split))
+        # 这里按标签分别切分，确保每个情绪类别在 train/val 都尽量保留比例。
         for index in shuffled[:cutoff]:
             items[index]["split"] = "train"
         for index in shuffled[cutoff:]:
@@ -380,6 +451,8 @@ def build_split_manifest(
 
 
 def load_split_manifest(path: Path) -> dict[str, Any]:
+    """读取并做最基本结构校验。"""
+
     obj = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(obj, dict) or "items" not in obj:
         raise RuntimeError(f"Invalid split manifest: {path}")
@@ -389,6 +462,8 @@ def load_split_manifest(path: Path) -> dict[str, Any]:
 
 
 def select_manifest_items(manifest: dict[str, Any], subset: str = "all") -> list[dict[str, Any]]:
+    """从 manifest 中选择某个子集的可用条目。"""
+
     subset = str(subset or "all").strip().lower()
     items = manifest.get("items", [])
     if subset == "all":

@@ -6,6 +6,7 @@ Date: 2026-01-23
 LastEditors: Dai Lu Lu
 LastEditTime: 2026-01-23 13:55:31
 '''
+import sys
 from pathlib import Path
 
 import cv2
@@ -15,7 +16,17 @@ import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from matplotlib import rcParams
 
-from experiments.motion_prosody.models import FlowVideoEncoder, VideoMAEEncoder
+
+def _ensure_repo_root_on_path() -> None:
+	repo_root = Path(__file__).resolve().parents[2]
+	repo_root_str = str(repo_root)
+	if repo_root_str not in sys.path:
+		sys.path.insert(0, repo_root_str)
+
+
+_ensure_repo_root_on_path()
+
+from motion_prosody.models import FlowVideoEncoder, VideoMAEEncoder
 
 # ================== 中文支持 ==================
 rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']  # 黑体

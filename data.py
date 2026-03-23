@@ -1,3 +1,9 @@
+"""缓存数据集读取与 batch 拼接。
+
+`predecode_motion_audio.py` 会把预处理好的多模态样本写成 `.pt` 分片。
+这个模块负责把这些分片重新读回来，并在 DataLoader 层面统一成训练可用的 batch。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,11 +16,22 @@ from torch.utils.data import Dataset
 
 @dataclass
 class CacheConfig:
+    """缓存数据集的轻量配置占位符。"""
+
     sample_rate: int = 24000
 
 
 class CachedMotionAudioDataset(Dataset):
+    """从预解码缓存中读取样本。
+
+    设计重点：
+    - 支持目录或单个 shard 文件两种输入；
+    - 自动跳过损坏 shard，但会把问题打印出来；
+    - `__getitem__` 里统一做 dtype 和缺失值整理，减轻训练入口负担。
+    """
+
     def __init__(self, cached_dir: Path):
+        """加载缓存目录中的所有 shard。"""
         super().__init__()
         cached_dir = cached_dir.expanduser()
         if cached_dir.is_file():
@@ -54,9 +71,13 @@ class CachedMotionAudioDataset(Dataset):
             )
 
     def __len__(self) -> int:
+        """返回缓存样本总数。"""
+
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """取出单个样本，并把字段整理成训练阶段统一约定的格式。"""
+
         s = self.samples[idx]
         intensity = s.get("intensity", None)
         if isinstance(intensity, torch.Tensor):
@@ -87,6 +108,14 @@ class CachedMotionAudioDataset(Dataset):
 
 
 def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把若干缓存样本拼成一个 batch。
+
+    这里会做三类事情：
+    1. 检查某个模态是否在 batch 内“有的样本有、有的样本没有”；
+    2. 对变长音频做 padding，并记录 `audio_lens`；
+    3. 为强度回归生成 `intensity_mask`，把 NaN 标注屏蔽掉。
+    """
+
     labels = torch.stack([b["label"] for b in batch], dim=0)
 
     rgb_list = [b.get("rgb", None) for b in batch]
@@ -121,7 +150,10 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     mn_list = [str(b.get("mn", "")) for b in batch]
 
-    intensity = torch.stack([b.get("intensity", torch.tensor(float("nan"), dtype=torch.float32)) for b in batch], dim=0).to(torch.float32)
+    intensity = torch.stack(
+        [b.get("intensity", torch.tensor(float("nan"), dtype=torch.float32)) for b in batch],
+        dim=0,
+    ).to(torch.float32)
     intensity_mask = torch.isfinite(intensity)
 
     batch_out = {

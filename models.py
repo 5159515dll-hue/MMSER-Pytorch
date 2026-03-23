@@ -73,6 +73,12 @@ class VideoMAEEncoder(nn.Module):
     """
 
     def __init__(self, model_name: str = "MCG-NJU/videomae-large", freeze: bool = True):
+        """初始化 VideoMAE 编码器并注册 RGB 归一化缓冲区。
+
+        Args:
+            model_name: HuggingFace 上的 VideoMAE 模型名或本地目录。
+            freeze: 是否冻结预训练主干。
+        """
         super().__init__()
         try:
             from transformers import AutoModel
@@ -96,6 +102,13 @@ class VideoMAEEncoder(nn.Module):
         self.register_buffer("_std", std, persistent=False)
 
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        """编码 RGB clip。
+
+        这里先做 ImageNet 均值/方差归一化，再交给 VideoMAE。
+        如果模型本身没有显式 `pooler_output`，就退回到 CLS token，
+        再不行才做 mean pooling。
+        """
+
         # rgb: (B, T, 3, H, W) in [0,1]
         x = rgb.to(dtype=torch.float32)
         x = (x - self._mean) / self._std
@@ -112,6 +125,8 @@ class VideoMAEEncoder(nn.Module):
 
 
 class Wav2Vec2Encoder(nn.Module):
+    """基于 torchaudio 预训练管线的 wav2vec2 编码器。"""
+
     def __init__(self, freeze: bool = True):
         """Wav2Vec2 音频编码器（使用 torchaudio 的预训练管线）。
 
@@ -179,6 +194,12 @@ class HFAudioEncoder(nn.Module):
     """
 
     def __init__(self, model_name: str = "microsoft/wavlm-large", freeze: bool = True):
+        """初始化 HuggingFace 音频编码器。
+
+        Args:
+            model_name: 例如 `microsoft/wavlm-large`。
+            freeze: 是否冻结参数，仅训练上层融合头。
+        """
         super().__init__()
         try:
             from transformers import AutoModel
@@ -196,6 +217,13 @@ class HFAudioEncoder(nn.Module):
                 p.requires_grad = False
 
     def _get_output_lengths(self, lengths: torch.Tensor) -> torch.Tensor | None:
+        """把输入波形长度映射到编码器输出时间步长度。
+
+        某些 HuggingFace 音频模型内部有卷积下采样，因此输出序列长度
+        会短于输入长度。这个函数用于把 `audio_lens` 从原始采样点域
+        映射到 hidden-state 的时间轴上。
+        """
+
         fn = getattr(self.model, "_get_feat_extract_output_lengths", None)
         if fn is None:
             return None
@@ -205,6 +233,12 @@ class HFAudioEncoder(nn.Module):
             return None
 
     def forward(self, wav: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """编码音频并做 mean+std 池化。
+
+        当 `lengths` 可用时，会构造输出时域掩码，只对有效帧做统计；
+        否则默认把整个时间轴都纳入池化。
+        """
+
         x = wav.to(dtype=torch.float32)
         attention_mask = None
         if lengths is not None:
@@ -232,12 +266,15 @@ class HFAudioEncoder(nn.Module):
         mask_f = mask.to(hidden.dtype)
         denom = mask_f.sum(dim=1).clamp(min=1.0)
         mean = (hidden * mask_f[:, :, None]).sum(dim=1) / denom[:, None]
+        # 方差也必须只在有效帧上统计，所以这里用同一个掩码对平方误差求和。
         var = ((hidden - mean[:, None, :]) ** 2 * mask_f[:, :, None]).sum(dim=1) / denom[:, None]
         std = torch.sqrt(var.clamp_min(1e-6))
         return torch.cat([mean, std], dim=1)
 
 
 class ProsodyMLP(nn.Module):
+    """把低维韵律统计映射到可与其它模态融合的嵌入空间。"""
+
     def __init__(self, in_dim: int = 10, out_dim: int = 64):
         """韵律/统计特征的 MLP 编码器。
 
@@ -271,6 +308,8 @@ class ProsodyMLP(nn.Module):
 
 
 class MbertTextEncoder(nn.Module):
+    """基于 HuggingFace `AutoModel` 的文本编码器封装。"""
+
     def __init__(self, model_name: str = "bert-base-multilingual-cased", freeze: bool = True):
         """mBERT 文本编码器（HuggingFace Transformers）。
 
@@ -329,6 +368,12 @@ class MbertTextEncoder(nn.Module):
 
 
 class FusionClassifier(nn.Module):
+    """主工程的多模态融合网络。
+
+    它负责把视频、音频、韵律、文本四路表示统一到同一个判别空间，
+    并输出情绪分类结果，以及可选的连续强度回归结果。
+    """
+
     def __init__(
         self,
         num_classes: int = 7,
@@ -478,6 +523,13 @@ class FusionClassifier(nn.Module):
             self.reg_head = None
 
     def _maybe_drop_modality(self, x: torch.Tensor) -> torch.Tensor:
+        """按样本随机丢弃一个非文本模态。
+
+        这里的 dropout 不是逐元素，而是“整条模态向量”级别：
+        对同一个样本，要么完整保留该模态，要么整个置零。
+        这样更接近真实缺模态/弱模态场景。
+        """
+
         if not self.training:
             return x
         p = float(self.modality_dropout)
@@ -573,6 +625,14 @@ class FusionClassifier(nn.Module):
             gate_logits = self.gate_proj(non_text)
             if self.gate_temperature <= 0:
                 raise ValueError("gate_temperature_must_be_positive")
+            # 门控位移融合的核心公式：
+            #   gate = sigmoid(gate_logits / T)
+            #   t'   = t + (gate_scale * gate) * (delta_scale * delta)
+            #
+            # 直觉上：
+            # - `delta` 决定“往哪个方向修正文本向量”；
+            # - `gate` 决定“修正多少”；
+            # - `temperature` 控制门的平滑/尖锐程度。
             gate = torch.sigmoid(gate_logits / float(self.gate_temperature))
             t = t + (float(self.gate_scale) * gate) * (float(self.delta_scale) * delta)
             x = t

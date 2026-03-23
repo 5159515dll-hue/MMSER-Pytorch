@@ -6,11 +6,13 @@
  * @LastEditors: Dai Lu Lu
  * @LastEditTime: 2026-01-21 12:11:25
 -->
-# Motion + Prosody (独立实验目录)
+# Motion + Prosody (当前主线)
 
 ## 项目概述
 
-目标：在不改动现有主流程的前提下，提供一个新的两段式 pipeline：
+当前仓库的主线实现已经移动到仓库根目录。请从仓库根目录使用 `train.py`、`predecode_dataset.py`、`batch_inference.py`、`build_split_manifest.py` 和 `validate_cached_shards.py` 作为日常入口；旧版基线已封存在 `legacy/baseline_v1/`。本目录现在主要保留兼容导入层和历史说明文档。
+
+目标：提供一个以 manifest 驱动的数据划分、缓存预处理和多模态融合训练为核心的两段式 pipeline：
 - **预解码**：从视频提取人脸区域光流 + RGB clip（默认双路），从音频提取波形并计算显式 prosody（音调/能量动态统计），可选缓存 WavLM 音频嵌入。
 - **训练（默认配置）**：**声学表征（WavLM）+ 显式韵律（Prosody）并行；光流 + RGB 双表征视频；蒙古文文本（XLM-R）**。支持冻结音频/文本/视频分支用于消融。
 
@@ -239,7 +241,7 @@
 1) 预解码（生成缓存）
 
 ```bash
-python3 experiments/motion_prosody/predecode_motion_audio.py \
+python3 predecode_dataset.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --num-frames 64 --flow-size 112 --rgb-size 224 --video-repr both \
   --audio-repr wavlm --audio-model microsoft/wavlm-large \
@@ -253,7 +255,7 @@ python3 experiments/motion_prosody/predecode_motion_audio.py \
 2) 训练（只做分类）
 
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --epochs 50 --batch-size 32 --num-workers 16 \
   --pin-memory --persistent-workers --prefetch-factor 4 \
@@ -265,7 +267,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 3) 推理（推荐：从缓存推理）
 
 ```bash
-python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
+python3 batch_inference.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --checkpoint outputs/motion_prosody/checkpoints/best.pt \
   --output outputs/motion_prosody/inference_results.jsonl \
@@ -333,7 +335,7 @@ python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
 
 ```bash
 # 快速预解码（低分辨率、少帧）
-python3 experiments/motion_prosody/predecode_motion_audio.py \
+python3 predecode_dataset.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --num-frames 32 --flow-size 96 --sample-rate 24000 --max-audio-sec 4.0 \
   --audio-repr wavlm --audio-model microsoft/wavlm-large \
@@ -341,7 +343,7 @@ python3 experiments/motion_prosody/predecode_motion_audio.py \
   --output outputs/predecoded/motion_prosody_fast
 
 # 高精度预解码（更多帧、更大分辨率）
-python3 experiments/motion_prosody/predecode_motion_audio.py \
+python3 predecode_dataset.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --num-frames 64 --flow-size 112 --sample-rate 24000 --max-audio-sec 6.0 \
   --audio-repr wavlm --audio-model microsoft/wavlm-large \
@@ -367,7 +369,7 @@ python3 experiments/motion_prosody/predecode_motion_audio.py \
 ### 模式 1：纯分类
 
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --epochs 50 --batch-size 32 --num-workers 16 \
   --pin-memory --persistent-workers --prefetch-factor 4 \
@@ -382,7 +384,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 ### 模式 2：分类 + 情感强度回归（多任务）
 
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --epochs 50 --batch-size 32 --num-workers 16 \
   --pin-memory --persistent-workers --prefetch-factor 4 \
@@ -441,7 +443,7 @@ $$
 
 ```bash
 # 更“硬”的门控（提升非语言影响）
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --video-backbone dual --audio-model microsoft/wavlm-large \
   --text-model xlm-roberta-large --fusion-mode gated_text \
@@ -449,7 +451,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
   --modality-dropout 0.1
 
 # 回退到传统 concat 融合
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --fusion-mode concat --modality-dropout 0.0
 ```
@@ -460,7 +462,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 
 ```bash
 # 冻结视频和音频编码器，只训练融合头和 prosody
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --freeze-video --freeze-audio \
   --epochs 50 --batch-size 32 --num-workers 16 \
@@ -477,7 +479,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 ### 音频增强（提升鲁棒性）
 
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --audio-aug \
   --epochs 50 --batch-size 32 --num-workers 16 \
@@ -496,7 +498,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 ### 性能优化选项（CUDA 特定）
 
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --amp \
   --pin-memory --persistent-workers --prefetch-factor 4 \
@@ -527,7 +529,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 最快、最稳定的方式：
 
 ```bash
-python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
+python3 batch_inference.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --checkpoint outputs/motion_prosody/checkpoints/best.pt \
   --output outputs/motion_prosody/inference_results.jsonl \
@@ -550,7 +552,7 @@ python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
 在线从视频/音频解码（较慢）：
 
 ```bash
-python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
+python3 batch_inference.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --checkpoint outputs/motion_prosody/checkpoints/best.pt \
   --output outputs/motion_prosody/inference_results_online.jsonl \
@@ -572,7 +574,7 @@ python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
 MPS（Metal Performance Shaders）不支持 3D Conv（视频编码器）。推荐跳过：
 
 ```bash
-python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
+python3 batch_inference.py \
   --cached-dataset outputs/predecoded/motion_prosody_f64_sr24000 \
   --checkpoint outputs/motion_prosody/checkpoints/best.pt \
   --output outputs/motion_prosody/inference_results_nomps.jsonl \
@@ -710,7 +712,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 **第 2 步：预解码（启用光流 + RGB + prosody + WavLM 缓存）**
 ```bash
 FORCE_FACE_CPU=1 HF_ENDPOINT=$HF_ENDPOINT HF_TOKEN=$HF_TOKEN \
-python3 experiments/motion_prosody/predecode_motion_audio.py \
+python3 predecode_dataset.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --num-frames 64 --flow-size 112 --rgb-size 224 --video-repr both \
   --audio-repr both --audio-model microsoft/wavlm-large \
@@ -726,7 +728,7 @@ python3 experiments/motion_prosody/predecode_motion_audio.py \
 
 **第 3 步：训练（默认：WavLM + Prosody 并行，双路视频，蒙古文文本）**
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/my_project_v1 \
   --epochs 50 --batch-size 32 --num-workers 16 \
   --pin-memory --persistent-workers --prefetch-factor 4 \
@@ -737,7 +739,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 
 **可选：冻结分支做消融**
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/my_project_v1 \
   --freeze-audio --freeze-video --freeze-text \
   --epochs 20 --batch-size 32 --lr 1e-3 \
@@ -748,7 +750,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 
 **第 4 步：推理与评估（默认：从原始视频/音频/文本在线解码）**
 ```bash
-python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
+python3 batch_inference.py \
   --data-root databases --xlsx databases/video_databases.xlsx \
   --checkpoint outputs/my_project_v1_model/checkpoints/best.pt \
   --output outputs/my_project_v1_model/results.jsonl \
@@ -765,7 +767,7 @@ python3 experiments/motion_prosody/batch_inference_motion_prosody.py \
 
 **尝试冻结音视频分支，只微调融合层**：
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/my_project_v1 \
   --freeze-audio --freeze-video \
   --epochs 20 --batch-size 32 --lr 1e-3 \
@@ -775,7 +777,7 @@ python3 experiments/motion_prosody/train_motion_audio.py \
 
 **尝试启用音频增强与强度回归**：
 ```bash
-python3 experiments/motion_prosody/train_motion_audio.py \
+python3 train.py \
   --cached-dataset outputs/predecoded/my_project_v1 \
   --epochs 50 --batch-size 32 --lr 1e-4 \
   --audio-aug \

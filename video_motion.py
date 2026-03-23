@@ -1,3 +1,12 @@
+"""视频预处理与面部运动表征提取。
+
+当前主线里，视频模态分成两条路：
+1. 光流分支：显式建模相邻帧间的运动。
+2. RGB 分支：保留外观信息，供 VideoMAE 这类预训练模型编码。
+
+这两个函数输出的都是“已经对齐好形状”的 numpy 张量，方便后续缓存。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,17 +19,27 @@ import numpy as np
 
 @dataclass
 class MotionConfig:
+    """光流分支的采样与输出尺寸配置。"""
+
     num_frames: int = 64
     flow_size: int = 112
 
 
 @dataclass
 class RgbConfig:
+    """RGB 分支的采样与输出尺寸配置。"""
+
     num_frames: int = 64
     rgb_size: int = 224
 
 
 def _read_video_frames_cv2(path: Path) -> List[np.ndarray]:
+    """用 OpenCV 读取整段视频帧。
+
+    返回 BGR 帧列表；如果视频打不开，返回空列表而不是抛错，
+    这样上层可以统一决定是跳过样本还是回退成全零张量。
+    """
+
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return []
@@ -36,6 +55,8 @@ def _read_video_frames_cv2(path: Path) -> List[np.ndarray]:
 
 
 def _select_indices(total: int, num_frames: int) -> List[int]:
+    """生成均匀采样索引，并在短视频场景下用最后一帧补齐。"""
+
     if total <= 0:
         return [0] * num_frames
     if total >= num_frames:
@@ -46,6 +67,8 @@ def _select_indices(total: int, num_frames: int) -> List[int]:
 
 
 def _detect_face_box_haar(frame_bgr: np.ndarray, cascade: cv2.CascadeClassifier) -> Optional[Tuple[int, int, int, int]]:
+    """在单帧里用 Haar 分类器找最大的人脸框。"""
+
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(48, 48))
     if len(faces) == 0:
@@ -55,6 +78,8 @@ def _detect_face_box_haar(frame_bgr: np.ndarray, cascade: cv2.CascadeClassifier)
 
 
 def _crop_and_resize(frame_bgr: np.ndarray, box: Tuple[int, int, int, int], size: int) -> np.ndarray:
+    """按人脸框裁剪，并统一缩放到固定尺寸。"""
+
     x, y, w, h = box
     x1 = max(0, x)
     y1 = max(0, y)
@@ -99,6 +124,8 @@ def compute_face_flow_tensor(
         y = (h - side) // 2
         first_box = (x, y, side, side)
 
+    # 这里只在首帧做人脸检测，后续沿用同一个框。
+    # 这样虽然不如逐帧跟踪精细，但计算稳定、成本低，也避免人脸框抖动反而污染光流。
     face_imgs = [_crop_and_resize(f, first_box, cfg.flow_size) for f in sampled]
     grays = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in face_imgs]
 
@@ -125,8 +152,9 @@ def compute_face_flow_tensor(
 
     out = np.stack(flows, axis=1).astype(np.float32)  # (3,T-1,H,W)
 
-    # Per-sample normalization to reduce identity/lighting cues: robust scale on magnitude.
-    # Keep u/v scale consistent by same factor.
+    # 用每个样本 magnitude 的 95 分位数做鲁棒缩放：
+    # - 如果直接按最大值缩放，少量异常光流点会把整体动态范围拉坏；
+    # - 用 95 分位数更稳，同时仍保持 u/v/magnitude 三个通道的相对比例一致。
     mag = out[2]
     scale = np.percentile(np.abs(mag), 95)
     if scale and scale > 1e-6:
@@ -165,6 +193,7 @@ def compute_face_rgb_tensor(
         y = (h - side) // 2
         first_box = (x, y, side, side)
 
+    # 与光流分支保持同样的人脸框来源，减少两路视频表征的空间错位。
     face_imgs = [_crop_and_resize(f, first_box, cfg.rgb_size) for f in sampled]
     rgb_frames = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in face_imgs]
     rgb = np.stack(rgb_frames, axis=0).astype(np.float32) / 255.0  # (T,H,W,3)
