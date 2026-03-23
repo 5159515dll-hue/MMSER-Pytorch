@@ -4,6 +4,7 @@ import argparse
 import sys
 import math
 import os
+import shutil
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -41,6 +42,13 @@ _ensure_project_root_on_path()
 from prosody import ProsodyConfig, extract_prosody_features
 from audio_aug import normalize_wav
 from path_utils import default_databases_dir
+from runtime_adapt import (
+    choose_scratch_dir,
+    detect_runtime,
+    resolve_mp_chunksize,
+    resolve_mp_start_method,
+    resolve_worker_count,
+)
 from video_motion import MotionConfig, RgbConfig, compute_face_flow_and_rgb_tensors, compute_face_flow_tensor, compute_face_rgb_tensor
 from manifest_utils import (
     detect_text_cue_flags as _detect_text_cue_flags,
@@ -67,7 +75,7 @@ CN_TO_EN = {
 EMOTIONS = ["angry", "disgusted", "fear", "happy", "neutral", "sad", "surprise"]
 
 
-def _atomic_torch_save(obj: Any, dst: Path) -> None:
+def _atomic_torch_save(obj: Any, dst: Path, *, temp_dir: Path | None = None) -> None:
     """Atomically save a torch object to dst.
 
     Prevents producing truncated/corrupt .pt shards when the process is interrupted.
@@ -75,17 +83,22 @@ def _atomic_torch_save(obj: Any, dst: Path) -> None:
 
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    temp_root = temp_dir.expanduser() if temp_dir is not None else dst.parent
+    temp_root.mkdir(parents=True, exist_ok=True)
     tmp_fd: int | None = None
     tmp_path: Path | None = None
     try:
-        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(temp_root))
         tmp_path = Path(tmp_name)
         with os.fdopen(tmp_fd, "wb") as f:
             tmp_fd = None
             torch.save(obj, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(str(tmp_path), str(dst))
+        try:
+            os.replace(str(tmp_path), str(dst))
+        except OSError:
+            shutil.move(str(tmp_path), str(dst))
         tmp_path = None
     finally:
         if tmp_fd is not None:
@@ -194,13 +207,15 @@ def parse_args():
     )
     p.add_argument("--shard-size", type=int, default=100)
     p.add_argument("--output", type=Path, required=True, help="Output directory for shards")
+    p.add_argument("--scratch-dir", type=str, default="auto", help="Temp directory for shard writing. auto prefers /tmp on Linux.")
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--max-audio-sec", type=float, default=6.0)
-    p.add_argument("--num-workers", type=int, default=0, help="Use N worker processes for predecode (0=single-process)")
+    p.add_argument("--num-workers", type=str, default="auto", help="Use N worker processes for predecode (auto adapts to CPU cores)")
     p.add_argument(
         "--mp-start-method",
         type=str,
-        default="spawn",
-        choices=["spawn", "forkserver", "fork"],
+        default="auto",
+        choices=["auto", "spawn", "forkserver", "fork"],
         help="Multiprocessing start method (Linux: spawn/forkserver recommended for OpenCV/torchaudio)",
     )
     p.add_argument(
@@ -215,7 +230,7 @@ def parse_args():
         default=3.0,
         help="Seconds to wait before retrying the multiprocessing pool after a crash.",
     )
-    p.add_argument("--mp-chunksize", type=int, default=1, help="Chunk size for multiprocessing map")
+    p.add_argument("--mp-chunksize", type=str, default="auto", help="Chunk size for multiprocessing map")
     p.add_argument(
         "--prosody-no-pitch",
         action="store_true",
@@ -473,19 +488,6 @@ def main():
 
     args = parse_args()
 
-    # In multi-process mode, passing many tensor storages between processes can exhaust
-    # file descriptors / ancillary data and crash with errors like:
-    #   RuntimeError: received 0 items of ancdata
-    # Switching to file_system sharing avoids FD passing and is more robust on RPi.
-    if args.num_workers and int(args.num_workers) > 0:
-        try:
-            import torch.multiprocessing as tmp
-
-            tmp.set_sharing_strategy("file_system")
-            print(f"torch.multiprocessing sharing_strategy={tmp.get_sharing_strategy()}", flush=True)
-        except Exception as e:
-            print(f"Warning: failed to set torch sharing strategy to file_system: {type(e).__name__}: {e}", flush=True)
-
     data_root = args.data_root.expanduser()
     xlsx = args.xlsx.expanduser()
 
@@ -601,6 +603,27 @@ def main():
             print(f"Wrote missing list -> {out_dir / 'missing.txt'}", flush=True)
         return
 
+    profile = detect_runtime(args.device)
+    resolved_num_workers = resolve_worker_count(args.num_workers, phase="predecode", profile=profile, dataset_in_memory=False, total_items=total)
+    resolved_mp_start_method = resolve_mp_start_method(args.mp_start_method)
+    resolved_mp_chunksize = resolve_mp_chunksize(args.mp_chunksize, workers=int(resolved_num_workers), total_items=total)
+    scratch_dir = choose_scratch_dir(args.scratch_dir, output_dir=out_dir)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Runtime: device={profile.device_type} cpu={profile.cpu_count} workers={resolved_num_workers} "
+        f"mp_start={resolved_mp_start_method} mp_chunksize={resolved_mp_chunksize} scratch={scratch_dir}",
+        flush=True,
+    )
+
+    if int(resolved_num_workers) > 0:
+        try:
+            import torch.multiprocessing as tmp
+
+            tmp.set_sharing_strategy("file_system")
+            print(f"torch.multiprocessing sharing_strategy={tmp.get_sharing_strategy()}", flush=True)
+        except Exception as e:
+            print(f"Warning: failed to set torch sharing strategy to file_system: {type(e).__name__}: {e}", flush=True)
+
     iterator = tasks
     pbar = None
     tqdm_mod = None
@@ -677,6 +700,7 @@ def main():
                     "missing": missing,
                 },
                 shard_path,
+                temp_dir=scratch_dir,
             )
             print(f"Saved shard {shard_id} ({len(cached)} samples) -> {shard_path}", flush=True)
             shard_id += 1
@@ -700,9 +724,9 @@ def main():
             return False
         return (idx % int(args.log_every)) == 0
 
-    if args.num_workers and args.num_workers > 0:
+    if int(resolved_num_workers) > 0:
         # Multiprocess mode: compute-heavy parts run in worker processes.
-        ctx = mp.get_context(args.mp_start_method)
+        ctx = mp.get_context(resolved_mp_start_method)
         worker_fn = partial(
             _worker_process_one,
             num_frames=args.num_frames,
@@ -730,8 +754,8 @@ def main():
             if not remaining:
                 break
             try:
-                with ProcessPoolExecutor(max_workers=int(args.num_workers), mp_context=ctx) as ex:
-                    for i, res in enumerate(ex.map(worker_fn, remaining, chunksize=max(1, int(args.mp_chunksize))), 1):
+                with ProcessPoolExecutor(max_workers=int(resolved_num_workers), mp_context=ctx) as ex:
+                    for i, res in enumerate(ex.map(worker_fn, remaining, chunksize=max(1, int(resolved_mp_chunksize))), 1):
                         processed += 1
                         task = remaining[i - 1] if i <= len(remaining) else {}
                         base_line = _format_task_line(processed, task) if task else f"[#{processed}/{total}]"
@@ -1006,6 +1030,7 @@ def main():
                 "missing": missing,
             },
             shard_path,
+            temp_dir=scratch_dir,
         )
         print(f"Saved shard {shard_id} ({len(cached)} samples) -> {shard_path}", flush=True)
 

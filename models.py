@@ -432,8 +432,13 @@ class FusionClassifier(nn.Module):
         self.gate_temperature = float(gate_temperature)
         self.gate_scale = float(gate_scale)
         self.delta_scale = float(delta_scale)
+        self._freeze_audio = bool(freeze_audio)
+        self._freeze_text = bool(freeze_text)
+        self._freeze_prosody = bool(freeze_prosody)
         freeze_flow = bool(freeze_video) if freeze_flow is None else bool(freeze_flow)
         freeze_rgb = bool(freeze_video) if freeze_rgb is None else bool(freeze_rgb)
+        self._freeze_flow = bool(freeze_flow)
+        self._freeze_rgb = bool(freeze_rgb)
         if self.video_backbone == "videomae":
             self.video = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
             self.video_flow = None
@@ -522,6 +527,27 @@ class FusionClassifier(nn.Module):
         else:
             self.reg_head = None
 
+    def train(self, mode: bool = True) -> "FusionClassifier":
+        """训练态切换时，保持被冻结编码器处于 eval 模式。"""
+
+        super().train(mode)
+        if mode:
+            if self._freeze_audio:
+                self.audio.eval()
+            if self._freeze_text:
+                self.text.eval()
+            if self._freeze_prosody:
+                self.prosody.eval()
+            if self.video is not None and self.video_backbone == "videomae" and self._freeze_rgb:
+                self.video.eval()
+            if self.video is not None and self.video_backbone != "videomae" and self._freeze_flow:
+                self.video.eval()
+            if self.video_flow is not None and self._freeze_flow:
+                self.video_flow.eval()
+            if self.video_rgb is not None and self._freeze_rgb:
+                self.video_rgb.eval()
+        return self
+
     def _maybe_drop_modality(self, x: torch.Tensor) -> torch.Tensor:
         """按样本随机丢弃一个非文本模态。
 
@@ -548,6 +574,9 @@ class FusionClassifier(nn.Module):
         rgb: Optional[torch.Tensor] = None,
         audio_lens: Optional[torch.Tensor] = None,
         audio_emb: Optional[torch.Tensor] = None,
+        flow_emb: Optional[torch.Tensor] = None,
+        rgb_emb: Optional[torch.Tensor] = None,
+        text_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """前向传播：融合多模态并输出分类 logits（可选强度回归）。
 
@@ -557,6 +586,9 @@ class FusionClassifier(nn.Module):
             prosody: 韵律特征输入，形状 (B, 10)（默认与 `ProsodyMLP(in_dim=10)` 对齐）。
             text_inputs: tokenizer 输出字典；若为 None，则用零向量代替文本模态。
             return_intensity: 是否同时返回强度回归结果。
+            flow_emb: 预缓存的光流视频 embedding，形状 (B, D_flow)。
+            rgb_emb: 预缓存的 RGB 视频 embedding，形状 (B, D_rgb)。
+            text_emb: 预缓存的文本 embedding，形状 (B, D_text)。
 
         Returns:
             - 当 `return_intensity=False`：返回 `logits`，形状 (B, num_classes)。
@@ -567,27 +599,41 @@ class FusionClassifier(nn.Module):
             RuntimeError: 当请求强度输出但未启用 `intensity_head` 时抛出。
         """
         if self.video_backbone == "videomae":
-            if rgb is None:
-                raise ValueError("rgb_missing")
-            if self.video is None:
-                raise RuntimeError("video_encoder_missing")
-            v = self.video(rgb)
+            if rgb_emb is not None:
+                v = rgb_emb.to(dtype=torch.float32)
+            else:
+                if rgb is None:
+                    raise ValueError("rgb_missing")
+                if self.video is None:
+                    raise RuntimeError("video_encoder_missing")
+                v = self.video(rgb)
         elif self.video_backbone == "dual":
-            if flow is None:
-                raise ValueError("flow_missing")
-            if rgb is None:
-                raise ValueError("rgb_missing")
-            if self.video_flow is None or self.video_rgb is None:
-                raise RuntimeError("dual_video_encoder_missing")
-            v_flow = self.video_flow(flow)
-            v_rgb = self.video_rgb(rgb)
+            if flow_emb is not None:
+                v_flow = flow_emb.to(dtype=torch.float32)
+            else:
+                if flow is None:
+                    raise ValueError("flow_missing")
+                if self.video_flow is None:
+                    raise RuntimeError("flow_encoder_missing")
+                v_flow = self.video_flow(flow)
+            if rgb_emb is not None:
+                v_rgb = rgb_emb.to(dtype=torch.float32)
+            else:
+                if rgb is None:
+                    raise ValueError("rgb_missing")
+                if self.video_rgb is None:
+                    raise RuntimeError("rgb_encoder_missing")
+                v_rgb = self.video_rgb(rgb)
             v = torch.cat([v_flow, v_rgb], dim=1)
         else:
-            if flow is None:
-                raise ValueError("flow_missing")
-            if self.video is None:
-                raise RuntimeError("video_encoder_missing")
-            v = self.video(flow)
+            if flow_emb is not None:
+                v = flow_emb.to(dtype=torch.float32)
+            else:
+                if flow is None:
+                    raise ValueError("flow_missing")
+                if self.video is None:
+                    raise RuntimeError("video_encoder_missing")
+                v = self.video(flow)
 
         if audio_emb is not None:
             a = audio_emb.to(dtype=v.dtype)
@@ -606,7 +652,9 @@ class FusionClassifier(nn.Module):
         a = self._maybe_drop_modality(a)
         p = self._maybe_drop_modality(p)
 
-        if text_inputs is None:
+        if text_emb is not None:
+            t = text_emb.to(device=v.device, dtype=v.dtype)
+        elif text_inputs is None:
             # 允许在无文本场景下运行：使用零向量作为文本模态占位。
             t = torch.zeros(
                 (v.shape[0], int(self.text.out_dim)),

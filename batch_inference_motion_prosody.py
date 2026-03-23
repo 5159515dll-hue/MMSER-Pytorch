@@ -12,6 +12,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 
 import torch
+from torch.utils.data import DataLoader, Subset
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -34,6 +35,7 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from audio_aug import normalize_wav
+from data import CachedMotionAudioDataset, collate
 from manifest_utils import (
     EMOTIONS,
     load_split_manifest,
@@ -50,6 +52,14 @@ from models import FusionClassifier
 from path_utils import default_databases_dir, default_xlsx_path
 from prosody import ProsodyConfig, extract_prosody_features
 from predecode_motion_audio import load_audio
+from runtime_adapt import (
+    detect_runtime,
+    resolve_amp_mode,
+    resolve_batch_size,
+    resolve_prefetch_factor,
+    resolve_worker_count,
+    select_device,
+)
 from video_motion import MotionConfig, RgbConfig, compute_face_flow_and_rgb_tensors, compute_face_flow_tensor, compute_face_rgb_tensor
 
 
@@ -153,8 +163,13 @@ def parse_args() -> argparse.Namespace:
             "Can be a directory containing *.pt shards, or a single shard file."
         ),
     )
+    p.add_argument("--feature-cache", type=Path, default=None, help="Optional GPU feature-cache built by build_feature_cache.py")
     p.add_argument("--checkpoint", type=Path, default=Path("outputs/motion_prosody/checkpoints/best.pt"))
     p.add_argument("--output", type=Path, default=Path("outputs/motion_prosody/inference_results.jsonl"))
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--batch-size", type=str, default="auto")
+    p.add_argument("--num-workers", type=str, default="auto")
+    p.add_argument("--prefetch-factor", type=str, default="auto")
 
     p.add_argument(
         "--zero-video",
@@ -200,6 +215,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="If >0, only run first N rows")
     p.add_argument("--fail-fast", action="store_true", help="Stop at first decode/predict error")
     p.add_argument("--no-amp", action="store_true", help="Disable AMP during inference")
+    p.add_argument(
+        "--amp-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "fp16", "bf16"],
+        help="Automatic mixed precision mode. auto prefers bf16 then fp16 on CUDA.",
+    )
     p.add_argument(
         "--print-every",
         type=int,
@@ -480,6 +502,9 @@ def _forward_outputs(
     text_inputs: Optional[dict[str, torch.Tensor]],
     audio_lens: Optional[torch.Tensor],
     audio_emb: Optional[torch.Tensor],
+    flow_emb: Optional[torch.Tensor],
+    rgb_emb: Optional[torch.Tensor],
+    text_emb: Optional[torch.Tensor],
     device: torch.device,
     use_amp: bool,
     amp_mod: Any,
@@ -542,6 +567,9 @@ def _forward_outputs(
                 rgb=rgb,
                 audio_lens=audio_lens,
                 audio_emb=audio_emb,
+                flow_emb=flow_emb,
+                rgb_emb=rgb_emb,
+                text_emb=text_emb,
             )
             return logits, pred_intensity, "full"
         logits = model(
@@ -552,6 +580,9 @@ def _forward_outputs(
             rgb=rgb,
             audio_lens=audio_lens,
             audio_emb=audio_emb,
+            flow_emb=flow_emb,
+            rgb_emb=rgb_emb,
+            text_emb=text_emb,
         )
         return logits, None, "full"
 
@@ -597,6 +628,292 @@ def _count_cached_samples(paths: Iterable[Path]) -> int:
     return int(total)
 
 
+def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_len: int) -> None:
+    """预先把整集文本分词，避免 cached 推理重复 tokenizer。"""
+
+    if not ds.samples:
+        return
+    if all("text_emb" in s for s in ds.samples):
+        return
+    if all("_text_input_ids" in s and "_text_attention_mask" in s for s in ds.samples):
+        return
+    enc = tokenizer(
+        [str(s.get("mn", "")) for s in ds.samples],
+        padding="max_length",
+        truncation=True,
+        max_length=int(max_text_len),
+        return_tensors="pt",
+    )
+    token_type_ids = enc.get("token_type_ids", None)
+    for idx, sample in enumerate(ds.samples):
+        sample["_text_input_ids"] = enc["input_ids"][idx].to(torch.long).clone()
+        sample["_text_attention_mask"] = enc["attention_mask"][idx].to(torch.long).clone()
+        if token_type_ids is not None:
+            sample["_text_token_type_ids"] = token_type_ids[idx].to(torch.long).clone()
+
+
+def _run_cached_batched(
+    *,
+    ds: CachedMotionAudioDataset,
+    subset_indices: list[int],
+    out_file: Any,
+    model: FusionClassifier,
+    tokenizer: Any,
+    args: argparse.Namespace,
+    device: torch.device,
+    use_amp: bool,
+    amp_mod: Any,
+    video_backbone: str,
+    ckpt_use_intensity: bool,
+    manifest_by_seq: dict[str, dict[str, Any]],
+    print_result: str,
+    print_every: int,
+    show_first_errors: int,
+) -> dict[str, Any]:
+    """对 cached / feature-cache 数据做 batched 推理。"""
+
+    eval_ds = Subset(ds, subset_indices) if subset_indices else ds
+    profile = detect_runtime(str(args.device))
+    using_feature_cache = bool(args.feature_cache is not None or ds.config.get("feature_cache"))
+    resolved_batch_size = resolve_batch_size(
+        args.batch_size,
+        phase="inference",
+        profile=profile,
+        feature_cache=using_feature_cache,
+        video_backbone=str(video_backbone),
+        freeze_audio=True,
+        freeze_text=True,
+        freeze_flow=True,
+        freeze_rgb=True,
+    )
+    resolved_num_workers = resolve_worker_count(
+        args.num_workers,
+        phase="inference",
+        profile=profile,
+        dataset_in_memory=True,
+        total_items=(len(subset_indices) if subset_indices else len(ds)),
+    )
+    prefetch_factor = resolve_prefetch_factor(args.prefetch_factor, num_workers=resolved_num_workers)
+
+    dl_kwargs: dict[str, Any] = {
+        "batch_size": int(resolved_batch_size),
+        "shuffle": False,
+        "num_workers": int(resolved_num_workers),
+        "collate_fn": collate,
+        "pin_memory": device.type == "cuda",
+    }
+    if int(resolved_num_workers) > 0:
+        dl_kwargs["persistent_workers"] = True
+        if prefetch_factor is not None:
+            dl_kwargs["prefetch_factor"] = int(prefetch_factor)
+    loader = DataLoader(eval_ds, **dl_kwargs)
+
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+    correct = 0
+    seen = 0
+    y_true_indices: list[int] = []
+    y_pred_indices: list[int] = []
+    reg_true: list[float] = []
+    reg_pred: list[float] = []
+    err_types: Counter[str] = Counter()
+
+    iterator = loader
+    if tqdm is not None and (not args.no_progress):
+        iterator = tqdm(loader, desc="Batch inference [cached]", unit="batch", dynamic_ncols=True)
+
+    first_errors = 0
+    for batch in iterator:
+        nb = device.type == "cuda"
+        stems = [str(x) for x in batch.get("stems", [])]
+        labels = batch["labels"]
+        speaker_ids = [str(x) for x in batch.get("speaker_id", ["UNKNOWN"] * labels.shape[0])]
+        flow = batch.get("flow", None)
+        rgb = batch.get("rgb", None)
+        flow_emb = batch.get("flow_emb", None)
+        rgb_emb = batch.get("rgb_emb", None)
+        audio_emb = batch.get("audio_emb", None)
+        wav = batch.get("audio", None)
+        audio_lens = batch.get("audio_lens", None)
+        prosody = batch["prosody"]
+        text_emb = batch.get("text_emb", None)
+        text_inputs = batch.get("text_inputs", None)
+
+        try:
+            if flow is not None:
+                flow = flow.to(device, non_blocking=nb)
+            if rgb is not None:
+                rgb = rgb.to(device, non_blocking=nb)
+            if flow_emb is not None:
+                flow_emb = flow_emb.to(device, non_blocking=nb)
+            if rgb_emb is not None:
+                rgb_emb = rgb_emb.to(device, non_blocking=nb)
+            if audio_emb is not None:
+                audio_emb = audio_emb.to(device, non_blocking=nb)
+            if wav is None:
+                wav = torch.zeros((labels.shape[0], 1), device=device, dtype=torch.float32)
+            else:
+                wav = wav.to(device, non_blocking=nb)
+            if audio_lens is not None:
+                audio_lens = audio_lens.to(device, non_blocking=nb)
+            prosody = prosody.to(device, non_blocking=nb)
+            if text_emb is not None:
+                text_emb = text_emb.to(device, non_blocking=nb)
+            if text_inputs is not None:
+                text_inputs = {k: v.to(device, non_blocking=nb) for k, v in text_inputs.items()}
+            elif text_emb is None and not bool(args.zero_text):
+                text_inputs = tokenizer(
+                    [str(x) for x in batch.get("mn", [])],
+                    padding=True,
+                    truncation=True,
+                    max_length=int(args.max_text_len),
+                    return_tensors="pt",
+                )
+                text_inputs = {k: v.to(device, non_blocking=nb) for k, v in text_inputs.items()}
+
+            if bool(args.zero_video):
+                if flow is not None:
+                    flow = torch.zeros_like(flow)
+                if rgb is not None:
+                    rgb = torch.zeros_like(rgb)
+                if flow_emb is not None:
+                    flow_emb = torch.zeros_like(flow_emb)
+                if rgb_emb is not None:
+                    rgb_emb = torch.zeros_like(rgb_emb)
+            if bool(args.zero_audio):
+                wav = torch.zeros_like(wav)
+                prosody = torch.zeros_like(prosody)
+                if audio_emb is not None:
+                    audio_emb = torch.zeros_like(audio_emb)
+            if bool(args.zero_text):
+                text_inputs = None
+                text_emb = None
+
+            logits, pred_intensity, _forward_mode = _forward_outputs(
+                model,
+                flow,
+                rgb,
+                wav,
+                prosody,
+                text_inputs,
+                audio_lens,
+                audio_emb,
+                flow_emb,
+                rgb_emb,
+                text_emb,
+                device=device,
+                use_amp=use_amp,
+                amp_mod=amp_mod,
+                skip_video_encoder=bool(args.skip_video_encoder),
+                return_intensity=bool(ckpt_use_intensity),
+                video_backbone=video_backbone,
+            )
+        except Exception as e:
+            batch_n = int(labels.shape[0])
+            err_count += batch_n
+            err_types[type(e).__name__] += batch_n
+            for i, stem in enumerate(stems):
+                label_idx = int(labels[i].item())
+                label_en = EMOTIONS[label_idx] if 0 <= label_idx < len(EMOTIONS) else None
+                rec = {
+                    "stem": stem,
+                    "status": "error",
+                    "label": label_en,
+                    "error": f"{type(e).__name__}: {e}",
+                    "cache_kind": "feature" if using_feature_cache else "raw_cached",
+                }
+                out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if first_errors < show_first_errors:
+                    print(f"ERROR stem={stem} label={label_en} err={rec['error']}", flush=True)
+                    first_errors += 1
+            if args.fail_fast:
+                raise
+            continue
+
+        probs = torch.softmax(logits, dim=1).detach().cpu()
+        pred_indices = torch.argmax(probs, dim=1)
+        pred_intensity_cpu = pred_intensity.detach().float().cpu() if pred_intensity is not None else None
+
+        for i, stem in enumerate(stems):
+            label_idx = int(labels[i].item())
+            if not (0 <= label_idx < len(EMOTIONS)):
+                skip_count += 1
+                rec = {
+                    "stem": stem,
+                    "status": "skip",
+                    "reason": "bad_label",
+                    "label": label_idx,
+                }
+                out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                continue
+
+            seen += 1
+            ok_count += 1
+            label_en = EMOTIONS[label_idx]
+            pred_idx = int(pred_indices[i].item())
+            pred = EMOTIONS[pred_idx]
+            prob = float(probs[i, pred_idx].item())
+            match = bool(pred_idx == label_idx)
+            correct += int(match)
+            y_true_indices.append(label_idx)
+            y_pred_indices.append(pred_idx)
+
+            gt_intensity_val: Optional[float] = None
+            pred_intensity_val: Optional[float] = None
+            if bool(ckpt_use_intensity):
+                try:
+                    gt_value = float(batch["intensity"][i].item())
+                    if math.isfinite(gt_value):
+                        gt_intensity_val = gt_value
+                        if pred_intensity_cpu is not None:
+                            pred_intensity_val = float(pred_intensity_cpu[i].item())
+                            reg_true.append(gt_value)
+                            reg_pred.append(pred_intensity_val)
+                except Exception:
+                    gt_intensity_val = None
+
+            rec = {
+                "stem": stem,
+                "status": "ok",
+                "label": label_en,
+                "pred": pred,
+                "match": match,
+                "probability": prob,
+                "speaker_id": speaker_ids[i],
+                "cache_kind": "feature" if using_feature_cache else "raw_cached",
+                "mn": str(batch.get("mn", [""])[i]),
+            }
+            if bool(ckpt_use_intensity):
+                rec["pred_intensity"] = pred_intensity_val
+                rec["intensity_gt"] = gt_intensity_val
+            out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            if print_result in {"ok", "all"}:
+                tag = "OK" if match else "MISS"
+                print(f"{tag} stem={stem} label={label_en} pred={pred} p={prob:.4f}", flush=True)
+            if print_every > 0 and (seen % int(print_every)) == 0:
+                acc = correct / max(1, seen)
+                print(f"[{seen}] acc={acc:.4f} stem={stem} label={label_en} pred={pred} p={prob:.4f}", flush=True)
+
+    return {
+        "correct": correct,
+        "seen": seen,
+        "ok_count": ok_count,
+        "skip_count": skip_count,
+        "err_count": err_count,
+        "y_true_indices": y_true_indices,
+        "y_pred_indices": y_pred_indices,
+        "reg_true": reg_true,
+        "reg_pred": reg_pred,
+        "err_types": err_types,
+        "resolved_batch_size": int(resolved_batch_size),
+        "resolved_num_workers": int(resolved_num_workers),
+        "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+        "using_feature_cache": using_feature_cache,
+    }
+
+
 def main() -> None:
     """批量推理主流程。
 
@@ -612,6 +929,7 @@ def main() -> None:
     data_root = args.data_root.expanduser()
     xlsx = args.xlsx.expanduser()
     cached_dataset = args.cached_dataset.expanduser() if args.cached_dataset is not None else None
+    feature_cache = args.feature_cache.expanduser() if args.feature_cache is not None else None
     split_manifest_path = args.split_manifest.expanduser() if args.split_manifest is not None else None
     ckpt_path = args.checkpoint.expanduser()
     out_path = args.output.expanduser()
@@ -619,7 +937,7 @@ def main() -> None:
 
     if split_manifest_path is not None and not split_manifest_path.exists():
         raise FileNotFoundError(f"Split manifest not found: {split_manifest_path}")
-    if cached_dataset is None and split_manifest_path is None:
+    if cached_dataset is None and feature_cache is None and split_manifest_path is None:
         if not xlsx.exists():
             raise FileNotFoundError(f"XLSX not found: {xlsx}")
     if not ckpt_path.exists():
@@ -630,7 +948,8 @@ def main() -> None:
     args.zero_audio = zero_audio
     args.zero_text = zero_text
 
-    device = _select_device()
+    profile = detect_runtime(args.device)
+    device = select_device(args.device)
     # Conv3D is not supported on MPS; by default, fall back to CPU for full-model inference.
     # If user explicitly asks to skip the video encoder, MPS can still be used for audio+prosody.
     if device.type == "mps" and (not bool(args.skip_video_encoder)):
@@ -641,8 +960,9 @@ def main() -> None:
         )
         device = torch.device("cpu")
 
-    # AMP is reliably supported on CUDA. For MPS/CPU, keep it off to avoid backend-specific issues.
-    use_amp = (not args.no_amp) and device.type == "cuda"
+    requested_amp_mode = "off" if bool(args.no_amp) else str(args.amp_mode)
+    resolved_amp_mode = resolve_amp_mode(requested_amp_mode, profile)
+    use_amp = resolved_amp_mode != "off" and device.type == "cuda"
 
     model, ckpt_use_intensity = _load_model(ckpt_path, device=device, args=args)
     video_backbone = str(getattr(model, "video_backbone", "flow"))
@@ -674,14 +994,12 @@ def main() -> None:
         manifest = load_split_manifest(split_manifest_path)
         manifest_items = select_manifest_items(manifest, args.subset)
         manifest_hash = manifest_sha256(split_manifest_path)
-    if cached_dataset is not None:
-        cached_paths = _iter_cached_paths(cached_dataset)
-        # Counting requires opening each shard once; still much lighter than loading everything into RAM.
+    cached_input = feature_cache if feature_cache is not None else cached_dataset
+    if cached_input is not None:
         if manifest_items:
             total = len(manifest_items)
         else:
-            total_cached = _count_cached_samples(cached_paths)
-            total = int(total_cached)
+            total = int(_count_cached_samples(_iter_cached_paths(cached_input)))
         limit = args.limit if args.limit and args.limit > 0 else total
     else:
         if manifest_items:
@@ -692,6 +1010,21 @@ def main() -> None:
         limit = args.limit if args.limit and args.limit > 0 else total
     allowed_stems = {str(item.get("seq", "")) for item in manifest_items} if manifest_items else None
     manifest_by_seq = {str(item.get("seq", "")): item for item in manifest_items} if manifest_items else {}
+
+    print(
+        json.dumps(
+            {
+                "runtime": profile.to_jsonable(),
+                "device": str(device),
+                "amp_mode": resolved_amp_mode,
+                "cached_input": str(cached_input) if cached_input is not None else None,
+                "feature_cache": str(feature_cache) if feature_cache is not None else None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
 
     correct = 0
     seen = 0
@@ -744,268 +1077,46 @@ def main() -> None:
     err_count = 0
     err_types: Counter[str] = Counter()
     first_errors: list[str] = []
+    cached_run_stats: dict[str, Any] = {}
 
     with open(out_path, "w", encoding="utf-8") as f:
-        if cached_dataset is not None:
-            # cached 模式下，不再重新跑光流/音频预处理，而是直接从 shard 恢复张量。
-            cached_paths = _iter_cached_paths(cached_dataset)
-            it = _iter_cached_samples(cached_paths)
-            if tqdm is not None and (not args.no_progress):
-                it = tqdm(it, total=limit, desc="Batch inference [cached]", mininterval=0.5)
+        if cached_input is not None:
+            ds = CachedMotionAudioDataset(cached_input)
+            subset_indices = list(range(len(ds)))
+            if allowed_stems is not None:
+                subset_indices = [idx for idx, sample in enumerate(ds.samples) if str(sample.get("stem", "")) in allowed_stems]
+            if limit > 0:
+                subset_indices = subset_indices[:limit]
+            if (not bool(args.zero_text)) and tokenizer is not None:
+                _cache_text_tokens(ds, tokenizer, int(args.max_text_len))
 
-            for shard_path, sample in it:
-                if seen >= limit:
-                    break
-
-                try:
-                    label_val = sample.get("label")
-                    if label_val is None:
-                        raise ValueError("label_missing")
-                    label_idx = int(label_val.item()) if isinstance(label_val, torch.Tensor) else int(label_val)
-                    label_en = EMOTIONS[label_idx] if 0 <= label_idx < len(EMOTIONS) else None
-                except Exception:
-                    label_en = None
-
-                stem = str(sample.get("stem", ""))
-                if allowed_stems is not None and stem not in allowed_stems:
-                    continue
-                manifest_item = manifest_by_seq.get(stem, {})
-                mn_text = _fmt_text(sample.get("mn", manifest_item.get("mn", "")))
-                speaker_id = str(sample.get("speaker_id", manifest_item.get("speaker_id", "UNKNOWN")))
-
-                if label_en is None:
-                    rec = {
-                        "stem": stem,
-                        "status": "skip",
-                        "reason": "bad_label",
-                        "label": str(sample.get("label")),
-                        "shard": str(shard_path),
-                    }
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    skipped += 1
-                    skip_count += 1
-                    if print_result in {"skip", "all"}:
-                        print(f"SKIP stem={stem} reason=bad_label shard={shard_path.name}")
-                        sys.stdout.flush()
-                    continue
-
-                try:
-                    if stage_log:
-                        print(f"--> [{seen + 1}/{limit}] stem={stem} label={label_en} shard={shard_path.name}")
-                        sys.stdout.flush()
-
-                    t0 = time.perf_counter()
-                    if stage_log:
-                        print("    stage=forward")
-                        sys.stdout.flush()
-
-                    flow = None
-                    rgb = None
-                    if not bool(args.skip_video_encoder):
-                        if str(video_backbone) == "videomae":
-                            if "rgb" not in sample:
-                                raise RuntimeError("Cached sample missing 'rgb'. Re-run predecode with --video-repr rgb/both.")
-                            if bool(args.zero_video):
-                                rgb = torch.zeros(
-                                    (1, int(sample["rgb"].shape[0]), 3, int(sample["rgb"].shape[2]), int(sample["rgb"].shape[3])),
-                                    dtype=torch.float32,
-                                    device=device,
-                                )
-                            else:
-                                rgb = sample["rgb"].to(torch.float32).unsqueeze(0).to(device)
-                        elif str(video_backbone) == "dual":
-                            if "rgb" not in sample or "flow" not in sample:
-                                raise RuntimeError("Cached sample missing 'rgb' or 'flow'. Re-run predecode with --video-repr both.")
-                            if bool(args.zero_video):
-                                rgb = torch.zeros(
-                                    (1, int(sample["rgb"].shape[0]), 3, int(sample["rgb"].shape[2]), int(sample["rgb"].shape[3])),
-                                    dtype=torch.float32,
-                                    device=device,
-                                )
-                                flow = torch.zeros(
-                                    (1, int(sample["flow"].shape[0]), int(sample["flow"].shape[1]), int(sample["flow"].shape[2]), int(sample["flow"].shape[3])),
-                                    dtype=torch.float32,
-                                    device=device,
-                                )
-                            else:
-                                rgb = sample["rgb"].to(torch.float32).unsqueeze(0).to(device)
-                                flow = sample["flow"].to(torch.float32).unsqueeze(0).to(device)
-                        else:
-                            if "flow" not in sample:
-                                raise RuntimeError("Cached sample missing 'flow'. Re-run predecode with --video-repr flow/both.")
-                            if bool(args.zero_video):
-                                flow = torch.zeros(
-                                    (1, int(sample["flow"].shape[0]), int(sample["flow"].shape[1]), int(sample["flow"].shape[2]), int(sample["flow"].shape[3])),
-                                    dtype=torch.float32,
-                                    device=device,
-                                )
-                            else:
-                                flow = sample["flow"].to(torch.float32).unsqueeze(0).to(device)
-                    audio_emb = sample.get("audio_emb", None)
-                    if audio_emb is not None:
-                        audio_emb = audio_emb.to(torch.float32).unsqueeze(0).to(device)
-                    if "audio" in sample:
-                        wav = sample["audio"].to(torch.float32).unsqueeze(0).to(device)
-                        audio_lens = torch.tensor([wav.shape[1]], device=device, dtype=torch.long)
-                    else:
-                        if audio_emb is None:
-                            raise RuntimeError("Cached sample missing 'audio' and 'audio_emb'. Re-run predecode with --audio-repr raw or wavlm.")
-                        wav = torch.zeros((1, 1), device=device, dtype=torch.float32)
-                        audio_lens = None
-                    prosody = sample["prosody"].to(torch.float32).unsqueeze(0).to(device)
-                    if bool(args.zero_audio):
-                        if audio_emb is not None:
-                            audio_emb = torch.zeros_like(audio_emb)
-                        wav = torch.zeros_like(wav)
-                        prosody = torch.zeros_like(prosody)
-
-                    text_inputs = None
-                    if not bool(args.zero_text):
-                        text_inputs = tokenizer(
-                            [str(sample.get("mn", manifest_item.get("mn", "")))],
-                            padding=True,
-                            truncation=True,
-                            max_length=int(args.max_text_len),
-                            return_tensors="pt",
-                        )
-                        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-
-                    logits, pred_intensity, forward_mode = _forward_outputs(
-                        model,
-                        flow,
-                        rgb,
-                        wav,
-                        prosody,
-                        text_inputs,
-                        audio_lens,
-                        audio_emb,
-                        device=device,
-                        use_amp=use_amp,
-                        amp_mod=amp_mod,
-                        skip_video_encoder=bool(args.skip_video_encoder),
-                        return_intensity=bool(ckpt_use_intensity),
-                        video_backbone=video_backbone,
-                    )
-
-                    probs = torch.softmax(logits, dim=1)[0]
-                    pred_idx = int(torch.argmax(probs).item())
-                    pred = EMOTIONS[pred_idx]
-                    prob = float(probs[pred_idx].item())
-
-                    pred_intensity_val: Optional[float] = None
-                    if bool(ckpt_use_intensity) and pred_intensity is not None:
-                        pred_intensity_val = float(pred_intensity.detach().float()[0].item())
-
-                    if stage_log:
-                        t1 = time.perf_counter()
-                        print(f"    stage=done (total {t1 - t0:.2f}s) pred={pred} p={prob:.4f}")
-                        sys.stdout.flush()
-                except Exception as e:
-                    err_count += 1
-                    err_types[type(e).__name__] += 1
-                    rec = {
-                        "stem": stem,
-                        "status": "error",
-                        "label": label_en,
-                        "shard": str(shard_path),
-                        "error": f"{type(e).__name__}: {e}",
-                    }
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    if show_first_errors and len(first_errors) < show_first_errors:
-                        msg = f"ERROR stem={stem} label={label_en} err={rec['error']}"
-                        first_errors.append(msg)
-                        print(msg)
-                        sys.stdout.flush()
-                    elif print_result in {"error", "all"}:
-                        print(f"ERROR stem={stem} label={label_en} err={rec['error']}")
-                        sys.stdout.flush()
-                    if args.fail_fast:
-                        raise
-                    continue
-
-                ok = pred == label_en
-                correct += int(ok)
-                # Update macro-F1 counts.
-                y = EMOTIONS.index(label_en)
-                yhat = EMOTIONS.index(pred)
-                y_true_indices.append(y)
-                y_pred_indices.append(yhat)
-                if y == yhat:
-                    tp[y] += 1
-                else:
-                    fp[yhat] += 1
-                    fn[y] += 1
-                seen += 1
-                ok_count += 1
-
-                gt_intensity_val: Optional[float] = None
-                raw_gt = sample.get("intensity", None)
-                if isinstance(raw_gt, torch.Tensor):
-                    try:
-                        v = float(raw_gt.detach().cpu().reshape(()).item())
-                        if not (math.isnan(v) or math.isinf(v)):
-                            gt_intensity_val = float(v)
-                    except Exception:
-                        gt_intensity_val = None
-                else:
-                    gt_intensity_val = _parse_intensity(raw_gt)
-                if bool(ckpt_use_intensity) and (pred_intensity_val is not None) and (gt_intensity_val is not None):
-                    reg_pred.append(float(pred_intensity_val))
-                    reg_true.append(float(gt_intensity_val))
-
-                if bool(args.skip_video_encoder):
-                    video_mode = "skip_encoder"
-                elif bool(args.zero_video):
-                    video_mode = "zero"
-                elif str(video_backbone) == "videomae":
-                    video_mode = "cached_rgb"
-                elif str(video_backbone) == "dual":
-                    video_mode = "cached_dual"
-                else:
-                    video_mode = "cached_flow"
-                rec = {
-                    "stem": stem,
-                    "status": "ok",
-                    "label": label_en,
-                    "pred": pred,
-                    "match": bool(ok),
-                    "probability": prob,
-                    "source": "cached",
-                    "shard": str(shard_path),
-                    "speaker_id": speaker_id,
-                    "video_mode": video_mode,
-                    "mn": mn_text,
-                }
-                if bool(ckpt_use_intensity):
-                    rec["pred_intensity"] = pred_intensity_val
-                    rec["intensity_gt"] = gt_intensity_val
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-                if print_result in {"ok", "all"}:
-                    tag = "OK" if ok else "MISS"
-                    print(f"{tag} stem={stem} label={label_en} pred={pred} p={prob:.4f} shard={shard_path.name}")
-                    if bool(args.print_text) and mn_text:
-                        print(f"    mn={mn_text}")
-                    sys.stdout.flush()
-
-                should_print = False
-                if args.debug:
-                    should_print = True
-                elif print_every > 0 and (seen % print_every) == 0:
-                    should_print = True
-
-                if should_print:
-                    acc = correct / max(1, seen)
-                    msg = f"[{seen}/{limit}] acc={acc:.4f} stem={stem} label={label_en} pred={pred} p={prob:.4f}"
-                    print(msg)
-                    if args.print_json:
-                        print(json.dumps(rec, ensure_ascii=False))
-
-                if tqdm is not None and hasattr(it, "update"):
-                    try:
-                        it.update(0)  # type: ignore[call-arg]
-                    except Exception:
-                        pass
+            cached_run_stats = _run_cached_batched(
+                ds=ds,
+                subset_indices=subset_indices,
+                out_file=f,
+                model=model,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                use_amp=use_amp,
+                amp_mod=amp_mod,
+                video_backbone=video_backbone,
+                ckpt_use_intensity=bool(ckpt_use_intensity),
+                manifest_by_seq=manifest_by_seq,
+                print_result=print_result,
+                print_every=print_every,
+                show_first_errors=show_first_errors,
+            )
+            correct = int(cached_run_stats["correct"])
+            seen = int(cached_run_stats["seen"])
+            ok_count = int(cached_run_stats["ok_count"])
+            skip_count = int(cached_run_stats["skip_count"])
+            err_count = int(cached_run_stats["err_count"])
+            y_true_indices = list(cached_run_stats["y_true_indices"])
+            y_pred_indices = list(cached_run_stats["y_pred_indices"])
+            reg_true = list(cached_run_stats["reg_true"])
+            reg_pred = list(cached_run_stats["reg_pred"])
+            err_types = Counter(cached_run_stats["err_types"])
         else:
             # XLSX 模式：在线从原始媒体提特征，适合排查原始数据问题，
             # 但速度明显慢于 cached 模式。
@@ -1227,6 +1338,9 @@ def main() -> None:
                         text_inputs,
                         audio_lens,
                         None,
+                        None,
+                        None,
+                        None,
                         device=device,
                         use_amp=use_amp,
                         amp_mod=amp_mod,
@@ -1367,8 +1481,9 @@ def main() -> None:
         speaker_baseline = speaker_majority_baseline(train_items, eval_items, EMOTIONS)
 
     metrics_summary = {
-        "xlsx": str(xlsx) if cached_dataset is None and split_manifest_path is None else None,
-        "cached_dataset": str(cached_dataset) if cached_dataset is not None else None,
+        "xlsx": str(xlsx) if cached_input is None and split_manifest_path is None else None,
+        "cached_dataset": str(cached_input) if cached_input is not None else None,
+        "feature_cache": str(feature_cache) if feature_cache is not None else None,
         "split_manifest": str(split_manifest_path) if split_manifest_path is not None else None,
         "subset": str(args.subset),
         "benchmark_tag": str(args.benchmark_tag),
@@ -1394,6 +1509,8 @@ def main() -> None:
         "intensity_mae": mae,
         "intensity_ccc": ccc,
         "device": str(device),
+        "runtime_profile": profile.to_jsonable(),
+        "amp_mode": resolved_amp_mode,
         "amp": bool(use_amp),
         "error_types": dict(err_types),
         "manifest_sha256": manifest_hash,

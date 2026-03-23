@@ -75,6 +75,18 @@ class CachedMotionAudioDataset(Dataset):
 
         return len(self.samples)
 
+    def estimate_sample_bytes(self, idx: int = 0) -> int:
+        """粗略估算单个样本的 tensor 体积。"""
+
+        if not self.samples:
+            return 0
+        sample = self.samples[min(max(0, int(idx)), len(self.samples) - 1)]
+        total = 0
+        for value in sample.values():
+            if isinstance(value, torch.Tensor):
+                total += int(value.numel() * value.element_size())
+        return total
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """取出单个样本，并把字段整理成训练阶段统一约定的格式。"""
 
@@ -94,6 +106,8 @@ class CachedMotionAudioDataset(Dataset):
             "label": s["label"].to(torch.long) if isinstance(s["label"], torch.Tensor) else torch.tensor(int(s["label"]), dtype=torch.long),
             "stem": s.get("stem", str(idx)),
             "mn": str(s.get("mn", "")),
+            "speaker_id": str(s.get("speaker_id", "UNKNOWN")),
+            "text_cue_flag": bool(s.get("text_cue_flag", False)),
             "intensity": intensity_t,
         }
         if "audio" in s:
@@ -104,6 +118,18 @@ class CachedMotionAudioDataset(Dataset):
             item["flow"] = s["flow"].to(torch.float32)
         if "rgb" in s:
             item["rgb"] = s["rgb"].to(torch.float32)
+        if "flow_emb" in s:
+            item["flow_emb"] = s["flow_emb"].to(torch.float32)
+        if "rgb_emb" in s:
+            item["rgb_emb"] = s["rgb_emb"].to(torch.float32)
+        if "text_emb" in s:
+            item["text_emb"] = s["text_emb"].to(torch.float32)
+        if "_text_input_ids" in s:
+            item["_text_input_ids"] = s["_text_input_ids"].to(torch.long)
+        if "_text_attention_mask" in s:
+            item["_text_attention_mask"] = s["_text_attention_mask"].to(torch.long)
+        if "_text_token_type_ids" in s:
+            item["_text_token_type_ids"] = s["_text_token_type_ids"].to(torch.long)
         return item
 
 
@@ -146,9 +172,27 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if has_audio_emb and any(x is None for x in audio_emb_list):
         raise RuntimeError("Mixed audio_emb presence in batch; re-generate cached dataset consistently.")
 
+    flow_emb_list = [b.get("flow_emb", None) for b in batch]
+    has_flow_emb = any(x is not None for x in flow_emb_list)
+    if has_flow_emb and any(x is None for x in flow_emb_list):
+        raise RuntimeError("Mixed flow_emb presence in batch; re-generate cached dataset consistently.")
+
+    rgb_emb_list = [b.get("rgb_emb", None) for b in batch]
+    has_rgb_emb = any(x is not None for x in rgb_emb_list)
+    if has_rgb_emb and any(x is None for x in rgb_emb_list):
+        raise RuntimeError("Mixed rgb_emb presence in batch; re-generate cached dataset consistently.")
+
+    text_emb_list = [b.get("text_emb", None) for b in batch]
+    has_text_emb = any(x is not None for x in text_emb_list)
+    if has_text_emb and any(x is None for x in text_emb_list):
+        raise RuntimeError("Mixed text_emb presence in batch; re-generate cached dataset consistently.")
+
     prosody = torch.stack([b["prosody"] for b in batch], dim=0)
 
     mn_list = [str(b.get("mn", "")) for b in batch]
+    stems = [str(b.get("stem", "")) for b in batch]
+    speaker_ids = [str(b.get("speaker_id", "UNKNOWN")) for b in batch]
+    text_cue_flags = torch.tensor([1 if bool(b.get("text_cue_flag", False)) else 0 for b in batch], dtype=torch.bool)
 
     intensity = torch.stack(
         [b.get("intensity", torch.tensor(float("nan"), dtype=torch.float32)) for b in batch],
@@ -160,6 +204,9 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "prosody": prosody,
         "labels": labels,
         "mn": mn_list,
+        "stems": stems,
+        "speaker_id": speaker_ids,
+        "text_cue_flag": text_cue_flags,
         "intensity": intensity,
         "intensity_mask": intensity_mask,
     }
@@ -172,4 +219,18 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         batch_out["flow"] = torch.stack([b["flow"] for b in batch], dim=0)
     if has_rgb:
         batch_out["rgb"] = torch.stack([b["rgb"] for b in batch], dim=0)
+    if has_flow_emb:
+        batch_out["flow_emb"] = torch.stack([b["flow_emb"] for b in batch], dim=0)
+    if has_rgb_emb:
+        batch_out["rgb_emb"] = torch.stack([b["rgb_emb"] for b in batch], dim=0)
+    if has_text_emb:
+        batch_out["text_emb"] = torch.stack([b["text_emb"] for b in batch], dim=0)
+    if all("_text_input_ids" in b for b in batch):
+        text_inputs = {
+            "input_ids": torch.stack([b["_text_input_ids"] for b in batch], dim=0),
+            "attention_mask": torch.stack([b["_text_attention_mask"] for b in batch], dim=0),
+        }
+        if all("_text_token_type_ids" in b for b in batch):
+            text_inputs["token_type_ids"] = torch.stack([b["_text_token_type_ids"] for b in batch], dim=0)
+        batch_out["text_inputs"] = text_inputs
     return batch_out
