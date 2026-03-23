@@ -89,7 +89,9 @@ class VideoMAEEncoder(nn.Module):
 
         self.model_name = str(model_name)
         self.model = AutoModel.from_pretrained(self.model_name)
-        self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
+        hidden_size = int(getattr(self.model.config, "hidden_size", 768))
+        # 前向里对 hidden state 做了 mean+std 池化并拼接，因此最终维度是 2 * hidden_size。
+        self.out_dim = 2 * hidden_size
 
         if freeze:
             for p in self.model.parameters():
