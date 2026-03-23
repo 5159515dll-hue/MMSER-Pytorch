@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FlowVideoEncoder(nn.Module):
@@ -90,6 +91,19 @@ class VideoMAEEncoder(nn.Module):
         self.model_name = str(model_name)
         self.model = AutoModel.from_pretrained(self.model_name)
         self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
+        self.expected_num_frames = int(getattr(self.model.config, "num_frames", 16))
+        image_size = getattr(self.model.config, "image_size", 224)
+        if isinstance(image_size, (tuple, list)):
+            if len(image_size) >= 2:
+                self.expected_image_size = (int(image_size[0]), int(image_size[1]))
+            elif len(image_size) == 1:
+                side = int(image_size[0])
+                self.expected_image_size = (side, side)
+            else:
+                self.expected_image_size = (224, 224)
+        else:
+            side = int(image_size)
+            self.expected_image_size = (side, side)
 
         if freeze:
             for p in self.model.parameters():
@@ -101,6 +115,39 @@ class VideoMAEEncoder(nn.Module):
         self.register_buffer("_mean", mean, persistent=False)
         self.register_buffer("_std", std, persistent=False)
 
+    def _adapt_clip_shape(self, rgb: torch.Tensor) -> torch.Tensor:
+        """把缓存 clip 对齐到当前 VideoMAE 的期望时空尺寸。
+
+        背景
+        - 预处理阶段为了兼容 flow 分支，默认会缓存 64 帧 RGB。
+        - 但 `MCG-NJU/videomae-large` 这类预训练模型通常固定期望 16 帧。
+        - 如果直接把 64 帧送进去，patch/token 数会和位置编码长度不匹配，
+          从而触发 `size of tensor a ... must match tensor b ...`。
+
+        这里直接在模型前向里做一次时空重采样，避免要求用户重跑整套预处理。
+        """
+
+        x = rgb.to(dtype=torch.float32)
+        target_t = max(1, int(self.expected_num_frames))
+        target_h, target_w = self.expected_image_size
+        need_resize = (
+            int(x.shape[1]) != target_t
+            or int(x.shape[3]) != int(target_h)
+            or int(x.shape[4]) != int(target_w)
+        )
+        if not need_resize:
+            return x
+        # F.interpolate 处理 5D 张量时要求形状是 (B, C, T, H, W)，
+        # 所以先把时间维和通道维交换，再做三线性插值。
+        x_5d = x.permute(0, 2, 1, 3, 4)
+        x_5d = F.interpolate(
+            x_5d,
+            size=(target_t, int(target_h), int(target_w)),
+            mode="trilinear",
+            align_corners=False,
+        )
+        return x_5d.permute(0, 2, 1, 3, 4).contiguous()
+
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
         """编码 RGB clip。
 
@@ -110,7 +157,7 @@ class VideoMAEEncoder(nn.Module):
         """
 
         # rgb: (B, T, 3, H, W) in [0,1]
-        x = rgb.to(dtype=torch.float32)
+        x = self._adapt_clip_shape(rgb)
         x = (x - self._mean) / self._std
         out = self.model(pixel_values=x)
         if hasattr(out, "pooler_output") and out.pooler_output is not None:
