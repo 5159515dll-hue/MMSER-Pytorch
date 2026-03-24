@@ -6,6 +6,8 @@ import sys
 import contextlib
 import os
 import math
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,15 @@ _ensure_project_root_on_path()
 
 from audio_aug import AudioAugConfig, augment_wav
 from audio_aug import normalize_wav
-from data import CachedMotionAudioDataset, ManifestItemDataset, collate, collate_manifest_items
+from data import (
+    CachedMotionAudioDataset,
+    ManifestIngressConfig,
+    ManifestItemDataset,
+    StreamingManifestDataset,
+    cache_manifest_text_tokens,
+    collate,
+    collate_manifest_items,
+)
 from gpu_stream import GpuStreamConfig, GpuStreamPreprocessor
 from manifest_utils import (
     EMOTIONS,
@@ -50,7 +60,7 @@ from manifest_utils import (
     select_manifest_items,
 )
 from metrics_utils import classification_summary, speaker_majority_baseline, speaker_only_baseline
-from models import FusionClassifier
+from models import EmbeddingPlaceholderEncoder, FusionClassifier
 from prosody import ProsodyConfig, extract_prosody_features
 from runtime_adapt import (
     detect_runtime,
@@ -337,6 +347,117 @@ def _autocast_context(device: torch.device, amp_mode: str) -> contextlib.Abstrac
     if amp_mod is not None and hasattr(amp_mod, "autocast"):
         return amp_mod.autocast("cuda", enabled=True, dtype=amp_dtype)  # type: ignore[attr-defined]
     return torch.cuda.amp.autocast(enabled=True)
+
+
+@dataclass
+class _FrozenEmbeddingCaches:
+    audio: dict[str, torch.Tensor] = field(default_factory=dict)
+    flow: dict[str, torch.Tensor] = field(default_factory=dict)
+    rgb: dict[str, torch.Tensor] = field(default_factory=dict)
+    text: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def _stack_cache_hits(stems: list[str], cache: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor | None, list[int]]:
+    tensors: list[torch.Tensor | None] = []
+    missing: list[int] = []
+    for idx, stem in enumerate(stems):
+        value = cache.get(str(stem))
+        if value is None:
+            missing.append(idx)
+        tensors.append(value)
+    if missing:
+        return None, missing
+    return torch.stack([t.to(device=device, dtype=torch.float32) for t in tensors if t is not None], dim=0), []
+
+
+def _put_cache_rows(cache: dict[str, torch.Tensor], stems: list[str], rows: torch.Tensor, indices: list[int]) -> None:
+    for row_idx, src_idx in enumerate(indices):
+        cache[str(stems[src_idx])] = rows[row_idx].detach().cpu().to(torch.float32)
+
+
+def _materialize_frozen_embeddings(
+    *,
+    model: FusionClassifier,
+    batch: dict[str, Any],
+    stems: list[str],
+    caches: _FrozenEmbeddingCaches | None,
+    resolved_amp_mode: str,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if caches is None:
+        return (
+            batch.get("audio_emb", None),
+            batch.get("flow_emb", None),
+            batch.get("rgb_emb", None),
+            batch.get("text_emb", None) if bool(args.freeze_text) else None,
+        )
+
+    audio_emb_t = batch.get("audio_emb", None)
+    flow_emb_t = batch.get("flow_emb", None)
+    rgb_emb_t = batch.get("rgb_emb", None)
+    text_emb_t = batch.get("text_emb", None) if bool(args.freeze_text) else None
+    amp_ctx = _autocast_context(device, resolved_amp_mode)
+
+    with torch.no_grad():
+        if bool(args.freeze_audio) and audio_emb_t is None and (not bool(args.zero_audio)) and "audio" in batch and not isinstance(model.audio, EmbeddingPlaceholderEncoder):
+            cached, missing = _stack_cache_hits(stems, caches.audio, device)
+            if not missing:
+                audio_emb_t = cached
+            else:
+                sel = torch.tensor(missing, dtype=torch.long, device=device)
+                wav = batch["audio"].index_select(0, sel)
+                audio_lens = batch.get("audio_lens", None)
+                audio_lens_sel = audio_lens.index_select(0, sel) if isinstance(audio_lens, torch.Tensor) else None
+                with amp_ctx:
+                    try:
+                        fresh = model.audio(wav, lengths=audio_lens_sel)
+                    except TypeError:
+                        fresh = model.audio(wav)
+                _put_cache_rows(caches.audio, stems, fresh.to(torch.float32), missing)
+                audio_emb_t, _ = _stack_cache_hits(stems, caches.audio, device)
+
+        if bool(args.freeze_text) and text_emb_t is None and (not bool(args.zero_text)) and batch.get("text_inputs", None) is not None and not isinstance(model.text, EmbeddingPlaceholderEncoder):
+            cached, missing = _stack_cache_hits(stems, caches.text, device)
+            if not missing:
+                text_emb_t = cached
+            else:
+                sel = torch.tensor(missing, dtype=torch.long, device=device)
+                text_inputs = {key: value.index_select(0, sel) for key, value in batch["text_inputs"].items()}
+                with amp_ctx:
+                    fresh = model.text(text_inputs).to(torch.float32)
+                _put_cache_rows(caches.text, stems, fresh, missing)
+                text_emb_t, _ = _stack_cache_hits(stems, caches.text, device)
+
+        if str(args.video_backbone) in {"flow", "dual"} and bool(args.freeze_flow) and flow_emb_t is None and (not bool(args.zero_video)) and "flow" in batch:
+            flow_encoder = model.video if str(args.video_backbone) == "flow" else model.video_flow
+            if flow_encoder is not None:
+                cached, missing = _stack_cache_hits(stems, caches.flow, device)
+                if not missing:
+                    flow_emb_t = cached
+                else:
+                    sel = torch.tensor(missing, dtype=torch.long, device=device)
+                    flow = batch["flow"].index_select(0, sel)
+                    with amp_ctx:
+                        fresh = flow_encoder(flow).to(torch.float32)
+                    _put_cache_rows(caches.flow, stems, fresh, missing)
+                    flow_emb_t, _ = _stack_cache_hits(stems, caches.flow, device)
+
+        if str(args.video_backbone) in {"videomae", "dual"} and bool(args.freeze_rgb) and rgb_emb_t is None and (not bool(args.zero_video)) and "rgb" in batch:
+            rgb_encoder = model.video if str(args.video_backbone) == "videomae" else model.video_rgb
+            if rgb_encoder is not None:
+                cached, missing = _stack_cache_hits(stems, caches.rgb, device)
+                if not missing:
+                    rgb_emb_t = cached
+                else:
+                    sel = torch.tensor(missing, dtype=torch.long, device=device)
+                    rgb = batch["rgb"].index_select(0, sel)
+                    with amp_ctx:
+                        fresh = rgb_encoder(rgb).to(torch.float32)
+                    _put_cache_rows(caches.rgb, stems, fresh, missing)
+                    rgb_emb_t, _ = _stack_cache_hits(stems, caches.rgb, device)
+
+    return audio_emb_t, flow_emb_t, rgb_emb_t, text_emb_t
 
 
 def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_len: int, *, text_policy: str) -> None:
@@ -1034,8 +1155,18 @@ def main():
         _print_split_label_hist("train", ds, train_indices, task_label_names)
         _print_split_label_hist("val", ds, val_indices, task_label_names)
     else:
-        train_ds = ManifestItemDataset(train_manifest_items)
-        val_ds = ManifestItemDataset(val_manifest_items)
+        ingress_cfg = ManifestIngressConfig(
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            audio_backend_mode=str(args.audio_backend),
+            video_decode_backend=str(args.video_decode_backend),
+            num_frames=int(args.num_frames),
+            zero_audio=bool(args.zero_audio),
+            zero_video=bool(args.zero_video),
+            video_backbone=str(args.video_backbone),
+        )
+        train_ds = StreamingManifestDataset(train_manifest_items, ingress=ingress_cfg)
+        val_ds = StreamingManifestDataset(val_manifest_items, ingress=ingress_cfg)
         _print_manifest_label_hist("train", train_manifest_items, task_label_names)
         _print_manifest_label_hist("val", val_manifest_items, task_label_names)
     speaker_baseline = None
@@ -1093,6 +1224,9 @@ def main():
         if pipeline_mode == "legacy":
             assert ds is not None
             _cache_text_tokens(ds, tokenizer, int(args.max_text_len), text_policy=str(args.text_policy))
+        else:
+            cache_manifest_text_tokens(train_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
+            cache_manifest_text_tokens(val_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
 
     skip_audio_encoder_init = bool(using_feature_cache and args.freeze_audio and ("audio_emb" in cached_embedding_dims))
     if bool(args.zero_audio) and "audio_emb" not in cached_embedding_dims:
@@ -1159,6 +1293,12 @@ def main():
                 ram_cache_size=int(args.ram_cache_size),
             )
         )
+    frozen_embedding_caches = (
+        _FrozenEmbeddingCaches()
+        if pipeline_mode == "gpu_stream"
+        and any([bool(args.freeze_audio), bool(args.freeze_text), bool(args.freeze_flow), bool(args.freeze_rgb)])
+        else None
+    )
 
     requested_amp_mode = str(args.amp_mode)
     if bool(args.amp) and requested_amp_mode == "auto":
@@ -1183,6 +1323,7 @@ def main():
                 "using_feature_cache": using_feature_cache,
                 "pipeline": pipeline_mode,
                 "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
+                "runtime_embedding_cache": bool(frozen_embedding_caches is not None),
                 "amp_mode": resolved_amp_mode,
             },
             ensure_ascii=False,
@@ -1234,21 +1375,24 @@ def main():
         total = 0
         correct = 0
         running = 0.0
+        train_prepare_sec = 0.0
         y_true_all: list[torch.Tensor] = []
         y_pred_all: list[torch.Tensor] = []
 
         reg_pred_all: list[torch.Tensor] = []
         reg_true_all: list[torch.Tensor] = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]"), start=1):
             if pipeline_mode == "gpu_stream":
                 if stream_preprocessor is None:
                     raise RuntimeError("gpu_stream preprocessor is not initialized")
+                prep_t0 = time.perf_counter()
                 batch = stream_preprocessor.prepare_batch(
                     batch,
                     tokenizer=tokenizer,
                     text_policy=str(args.text_policy),
                     max_text_len=int(args.max_text_len),
                 )
+                train_prepare_sec += float(time.perf_counter() - prep_t0)
             nb = pin_memory and device.type == "cuda"
 
             cached_audio_emb = batch.get("audio_emb", None)
@@ -1371,6 +1515,49 @@ def main():
                 text_inputs = None
                 text_emb_t = None
 
+            stems = [str(s) for s in batch.get("stems", [])]
+            if pipeline_mode == "gpu_stream" and stems:
+                audio_emb_cached, flow_emb_cached, rgb_emb_cached, text_emb_cached = _materialize_frozen_embeddings(
+                    model=model,
+                    batch={
+                        **batch,
+                        "audio": wav,
+                        "audio_lens": audio_lens_t,
+                        "flow": flow,
+                        "rgb": rgb,
+                        "text_inputs": text_inputs,
+                    },
+                    stems=stems,
+                    caches=frozen_embedding_caches,
+                    resolved_amp_mode=resolved_amp_mode,
+                    args=args,
+                    device=device,
+                )
+                audio_emb_t = audio_emb_cached if audio_emb_cached is not None else audio_emb_t
+                flow_emb_t = flow_emb_cached if flow_emb_cached is not None else flow_emb_t
+                rgb_emb_t = rgb_emb_cached if rgb_emb_cached is not None else rgb_emb_t
+                text_emb_t = text_emb_cached if text_emb_cached is not None else text_emb_t
+                if bool(args.freeze_audio) and audio_emb_t is not None:
+                    wav = torch.zeros((wav.shape[0], 1), device=device, dtype=wav.dtype)
+                    audio_lens_t = None
+                if bool(args.freeze_flow) and flow_emb_t is not None:
+                    flow = None
+                if bool(args.freeze_rgb) and rgb_emb_t is not None:
+                    rgb = None
+                if bool(args.freeze_text) and text_emb_t is not None:
+                    text_inputs = None
+                if batch_idx == 1:
+                    print(
+                        json.dumps(
+                            {
+                                "gpu_stream_backends": stream_preprocessor.backend_summary() if stream_preprocessor is not None else {},
+                                "gpu_stream_prepare_stats": stream_preprocessor.consume_prepare_stats() if stream_preprocessor is not None else {},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+
             opt.zero_grad(set_to_none=True)
             amp_ctx = _autocast_context(device, resolved_amp_mode)
 
@@ -1476,17 +1663,20 @@ def main():
         v_gt_intensity_all: list[float | None] = []
         v_reg_pred_all: list[torch.Tensor] = []
         v_reg_true_all: list[torch.Tensor] = []
+        val_prepare_sec = 0.0
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]"):
+            for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]"), start=1):
                 if pipeline_mode == "gpu_stream":
                     if stream_preprocessor is None:
                         raise RuntimeError("gpu_stream preprocessor is not initialized")
+                    prep_t0 = time.perf_counter()
                     batch = stream_preprocessor.prepare_batch(
                         batch,
                         tokenizer=tokenizer,
                         text_policy=str(args.text_policy),
                         max_text_len=int(args.max_text_len),
                     )
+                    val_prepare_sec += float(time.perf_counter() - prep_t0)
                 nb = pin_memory and device.type == "cuda"
                 flow_emb_t = batch.get("flow_emb", None)
                 rgb_emb_t = batch.get("rgb_emb", None)
@@ -1587,6 +1777,49 @@ def main():
                     text_inputs = None
                     text_emb_t = None
 
+                stems = [str(s) for s in batch.get("stems", [])]
+                if pipeline_mode == "gpu_stream" and stems:
+                    audio_emb_cached, flow_emb_cached, rgb_emb_cached, text_emb_cached = _materialize_frozen_embeddings(
+                        model=model,
+                        batch={
+                            **batch,
+                            "audio": wav,
+                            "audio_lens": audio_lens_t,
+                            "flow": flow,
+                            "rgb": rgb,
+                            "text_inputs": text_inputs,
+                        },
+                        stems=stems,
+                        caches=frozen_embedding_caches,
+                        resolved_amp_mode=resolved_amp_mode,
+                        args=args,
+                        device=device,
+                    )
+                    audio_emb_t = audio_emb_cached if audio_emb_cached is not None else audio_emb_t
+                    flow_emb_t = flow_emb_cached if flow_emb_cached is not None else flow_emb_t
+                    rgb_emb_t = rgb_emb_cached if rgb_emb_cached is not None else rgb_emb_t
+                    text_emb_t = text_emb_cached if text_emb_cached is not None else text_emb_t
+                    if bool(args.freeze_audio) and audio_emb_t is not None:
+                        wav = torch.zeros((wav.shape[0], 1), device=device, dtype=wav.dtype)
+                        audio_lens_t = None
+                    if bool(args.freeze_flow) and flow_emb_t is not None:
+                        flow = None
+                    if bool(args.freeze_rgb) and rgb_emb_t is not None:
+                        rgb = None
+                    if bool(args.freeze_text) and text_emb_t is not None:
+                        text_inputs = None
+                    if batch_idx == 1:
+                        print(
+                            json.dumps(
+                                {
+                                    "gpu_stream_backends": stream_preprocessor.backend_summary() if stream_preprocessor is not None else {},
+                                    "gpu_stream_prepare_stats": stream_preprocessor.consume_prepare_stats() if stream_preprocessor is not None else {},
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+
                 amp_ctx = _autocast_context(device, resolved_amp_mode)
 
                 with amp_ctx:
@@ -1684,7 +1917,8 @@ def main():
             print(
                 "Epoch {e}: train_loss={tl:.4f} train_acc={ta:.4f} train_f1={tf:.4f} "
                 "val_loss={vl:.4f} val_acc={va:.4f} val_f1={vf:.4f} "
-                "val_mse={vmse:.4f} val_mae={vmae:.4f} val_ccc={vccc:.4f} (n={vn})".format(
+                "val_mse={vmse:.4f} val_mae={vmae:.4f} val_ccc={vccc:.4f} (n={vn}) "
+                "train_prepare_s={tps:.2f} val_prepare_s={vps:.2f}".format(
                     e=epoch,
                     tl=train_loss,
                     ta=train_acc,
@@ -1696,12 +1930,15 @@ def main():
                     vmae=val_mae,
                     vccc=val_ccc,
                     vn=val_intensity_n,
+                    tps=train_prepare_sec,
+                    vps=val_prepare_sec,
                 )
             )
         else:
             print(
                 "Epoch {e}: train_loss={tl:.4f} train_acc={ta:.4f} train_f1={tf:.4f} "
-                "val_loss={vl:.4f} val_acc={va:.4f} val_f1={vf:.4f}".format(
+                "val_loss={vl:.4f} val_acc={va:.4f} val_f1={vf:.4f} "
+                "train_prepare_s={tps:.2f} val_prepare_s={vps:.2f}".format(
                     e=epoch,
                     tl=train_loss,
                     ta=train_acc,
@@ -1709,6 +1946,8 @@ def main():
                     vl=val_loss,
                     va=val_acc,
                     vf=val_f1,
+                    tps=train_prepare_sec,
+                    vps=val_prepare_sec,
                 )
             )
 

@@ -158,6 +158,7 @@ export TRANSFORMERS_OFFLINE=1
 
 这是实验一的最终正确 GPU 命令。不要再为它额外执行 `build_feature_cache.py`。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
 
 训练：
 
@@ -173,7 +174,7 @@ python3 train.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 32 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
@@ -206,7 +207,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 64 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
@@ -231,7 +232,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 64 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
@@ -315,6 +316,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 
 这是实验二的最终正确 GPU 命令。不要再为它生成 `feature_cache_tri_*` 一类目录。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
 
 训练：
 
@@ -330,7 +332,7 @@ python3 train.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 8 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -363,7 +365,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 16 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -389,7 +391,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 16 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -469,6 +471,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 
 这是实验三的最终正确 GPU 命令。它直接从原始媒体流式训练，不需要任何中间 shard。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
 
 训练：
 
@@ -484,7 +487,7 @@ python3 train.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 2 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -514,7 +517,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 8 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -540,7 +543,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 8 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone videomae \
   --num-frames 16 \
   --rgb-size 224 \
@@ -620,6 +623,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 
 这是实验四的最终正确 GPU 命令。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
 
 训练：
 
@@ -635,7 +639,7 @@ python3 train.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 1 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone dual \
   --flow-backend torch_motion \
   --num-frames 32 \
@@ -667,7 +671,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 4 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone dual \
   --flow-backend torch_motion \
   --num-frames 32 \
@@ -695,7 +699,7 @@ python3 batch_inference.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 4 \
-  --num-workers 0 \
+  --num-workers auto \
   --video-backbone dual \
   --flow-backend torch_motion \
   --num-frames 32 \

@@ -13,6 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import time
 
 import torch
 import torch.nn.functional as F
@@ -103,6 +104,25 @@ class GpuStreamPreprocessor:
         self._cache = _RamSampleCache(cfg.ram_cache_size) if str(cfg.cache_mode) == "ram" else None
         self._decord_ready = False
         self._decord = None
+        self._audio_backend_counts: dict[str, int] = {}
+        self._video_backend_counts: dict[str, int] = {}
+        self._last_prepare_stats: dict[str, float | int] = {}
+
+    @staticmethod
+    def _bump_counter(bucket: dict[str, int], key: str) -> None:
+        name = str(key or "unknown")
+        bucket[name] = int(bucket.get(name, 0)) + 1
+
+    def backend_summary(self) -> dict[str, dict[str, int]]:
+        return {
+            "audio": dict(sorted(self._audio_backend_counts.items())),
+            "video": dict(sorted(self._video_backend_counts.items())),
+        }
+
+    def consume_prepare_stats(self) -> dict[str, float | int]:
+        stats = dict(self._last_prepare_stats)
+        self._last_prepare_stats = {}
+        return stats
 
     def _maybe_import_decord(self) -> Any | None:
         if self._decord_ready:
@@ -245,24 +265,34 @@ class GpuStreamPreprocessor:
         }
 
         if not bool(self.cfg.zero_audio):
-            audio_path = Path(str(item.get("audio_path", ""))).expanduser()
-            if not audio_path.exists():
-                raise FileNotFoundError(f"Manifest audio_path not found: {audio_path}")
-            wav_f32, _backend = load_audio(
-                audio_path,
-                sample_rate=int(self.cfg.sample_rate),
-                max_sec=float(self.cfg.max_audio_sec),
-                backend_mode=str(self.cfg.audio_backend_mode),
-            )
-            sample["audio"] = wav_f32.to(torch.float32)
+            if "audio" in item and isinstance(item["audio"], torch.Tensor):
+                sample["audio"] = item["audio"].to(torch.float32)
+                self._bump_counter(self._audio_backend_counts, str(item.get("_audio_backend", "prefetched")))
+            else:
+                audio_path = Path(str(item.get("audio_path", ""))).expanduser()
+                if not audio_path.exists():
+                    raise FileNotFoundError(f"Manifest audio_path not found: {audio_path}")
+                wav_f32, backend = load_audio(
+                    audio_path,
+                    sample_rate=int(self.cfg.sample_rate),
+                    max_sec=float(self.cfg.max_audio_sec),
+                    backend_mode=str(self.cfg.audio_backend_mode),
+                )
+                sample["audio"] = wav_f32.to(torch.float32)
+                self._bump_counter(self._audio_backend_counts, str(backend))
 
         need_rgb = (not bool(self.cfg.zero_video)) and str(self.cfg.video_backbone) in {"videomae", "dual"}
         need_flow = (not bool(self.cfg.zero_video)) and str(self.cfg.video_backbone) in {"flow", "dual"}
         if need_rgb or need_flow:
-            video_path = Path(str(item.get("video_path", ""))).expanduser()
-            if not video_path.exists():
-                raise FileNotFoundError(f"Manifest video_path not found: {video_path}")
-            frames = self._read_video_frames(video_path)
+            if "video_frames" in item and isinstance(item["video_frames"], torch.Tensor):
+                frames = item["video_frames"].to(self.cfg.device)
+                self._bump_counter(self._video_backend_counts, str(item.get("_video_backend", "prefetched")))
+            else:
+                video_path = Path(str(item.get("video_path", ""))).expanduser()
+                if not video_path.exists():
+                    raise FileNotFoundError(f"Manifest video_path not found: {video_path}")
+                frames = self._read_video_frames(video_path)
+                self._bump_counter(self._video_backend_counts, str(self.cfg.video_decode_backend))
             if need_rgb:
                 sample["rgb"] = self._prepare_rgb(frames)
             if need_flow:
@@ -280,6 +310,7 @@ class GpuStreamPreprocessor:
         text_policy: str,
         max_text_len: int,
     ) -> dict[str, Any]:
+        t0 = time.perf_counter()
         processed = [self._process_item(item) for item in items]
 
         labels = torch.stack([sample["label"] for sample in processed], dim=0).to(self.cfg.device)
@@ -361,22 +392,41 @@ class GpuStreamPreprocessor:
             batch_out["rgb"] = rgb
 
         if (not bool(self.cfg.zero_text)) and tokenizer is not None:
-            texts = [
-                select_text_for_policy(
-                    full_text=str(sample.get("mn", "")),
-                    masked_text=str(sample.get("masked_mn", "")),
-                    label_en=str(sample.get("_global_label_en", "")) or None,
-                    policy=str(text_policy),
+            if all("_text_input_ids" in item and "_text_attention_mask" in item for item in items):
+                text_inputs = {
+                    "input_ids": torch.stack([item["_text_input_ids"].to(torch.long) for item in items], dim=0).to(self.cfg.device),
+                    "attention_mask": torch.stack([item["_text_attention_mask"].to(torch.long) for item in items], dim=0).to(self.cfg.device),
+                }
+                if all("_text_token_type_ids" in item for item in items):
+                    text_inputs["token_type_ids"] = torch.stack(
+                        [item["_text_token_type_ids"].to(torch.long) for item in items],
+                        dim=0,
+                    ).to(self.cfg.device)
+                batch_out["text_inputs"] = text_inputs
+            else:
+                texts = [
+                    select_text_for_policy(
+                        full_text=str(sample.get("mn", "")),
+                        masked_text=str(sample.get("masked_mn", "")),
+                        label_en=str(sample.get("_global_label_en", "")) or None,
+                        policy=str(text_policy),
+                    )
+                    for sample in processed
+                ]
+                enc = tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=int(max_text_len),
+                    return_tensors="pt",
                 )
-                for sample in processed
-            ]
-            enc = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=int(max_text_len),
-                return_tensors="pt",
-            )
-            batch_out["text_inputs"] = {k: v.to(self.cfg.device) for k, v in enc.items()}
+                batch_out["text_inputs"] = {k: v.to(self.cfg.device) for k, v in enc.items()}
+
+        self._last_prepare_stats = {
+            "prepare_batch_sec": float(time.perf_counter() - t0),
+            "batch_items": int(len(items)),
+            "audio_backend_kinds": int(len(self._audio_backend_counts)),
+            "video_backend_kinds": int(len(self._video_backend_counts)),
+        }
 
         return batch_out

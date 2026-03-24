@@ -35,7 +35,15 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from audio_aug import normalize_wav
-from data import CachedMotionAudioDataset, ManifestItemDataset, collate, collate_manifest_items
+from data import (
+    CachedMotionAudioDataset,
+    ManifestIngressConfig,
+    ManifestItemDataset,
+    StreamingManifestDataset,
+    cache_manifest_text_tokens,
+    collate,
+    collate_manifest_items,
+)
 from gpu_stream import GpuStreamConfig, GpuStreamPreprocessor
 from manifest_utils import (
     EMOTIONS,
@@ -1181,7 +1189,7 @@ def _run_stream_batched(
         args.num_workers,
         phase="inference",
         profile=profile,
-        dataset_in_memory=True,
+        dataset_in_memory=False,
         total_items=len(items),
     )
     prefetch_factor = resolve_prefetch_factor(args.prefetch_factor, num_workers=resolved_num_workers)
@@ -1196,7 +1204,20 @@ def _run_stream_batched(
         dl_kwargs["persistent_workers"] = True
         if prefetch_factor is not None:
             dl_kwargs["prefetch_factor"] = int(prefetch_factor)
-    loader = DataLoader(ManifestItemDataset(items), **dl_kwargs)
+    ingress_cfg = ManifestIngressConfig(
+        sample_rate=int(args.sample_rate),
+        max_audio_sec=float(args.max_audio_sec),
+        audio_backend_mode=str(args.audio_backend),
+        video_decode_backend=str(args.video_decode_backend),
+        num_frames=int(args.num_frames),
+        zero_audio=bool(args.zero_audio),
+        zero_video=bool(args.zero_video),
+        video_backbone=str(video_backbone),
+    )
+    stream_ds = StreamingManifestDataset(items, ingress=ingress_cfg)
+    if tokenizer is not None and not bool(args.zero_text):
+        cache_manifest_text_tokens(stream_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
+    loader = DataLoader(stream_ds, **dl_kwargs)
 
     preprocessor = GpuStreamPreprocessor(
         GpuStreamConfig(
@@ -1235,7 +1256,7 @@ def _run_stream_batched(
         iterator = tqdm(loader, desc="Batch inference [gpu_stream]", unit="batch", dynamic_ncols=True)
 
     first_errors = 0
-    for raw_batch in iterator:
+    for batch_idx, raw_batch in enumerate(iterator, start=1):
         try:
             batch = preprocessor.prepare_batch(
                 raw_batch,
@@ -1243,6 +1264,17 @@ def _run_stream_batched(
                 text_policy=str(args.text_policy),
                 max_text_len=int(args.max_text_len),
             )
+            if batch_idx == 1:
+                print(
+                    json.dumps(
+                        {
+                            "gpu_stream_backends": preprocessor.backend_summary(),
+                            "gpu_stream_prepare_stats": preprocessor.consume_prepare_stats(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
             logits, pred_intensity, _mode = _forward_outputs(
                 model,
                 batch.get("flow", None),
