@@ -68,6 +68,7 @@ python3 download.py
 
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
+- 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
 ```bash
@@ -156,6 +157,9 @@ export TRANSFORMERS_OFFLINE=1
 ### 命令
 
 这是实验一的最终正确 GPU 命令。不要再为它额外执行 `build_feature_cache.py`。
+训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+
+训练：
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video
@@ -171,7 +175,6 @@ python3 train.py \
   --batch-size 32 \
   --num-workers 0 \
   --video-backbone flow \
-  --flow-backend torch_motion \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
   --text-model FacebookAI/xlm-roberta-large \
@@ -182,13 +185,17 @@ python3 train.py \
   --task-mode confounded_7way \
   --text-policy full \
   --ablation no-video \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6 \
   --monitor val_f1 \
   --early-stop-patience 10 \
   --lr 1e-3 \
   --benchmark-tag meld_gpu_practical_no_video
+```
 
+验证集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -201,16 +208,19 @@ python3 batch_inference.py \
   --batch-size 64 \
   --num-workers 0 \
   --video-backbone flow \
-  --flow-backend torch_motion \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
   --ablation no-video \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
+```
 
+测试集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -223,14 +233,13 @@ python3 batch_inference.py \
   --batch-size 64 \
   --num-workers 0 \
   --video-backbone flow \
-  --flow-backend torch_motion \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
   --ablation no-video \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
 ```
 
@@ -305,6 +314,9 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 ### 命令
 
 这是实验二的最终正确 GPU 命令。不要再为它生成 `feature_cache_tri_*` 一类目录。
+训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+
+训练：
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen
@@ -331,12 +343,16 @@ python3 train.py \
   --freeze-text \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6 \
   --monitor val_f1 \
   --early-stop-patience 6 \
   --benchmark-tag meld_gpu_tri_rgb_audio_text_frozen
+```
 
+验证集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -356,9 +372,13 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
+```
 
+测试集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -378,7 +398,7 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
 ```
 
@@ -448,6 +468,9 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 ### 命令
 
 这是实验三的最终正确 GPU 命令。它直接从原始媒体流式训练，不需要任何中间 shard。
+训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+
+训练：
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text
@@ -471,12 +494,16 @@ python3 train.py \
   --fusion-mode gated_text \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6 \
   --monitor val_f1 \
   --early-stop-patience 5 \
   --benchmark-tag meld_gpu_upper_rgb_audio_text
+```
 
+验证集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -496,9 +523,13 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
+```
 
+测试集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -518,7 +549,7 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
 ```
 
@@ -588,6 +619,9 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 ### 命令
 
 这是实验四的最终正确 GPU 命令。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
+训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
+
+训练：
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion
@@ -613,12 +647,16 @@ python3 train.py \
   --fusion-mode gated_text \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6 \
   --monitor val_f1 \
   --early-stop-patience 5 \
   --benchmark-tag meld_gpu_upper_dual_torch_motion
+```
 
+验证集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -640,9 +678,13 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
+```
 
+测试集推理：
+
+```bash
 python3 batch_inference.py \
   --pipeline gpu_stream \
   --cache-mode none \
@@ -664,7 +706,7 @@ python3 batch_inference.py \
   --text-model FacebookAI/xlm-roberta-large \
   --task-mode confounded_7way \
   --text-policy full \
-  --sample-rate 24000 \
+  --sample-rate 16000 \
   --max-audio-sec 6
 ```
 
