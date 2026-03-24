@@ -75,6 +75,30 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
+## MELD GPU 主实验以后不要再用的旧命令
+
+下面这些命令属于旧的 CPU 缓存式 MELD 路线。对于本文这四组 GPU 主实验，后续都不要再用：
+
+- `python3 build_feature_cache.py ...`
+- `python3 validate_cached_shards.py ...`
+- `python3 train.py --feature-cache ...`
+- `python3 batch_inference.py --feature-cache ...`
+- 任何依赖 `outputs/benchmarks/meld/feature_cache_*` 的训练或推理命令
+
+原因很简单：
+
+- 它们仍然会先走一次重型媒体读取、特征编码和磁盘写 shard
+- 这不是当前文档要跑的 GPU 流式主线
+- 这也是你之前感觉“第一个命令就很慢”的根本原因
+
+因此，当前这四组正式实验的起点统一都是：
+
+- `python3 train.py --pipeline gpu_stream --cache-mode none ...`
+
+推理统一都是：
+
+- `python3 batch_inference.py --pipeline gpu_stream --cache-mode none ...`
+
 ---
 
 ## 实验一：MELD GPU 实用基线
@@ -130,6 +154,8 @@ export TRANSFORMERS_OFFLINE=1
 - 磁盘：SSD 即可
 
 ### 命令
+
+这是实验一的最终正确 GPU 命令。不要再为它额外执行 `build_feature_cache.py`。
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video
@@ -278,6 +304,8 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 
 ### 命令
 
+这是实验二的最终正确 GPU 命令。不要再为它生成 `feature_cache_tri_*` 一类目录。
+
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen
 
@@ -419,6 +447,8 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 
 ### 命令
 
+这是实验三的最终正确 GPU 命令。它直接从原始媒体流式训练，不需要任何中间 shard。
+
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text
 
@@ -556,6 +586,8 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 - 磁盘：NVMe
 
 ### 命令
+
+这是实验四的最终正确 GPU 命令。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
 
 ```bash
 rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion
