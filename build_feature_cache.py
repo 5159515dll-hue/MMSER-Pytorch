@@ -182,6 +182,35 @@ def _resolve_model_args(args: argparse.Namespace) -> tuple[dict[str, Any], Optio
     return model_args, state
 
 
+def _infer_text_dim(model_name: str) -> int:
+    """根据常见文本模型名估计 hidden size，供占位编码器使用。"""
+
+    name = str(model_name).lower()
+    if "large" in name:
+        return 1024
+    return 768
+
+
+def _infer_audio_dim(model_name: str) -> int:
+    """根据当前支持的音频编码器类型估计 mean+std 池化后的输出维度。"""
+
+    name = str(model_name).lower()
+    if name == "wav2vec2_base":
+        return 2 * 768
+    if "large" in name:
+        return 2 * 1024
+    return 2 * 768
+
+
+def _infer_rgb_dim(model_name: str) -> int:
+    """根据常见 VideoMAE 配置估计 RGB embedding 维度。"""
+
+    name = str(model_name).lower()
+    if "large" in name:
+        return 1024
+    return 768
+
+
 def _amp_context(device: torch.device, amp_mode: str) -> contextlib.AbstractContextManager[Any]:
     """构造 AMP 上下文。"""
 
@@ -323,26 +352,35 @@ def main() -> None:
             dl_kwargs["prefetch_factor"] = int(prefetch_factor)
     loader = DataLoader(ds, **dl_kwargs)
 
-    try:
-        from transformers import AutoTokenizer
-    except Exception as e:
-        raise RuntimeError("transformers is required for build_feature_cache.py") from e
-
     tokenizer = None
     if effective_freeze_text:
+        try:
+            from transformers import AutoTokenizer
+        except Exception as e:
+            raise RuntimeError("transformers is required for build_feature_cache.py when --freeze-text is enabled") from e
         tokenizer = AutoTokenizer.from_pretrained(str(model_args["text_model"]))
+
+    need_audio_encoder = bool(args.freeze_audio)
+    need_rgb_encoder = bool(args.freeze_rgb) and str(model_args["video_backbone"]) in {"dual", "videomae"}
+    need_text_encoder = bool(effective_freeze_text)
 
     model = FusionClassifier(
         num_classes=7,
         text_model=str(model_args["text_model"]),
         freeze_text=True,
+        text_dim=_infer_text_dim(str(model_args["text_model"])),
+        skip_text_encoder_init=not need_text_encoder,
         audio_model=str(model_args["audio_model"]),
         audio_model_revision=(str(model_args["audio_model_revision"]).strip() or None),
         freeze_audio=True,
+        audio_dim=_infer_audio_dim(str(model_args["audio_model"])),
+        skip_audio_encoder_init=not need_audio_encoder,
         video_backbone=str(model_args["video_backbone"]),
         video_model=str(model_args["video_model"]),
         freeze_flow=True,
         freeze_rgb=True,
+        rgb_dim=_infer_rgb_dim(str(model_args["video_model"])),
+        skip_rgb_encoder_init=not need_rgb_encoder,
         freeze_prosody=True,
     ).to(device)
     if state is not None:
