@@ -386,6 +386,26 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _infer_text_dim(model_name: str) -> int:
+    """根据常见文本模型名估计 hidden size，供跳过文本编码器初始化时使用。"""
+
+    name = str(model_name).lower()
+    if "large" in name:
+        return 1024
+    return 768
+
+
+def _infer_audio_dim(model_name: str) -> int:
+    """根据音频编码器类型估计 mean+std 池化后的输出维度。"""
+
+    name = str(model_name).lower()
+    if name == "wav2vec2_base":
+        return 2 * 768
+    if "large" in name:
+        return 2 * 1024
+    return 2 * 768
+
+
 def _load_model(
     ckpt_path: Path,
     device: torch.device,
@@ -515,7 +535,11 @@ def _load_model(
     task_speaker_id = normalized_speaker_id
     cached_embedding_dims = dict(cached_embedding_dims or {})
     skip_audio_encoder_init = bool(using_feature_cache and ("audio_emb" in cached_embedding_dims))
+    if bool(getattr(args, "zero_audio", False)) and "audio_emb" not in cached_embedding_dims:
+        skip_audio_encoder_init = True
     skip_text_encoder_init = bool(using_feature_cache and ("text_emb" in cached_embedding_dims))
+    if bool(getattr(args, "zero_text", False)) and "text_emb" not in cached_embedding_dims:
+        skip_text_encoder_init = True
     skip_rgb_encoder_init = bool(
         using_feature_cache
         and ("rgb_emb" in cached_embedding_dims)
@@ -525,10 +549,10 @@ def _load_model(
     model = FusionClassifier(
         num_classes=len(label_names),
         freeze_audio=True,
-        audio_dim=cached_embedding_dims.get("audio_emb"),
+        audio_dim=cached_embedding_dims.get("audio_emb", _infer_audio_dim(audio_model)),
         rgb_dim=cached_embedding_dims.get("rgb_emb"),
         text_model=text_model,
-        text_dim=cached_embedding_dims.get("text_emb"),
+        text_dim=cached_embedding_dims.get("text_emb", _infer_text_dim(text_model)),
         freeze_text=True,
         audio_model=audio_model,
         audio_model_revision=(audio_model_revision or None),

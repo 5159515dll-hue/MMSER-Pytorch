@@ -327,6 +327,26 @@ def _cache_text_tokens(ds: CachedMotionAudioDataset, tokenizer: Any, max_text_le
             sample["_text_token_type_ids"] = token_type_ids[idx].to(torch.long).clone()
 
 
+def _infer_text_dim(model_name: str) -> int:
+    """根据常见文本模型名估计 hidden size，供跳过文本编码器初始化时使用。"""
+
+    name = str(model_name).lower()
+    if "large" in name:
+        return 1024
+    return 768
+
+
+def _infer_audio_dim(model_name: str) -> int:
+    """根据音频编码器类型估计 mean+std 池化后的输出维度。"""
+
+    name = str(model_name).lower()
+    if name == "wav2vec2_base":
+        return 2 * 768
+    if "large" in name:
+        return 2 * 1024
+    return 2 * 768
+
+
 def _validate_cache_compatibility(ds: CachedMotionAudioDataset, args: argparse.Namespace) -> None:
     """提前检查 cache 是否满足当前训练配置。"""
 
@@ -964,17 +984,24 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(str(args.text_model))
         _cache_text_tokens(ds, tokenizer, int(args.max_text_len), text_policy=str(args.text_policy))
 
+    skip_audio_encoder_init = bool(using_feature_cache and args.freeze_audio and ("audio_emb" in cached_embedding_dims))
+    if bool(args.zero_audio) and "audio_emb" not in cached_embedding_dims:
+        skip_audio_encoder_init = True
+    skip_text_encoder_init = bool(using_feature_cache and args.freeze_text and ("text_emb" in cached_embedding_dims))
+    if bool(args.zero_text) and "text_emb" not in cached_embedding_dims:
+        skip_text_encoder_init = True
+
     model = FusionClassifier(
         num_classes=len(task_label_names),
         freeze_audio=args.freeze_audio,
-        audio_dim=cached_embedding_dims.get("audio_emb"),
+        audio_dim=cached_embedding_dims.get("audio_emb", _infer_audio_dim(str(args.audio_model))),
         rgb_dim=cached_embedding_dims.get("rgb_emb"),
         freeze_video=bool(args.freeze_video),
         freeze_flow=bool(args.freeze_video or args.freeze_flow),
         freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
         freeze_prosody=bool(args.freeze_prosody),
         text_model=str(args.text_model),
-        text_dim=cached_embedding_dims.get("text_emb"),
+        text_dim=cached_embedding_dims.get("text_emb", _infer_text_dim(str(args.text_model))),
         freeze_text=bool(args.freeze_text),
         audio_model=str(args.audio_model),
         audio_model_revision=(str(args.audio_model_revision).strip() or None),
@@ -985,8 +1012,8 @@ def main():
         gate_temperature=float(args.gate_temperature),
         gate_scale=float(args.gate_scale),
         delta_scale=float(args.delta_scale),
-        skip_audio_encoder_init=bool(using_feature_cache and args.freeze_audio and ("audio_emb" in cached_embedding_dims)),
-        skip_text_encoder_init=bool(using_feature_cache and args.freeze_text and ("text_emb" in cached_embedding_dims)),
+        skip_audio_encoder_init=skip_audio_encoder_init,
+        skip_text_encoder_init=skip_text_encoder_init,
         skip_rgb_encoder_init=bool(
             using_feature_cache
             and (bool(args.freeze_video) or bool(args.freeze_rgb))
