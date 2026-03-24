@@ -140,6 +140,50 @@ class CachedMotionAudioDataset(Dataset):
         return item
 
 
+class ManifestItemDataset(Dataset):
+    """直接从 split manifest 条目构造轻量 streaming dataset。
+
+    这个 dataset 不读取媒体内容，只负责把 manifest 里的元数据规范化成
+    训练/推理可消费的样本描述；真正的媒体读取与 CUDA 侧预处理交给
+    `gpu_stream.py`。
+    """
+
+    def __init__(self, items: list[dict[str, Any]]):
+        super().__init__()
+        self.items = [dict(item) for item in items]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        item = dict(self.items[idx])
+        label_idx = item.get("label_idx", None)
+        if label_idx is None:
+            raise RuntimeError(f"Manifest item missing label_idx: {item.get('seq') or item.get('sample_id') or idx}")
+        intensity = item.get("intensity", None)
+        if intensity is None:
+            intensity_t = torch.tensor(float("nan"), dtype=torch.float32)
+        else:
+            intensity_t = torch.tensor(float(intensity), dtype=torch.float32)
+        return {
+            "label": torch.tensor(int(label_idx), dtype=torch.long),
+            "stem": str(item.get("seq") or item.get("sample_id") or idx),
+            "text": str(item.get("text", item.get("mn", ""))),
+            "mn": str(item.get("mn", item.get("text", ""))),
+            "masked_text": str(item.get("masked_text", item.get("masked_mn", ""))),
+            "masked_mn": str(item.get("masked_mn", item.get("masked_text", ""))),
+            "speaker_id": str(item.get("speaker_id", "UNKNOWN")),
+            "text_cue_flag": bool(item.get("text_cue_flag", False)),
+            "cue_severity": str(item.get("cue_severity", "none")),
+            "prompt_group_id": str(item.get("prompt_group_id", "")),
+            "_global_label_en": str(item.get("label_en", item.get("_global_label_en", ""))),
+            "dataset_kind": str(item.get("dataset_kind", "")),
+            "intensity": intensity_t,
+            "video_path": str(item.get("video_path") or ""),
+            "audio_path": str(item.get("audio_path") or ""),
+        }
+
+
 def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """把若干缓存样本拼成一个 batch。
 
@@ -255,3 +299,9 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             text_inputs["token_type_ids"] = torch.stack([b["_text_token_type_ids"] for b in batch], dim=0)
         batch_out["text_inputs"] = text_inputs
     return batch_out
+
+
+def collate_manifest_items(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """manifest streaming 模式下保持原始 item 列表。"""
+
+    return list(batch)

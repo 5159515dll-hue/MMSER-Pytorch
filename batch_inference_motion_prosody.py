@@ -35,7 +35,8 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from audio_aug import normalize_wav
-from data import CachedMotionAudioDataset, collate
+from data import CachedMotionAudioDataset, ManifestItemDataset, collate, collate_manifest_items
+from gpu_stream import GpuStreamConfig, GpuStreamPreprocessor
 from manifest_utils import (
     EMOTIONS,
     TASK_MODES,
@@ -198,6 +199,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--feature-cache", type=Path, default=None, help="Optional GPU feature-cache built by build_feature_cache.py")
+    p.add_argument(
+        "--pipeline",
+        type=str,
+        default="auto",
+        choices=["auto", "legacy", "gpu_stream"],
+        help="auto=prefer cached legacy path when cache args are provided, otherwise stream from split-manifest when possible.",
+    )
+    p.add_argument(
+        "--cache-mode",
+        type=str,
+        default="none",
+        choices=["none", "ram", "disk"],
+        help="gpu_stream cache mode. disk is reserved for legacy tooling.",
+    )
+    p.add_argument("--ram-cache-size", type=int, default=256, help="Max samples cached in process RAM when --cache-mode=ram")
     p.add_argument("--checkpoint", type=Path, default=Path("outputs/motion_prosody/checkpoints/best.pt"))
     p.add_argument("--output", type=Path, default=Path("outputs/motion_prosody/inference_results.jsonl"))
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -243,6 +259,20 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "torchaudio", "soundfile"],
         help="Audio loading backend. auto=try torchaudio then fallback to soundfile",
+    )
+    p.add_argument(
+        "--video-decode-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "decord", "cpu"],
+        help="gpu_stream video decode backend",
+    )
+    p.add_argument(
+        "--flow-backend",
+        type=str,
+        default="torch_motion",
+        choices=["torch_motion", "legacy"],
+        help="gpu_stream motion backend",
     )
     p.add_argument("--prosody-no-pitch", action="store_true", help="Disable pitch extraction (faster)")
 
@@ -622,6 +652,19 @@ def _resolve_ablation_flags(args: argparse.Namespace) -> tuple[bool, bool, bool]
         zero_audio = zero_audio or preset[1]
         zero_text = zero_text or preset[2]
     return zero_video, zero_audio, zero_text
+
+
+def _resolve_pipeline_mode(args: argparse.Namespace, *, cached_input: Path | None, split_manifest_path: Path | None) -> str:
+    """根据输入源选择推理流水线。"""
+
+    requested = str(getattr(args, "pipeline", "auto") or "auto").strip().lower()
+    if requested == "auto":
+        if cached_input is not None:
+            return "legacy"
+        if split_manifest_path is not None:
+            return "gpu_stream"
+        return "legacy"
+    return requested
 
 
 def _forward_outputs(
@@ -1103,6 +1146,215 @@ def _run_cached_batched(
     }
 
 
+def _run_stream_batched(
+    *,
+    items: list[dict[str, Any]],
+    out_file: Any,
+    model: FusionClassifier,
+    tokenizer: Any,
+    args: argparse.Namespace,
+    device: torch.device,
+    use_amp: bool,
+    amp_mod: Any,
+    video_backbone: str,
+    ckpt_use_intensity: bool,
+    label_names: list[str],
+    print_result: str,
+    print_every: int,
+    show_first_errors: int,
+) -> dict[str, Any]:
+    """对 split manifest 原始媒体做 batched gpu_stream 推理。"""
+
+    profile = detect_runtime(str(args.device))
+    resolved_batch_size = resolve_batch_size(
+        args.batch_size,
+        phase="inference",
+        profile=profile,
+        feature_cache=False,
+        video_backbone=str(video_backbone),
+        freeze_audio=bool(args.freeze_audio) if hasattr(args, "freeze_audio") else True,
+        freeze_text=bool(args.freeze_text) if hasattr(args, "freeze_text") else True,
+        freeze_flow=True,
+        freeze_rgb=True,
+    )
+    resolved_num_workers = resolve_worker_count(
+        args.num_workers,
+        phase="inference",
+        profile=profile,
+        dataset_in_memory=True,
+        total_items=len(items),
+    )
+    prefetch_factor = resolve_prefetch_factor(args.prefetch_factor, num_workers=resolved_num_workers)
+    dl_kwargs: dict[str, Any] = {
+        "batch_size": int(resolved_batch_size),
+        "shuffle": False,
+        "num_workers": int(resolved_num_workers),
+        "collate_fn": collate_manifest_items,
+        "pin_memory": device.type == "cuda",
+    }
+    if int(resolved_num_workers) > 0:
+        dl_kwargs["persistent_workers"] = True
+        if prefetch_factor is not None:
+            dl_kwargs["prefetch_factor"] = int(prefetch_factor)
+    loader = DataLoader(ManifestItemDataset(items), **dl_kwargs)
+
+    preprocessor = GpuStreamPreprocessor(
+        GpuStreamConfig(
+            device=device,
+            video_backbone=str(video_backbone),
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            audio_backend_mode=str(args.audio_backend),
+            num_frames=int(args.num_frames),
+            flow_size=int(args.flow_size),
+            rgb_size=int(args.rgb_size),
+            zero_video=bool(args.zero_video),
+            zero_audio=bool(args.zero_audio),
+            zero_text=bool(args.zero_text),
+            prosody_use_pitch=(not bool(args.prosody_no_pitch)),
+            video_decode_backend=str(args.video_decode_backend),
+            flow_backend=str(args.flow_backend),
+            cache_mode=str(args.cache_mode),
+            ram_cache_size=int(args.ram_cache_size),
+        )
+    )
+
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+    correct = 0
+    seen = 0
+    y_true_indices: list[int] = []
+    y_pred_indices: list[int] = []
+    reg_true: list[float] = []
+    reg_pred: list[float] = []
+    err_types: Counter[str] = Counter()
+
+    iterator = loader
+    if tqdm is not None and (not args.no_progress):
+        iterator = tqdm(loader, desc="Batch inference [gpu_stream]", unit="batch", dynamic_ncols=True)
+
+    first_errors = 0
+    for raw_batch in iterator:
+        try:
+            batch = preprocessor.prepare_batch(
+                raw_batch,
+                tokenizer=tokenizer,
+                text_policy=str(args.text_policy),
+                max_text_len=int(args.max_text_len),
+            )
+            logits, pred_intensity, _mode = _forward_outputs(
+                model,
+                batch.get("flow", None),
+                batch.get("rgb", None),
+                batch["audio"],
+                batch["prosody"],
+                batch.get("text_inputs", None),
+                batch.get("audio_lens", None),
+                None,
+                None,
+                None,
+                None,
+                device=device,
+                use_amp=use_amp,
+                amp_mod=amp_mod,
+                skip_video_encoder=bool(args.skip_video_encoder),
+                return_intensity=bool(ckpt_use_intensity),
+                video_backbone=video_backbone,
+            )
+        except Exception as e:
+            err_types[type(e).__name__] += len(raw_batch)
+            err_count += len(raw_batch)
+            for item in raw_batch:
+                stem = str(item.get("stem", ""))
+                label_idx = int(item["label"].item()) if isinstance(item.get("label"), torch.Tensor) else int(item.get("label", -1))
+                label_en = label_names[label_idx] if 0 <= label_idx < len(label_names) else None
+                rec = {
+                    "stem": stem,
+                    "status": "error",
+                    "label": label_en,
+                    "error": f"{type(e).__name__}: {e}",
+                    "cache_kind": "gpu_stream",
+                }
+                out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if first_errors < show_first_errors:
+                    print(f"ERROR stem={stem} label={label_en} err={rec['error']}", flush=True)
+                    first_errors += 1
+            if args.fail_fast:
+                raise
+            continue
+
+        probs = torch.softmax(logits, dim=1).detach().cpu()
+        pred_indices = torch.argmax(probs, dim=1)
+        pred_intensity_cpu = pred_intensity.detach().float().cpu() if pred_intensity is not None else None
+        labels = batch["labels"].detach().cpu()
+        for i, stem in enumerate(batch.get("stems", [])):
+            label_idx = int(labels[i].item())
+            if not (0 <= label_idx < len(label_names)):
+                skip_count += 1
+                rec = {"stem": stem, "status": "skip", "reason": "bad_label", "label": label_idx}
+                out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                continue
+            seen += 1
+            ok_count += 1
+            label_en = label_names[label_idx]
+            pred_idx = int(pred_indices[i].item())
+            pred = label_names[pred_idx]
+            prob = float(probs[i, pred_idx].item())
+            match = bool(pred_idx == label_idx)
+            correct += int(match)
+            y_true_indices.append(label_idx)
+            y_pred_indices.append(pred_idx)
+            gt_intensity_val: float | None = None
+            pred_intensity_val: float | None = None
+            if bool(ckpt_use_intensity):
+                gt_raw = float(batch["intensity"][i].detach().cpu().item())
+                if math.isfinite(gt_raw):
+                    gt_intensity_val = gt_raw
+                    if pred_intensity_cpu is not None:
+                        pred_intensity_val = float(pred_intensity_cpu[i].item())
+                        reg_true.append(gt_raw)
+                        reg_pred.append(pred_intensity_val)
+            rec = {
+                "stem": stem,
+                "status": "ok",
+                "label": label_en,
+                "pred": pred,
+                "match": match,
+                "probability": prob,
+                "speaker_id": str(batch.get("speaker_id", ["UNKNOWN"])[i]),
+                "cache_kind": "gpu_stream",
+                "mn": str(batch.get("mn", [""])[i]),
+            }
+            if bool(ckpt_use_intensity):
+                rec["pred_intensity"] = pred_intensity_val
+                rec["intensity_gt"] = gt_intensity_val
+            out_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if print_result in {"ok", "all"}:
+                tag = "OK" if match else "MISS"
+                print(f"{tag} stem={stem} label={label_en} pred={pred} p={prob:.4f}", flush=True)
+            if print_every > 0 and (seen % int(print_every)) == 0:
+                acc = correct / max(1, seen)
+                print(f"[{seen}] acc={acc:.4f} stem={stem} label={label_en} pred={pred} p={prob:.4f}", flush=True)
+
+    return {
+        "correct": correct,
+        "seen": seen,
+        "ok_count": ok_count,
+        "skip_count": skip_count,
+        "err_count": err_count,
+        "y_true_indices": y_true_indices,
+        "y_pred_indices": y_pred_indices,
+        "reg_true": reg_true,
+        "reg_pred": reg_pred,
+        "err_types": err_types,
+        "resolved_batch_size": int(resolved_batch_size),
+        "resolved_num_workers": int(resolved_num_workers),
+        "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+        "using_feature_cache": False,
+    }
+
+
 def main() -> None:
     """批量推理主流程。
 
@@ -1121,6 +1373,8 @@ def main() -> None:
     cached_dataset = args.cached_dataset.expanduser() if args.cached_dataset is not None else None
     feature_cache = args.feature_cache.expanduser() if args.feature_cache is not None else None
     split_manifest_path = args.split_manifest.expanduser() if args.split_manifest is not None else None
+    cached_input = feature_cache if feature_cache is not None else cached_dataset
+    pipeline_mode = _resolve_pipeline_mode(args, cached_input=cached_input, split_manifest_path=split_manifest_path)
     ckpt_path = args.checkpoint.expanduser()
     out_path = args.output.expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1130,6 +1384,10 @@ def main() -> None:
     if cached_dataset is None and feature_cache is None and split_manifest_path is None:
         if not xlsx.exists():
             raise FileNotFoundError(f"XLSX not found: {xlsx}")
+    if pipeline_mode == "gpu_stream" and split_manifest_path is None:
+        raise RuntimeError("gpu_stream inference requires --split-manifest")
+    if pipeline_mode == "gpu_stream" and str(args.cache_mode) == "disk":
+        raise RuntimeError("gpu_stream --cache-mode=disk is not supported; use --cache-mode none/ram or switch --pipeline legacy")
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
@@ -1161,7 +1419,6 @@ def main() -> None:
     manifest_items: list[dict[str, Any]] = []
     manifest_hash: str | None = None
     dataset_kind = ""
-    cached_input = feature_cache if feature_cache is not None else cached_dataset
     cached_ds: CachedMotionAudioDataset | None = CachedMotionAudioDataset(cached_input) if cached_input is not None else None
     if cached_ds is not None and isinstance(cached_ds.config, dict):
         dataset_kind = str(
@@ -1192,6 +1449,11 @@ def main() -> None:
             task_mode,
             task_speaker_id,
         )
+        manifest_items = [
+            {**item, "label_idx": map_label_to_task_index(str(item.get("label_en", "")), task_mode, task_speaker_id)}
+            for item in manifest_items
+            if map_label_to_task_index(str(item.get("label_en", "")), task_mode, task_speaker_id) is not None
+        ]
         manifest_hash = manifest_sha256(split_manifest_path)
         validity = build_validity_summary(manifest.get("summary", {}), task_mode, task_speaker_id)
     if cached_input is not None:
@@ -1249,6 +1511,8 @@ def main() -> None:
                 "runtime": profile.to_jsonable(),
                 "device": str(device),
                 "amp_mode": resolved_amp_mode,
+                "pipeline": pipeline_mode,
+                "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
                 "cached_input": str(cached_input) if cached_input is not None else None,
                 "feature_cache": str(feature_cache) if feature_cache is not None else None,
             },
@@ -1312,7 +1576,7 @@ def main() -> None:
     cached_run_stats: dict[str, Any] = {}
 
     with open(out_path, "w", encoding="utf-8") as f:
-        if cached_input is not None:
+        if pipeline_mode == "legacy" and cached_input is not None:
             ds = cached_ds if cached_ds is not None else CachedMotionAudioDataset(cached_input)
             label_names = _prepare_cached_dataset_for_task(ds, task_mode, task_speaker_id)
             feature_cfg = ds.config.get("feature_cache", {}) if isinstance(ds.config, dict) else {}
@@ -1381,6 +1645,36 @@ def main() -> None:
                 ckpt_use_intensity=bool(ckpt_use_intensity),
                 label_names=label_names,
                 manifest_by_seq=manifest_by_seq,
+                print_result=print_result,
+                print_every=print_every,
+                show_first_errors=show_first_errors,
+            )
+            correct = int(cached_run_stats["correct"])
+            seen = int(cached_run_stats["seen"])
+            ok_count = int(cached_run_stats["ok_count"])
+            skip_count = int(cached_run_stats["skip_count"])
+            err_count = int(cached_run_stats["err_count"])
+            y_true_indices = list(cached_run_stats["y_true_indices"])
+            y_pred_indices = list(cached_run_stats["y_pred_indices"])
+            reg_true = list(cached_run_stats["reg_true"])
+            reg_pred = list(cached_run_stats["reg_pred"])
+            err_types = Counter(cached_run_stats["err_types"])
+        elif pipeline_mode == "gpu_stream":
+            if not manifest_items:
+                raise RuntimeError("gpu_stream inference requires a non-empty split manifest subset.")
+            stream_items = manifest_items[:limit] if limit > 0 else list(manifest_items)
+            cached_run_stats = _run_stream_batched(
+                items=stream_items,
+                out_file=f,
+                model=model,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                use_amp=use_amp,
+                amp_mod=amp_mod,
+                video_backbone=video_backbone,
+                ckpt_use_intensity=bool(ckpt_use_intensity),
+                label_names=label_names,
                 print_result=print_result,
                 print_every=print_every,
                 show_first_errors=show_first_errors,
@@ -1790,6 +2084,8 @@ def main() -> None:
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,
         "text_policy": str(args.text_policy),
+        "pipeline": pipeline_mode,
+        "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
         "label_names": label_names,
         "zero_video": bool(args.zero_video),
         "zero_audio": bool(args.zero_audio),

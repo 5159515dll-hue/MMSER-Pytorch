@@ -35,7 +35,8 @@ _ensure_project_root_on_path()
 
 from audio_aug import AudioAugConfig, augment_wav
 from audio_aug import normalize_wav
-from data import CachedMotionAudioDataset, collate
+from data import CachedMotionAudioDataset, ManifestItemDataset, collate, collate_manifest_items
+from gpu_stream import GpuStreamConfig, GpuStreamPreprocessor
 from manifest_utils import (
     EMOTIONS,
     TASK_MODES,
@@ -68,6 +69,26 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train motion(flow)/rgb + audio + prosody fusion on cached dataset")
     p.add_argument("--cached-dataset", type=Path, default=None)
     p.add_argument("--feature-cache", type=Path, default=None, help="Optional feature-cache shard dir/file built by build_feature_cache.py")
+    p.add_argument(
+        "--pipeline",
+        type=str,
+        default="auto",
+        choices=["auto", "legacy", "gpu_stream"],
+        help="auto=prefer cached legacy path when cache args are provided, otherwise stream from manifest without raw/feature shard writes.",
+    )
+    p.add_argument(
+        "--cache-mode",
+        type=str,
+        default="none",
+        choices=["none", "ram", "disk"],
+        help="gpu_stream cache mode. none=fully streaming, ram=process-local LRU cache, disk is reserved for legacy tooling.",
+    )
+    p.add_argument(
+        "--ram-cache-size",
+        type=int,
+        default=256,
+        help="Max samples kept in process-local RAM cache when --cache-mode=ram.",
+    )
     p.add_argument(
         "--task-mode",
         type=str,
@@ -217,6 +238,32 @@ def parse_args():
     p.add_argument("--zero-video", action="store_true", help="Zero video inputs for training/eval ablations")
     p.add_argument("--zero-audio", action="store_true", help="Zero audio-derived inputs (wav/audio_emb + prosody) for ablations")
     p.add_argument("--zero-text", action="store_true", help="Drop the text branch for training/eval ablations")
+    p.add_argument("--num-frames", type=int, default=64, help="gpu_stream raw-media frame count for RGB/flow branches")
+    p.add_argument("--flow-size", type=int, default=112, help="gpu_stream optical-flow tensor spatial size")
+    p.add_argument("--rgb-size", type=int, default=224, help="gpu_stream RGB clip spatial size")
+    p.add_argument("--sample-rate", type=int, default=24000, help="gpu_stream audio sample rate")
+    p.add_argument("--max-audio-sec", type=float, default=6.0, help="gpu_stream max audio duration in seconds")
+    p.add_argument(
+        "--audio-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torchaudio", "soundfile"],
+        help="gpu_stream audio loader backend",
+    )
+    p.add_argument(
+        "--video-decode-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "decord", "cpu"],
+        help="gpu_stream video decode backend",
+    )
+    p.add_argument(
+        "--flow-backend",
+        type=str,
+        default="torch_motion",
+        choices=["torch_motion", "legacy"],
+        help="gpu_stream motion backend; torch_motion is a CUDA-friendly task-equivalent motion field.",
+    )
     p.add_argument(
         "--ablation",
         type=str,
@@ -434,6 +481,52 @@ def _resolve_ablation_flags(args: argparse.Namespace) -> tuple[bool, bool, bool]
         zero_audio = zero_audio or preset[1]
         zero_text = zero_text or preset[2]
     return zero_video, zero_audio, zero_text
+
+
+def _resolve_pipeline_mode(args: argparse.Namespace) -> str:
+    """根据 CLI 和输入源选择训练流水线。"""
+
+    requested = str(getattr(args, "pipeline", "auto") or "auto").strip().lower()
+    if requested == "auto":
+        if getattr(args, "cached_dataset", None) is not None or getattr(args, "feature_cache", None) is not None:
+            return "legacy"
+        return "gpu_stream"
+    return requested
+
+
+def _prepare_manifest_items_for_task(
+    items: list[dict[str, Any]],
+    task_mode: str,
+    speaker_id: str | None,
+) -> list[dict[str, Any]]:
+    """为 manifest 条目补齐当前任务模式下的局部 label_idx。"""
+
+    prepared: list[dict[str, Any]] = []
+    for item in items:
+        label_en = str(item.get("label_en", "") or "")
+        task_label_idx = map_label_to_task_index(label_en, task_mode, speaker_id)
+        if task_label_idx is None:
+            continue
+        enriched = dict(item)
+        enriched["label_idx"] = int(task_label_idx)
+        prepared.append(enriched)
+    return prepared
+
+
+def _print_manifest_label_hist(name: str, items: list[dict[str, Any]], label_names: list[str]) -> None:
+    """打印 manifest 子集的标签直方图。"""
+
+    counts = torch.zeros(len(label_names), dtype=torch.long)
+    for item in items:
+        idx = item.get("label_idx", None)
+        if idx is None:
+            continue
+        idx_int = int(idx)
+        if 0 <= idx_int < len(label_names):
+            counts[idx_int] += 1
+    total = int(counts.sum().item())
+    parts = [f"{label_names[k]}:{int(v)}" for k, v in enumerate(counts.tolist())]
+    print(f"{name} label histogram (n={total}): " + " ".join(parts))
 
 
 def _macro_f1(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> float:
@@ -769,8 +862,13 @@ def main():
     """
 
     args = parse_args()
-    if args.cached_dataset is None and args.feature_cache is None:
-        raise RuntimeError("Provide at least one of --cached-dataset or --feature-cache")
+    pipeline_mode = _resolve_pipeline_mode(args)
+    if pipeline_mode == "legacy" and args.cached_dataset is None and args.feature_cache is None:
+        raise RuntimeError("Legacy pipeline requires at least one of --cached-dataset or --feature-cache")
+    if pipeline_mode == "gpu_stream" and args.split_manifest is None:
+        raise RuntimeError("gpu_stream pipeline requires --split-manifest")
+    if pipeline_mode == "gpu_stream" and str(args.cache_mode) == "disk":
+        raise RuntimeError("gpu_stream --cache-mode=disk is not supported; use --cache-mode none/ram or switch --pipeline legacy")
     set_seed(args.seed)
     args.text_policy = resolve_text_policy(args.text_policy)
     zero_video, zero_audio, zero_text = _resolve_ablation_flags(args)
@@ -803,37 +901,42 @@ def main():
         except Exception:
             pass
 
-    # Print cached shard paths (helps debug loading and ensures reproducibility).
-    cache_source = args.feature_cache.expanduser() if args.feature_cache is not None else args.cached_dataset.expanduser()
     if args.split_manifest is not None and not args.split_manifest.expanduser().exists():
         raise FileNotFoundError(f"Split manifest not found: {args.split_manifest.expanduser()}")
-    if cache_source.is_file():
-        shard_paths = [cache_source]
-    else:
-        shard_paths = sorted(
-            cache_source.glob("*.pt"),
-            key=lambda p: int(p.stem) if p.stem.isdigit() else p.stem,
-        )
-    print(f"Training cache path: {cache_source}")
-    print(f"Found {len(shard_paths)} shard(s):")
-    for p in shard_paths:
-        print(f"  - {p}")
-
-    ds = CachedMotionAudioDataset(cache_source)
+    cache_source = None
+    shard_paths: list[Path] = []
+    ds = None
     dataset_kind = ""
-    if isinstance(ds.config, dict):
-        dataset_kind = str(
-            ds.config.get("source_manifest", {}).get("dataset_kind")
-            or ds.config.get("dataset_kind", "")
-            or ""
-        ).strip()
-    if not dataset_kind and ds.samples:
-        dataset_kind = str(ds.samples[0].get("dataset_kind", "") or "").strip()
+    cached_embedding_dims: dict[str, int] = {}
     task_mode = resolve_task_mode(args.task_mode)
     task_speaker_id = str(args.speaker_id).strip().upper() or None
-    task_label_names = _prepare_dataset_for_task(ds, task_mode, task_speaker_id)
-    cached_embedding_dims = _infer_cached_embedding_dims(ds.samples)
-    _validate_cache_compatibility(ds, args)
+    task_label_names = resolve_task_label_names(task_mode, task_speaker_id)
+    if pipeline_mode == "legacy":
+        cache_source = args.feature_cache.expanduser() if args.feature_cache is not None else args.cached_dataset.expanduser()
+        if cache_source.is_file():
+            shard_paths = [cache_source]
+        else:
+            shard_paths = sorted(
+                cache_source.glob("*.pt"),
+                key=lambda p: int(p.stem) if p.stem.isdigit() else p.stem,
+            )
+        print(f"Training cache path: {cache_source}")
+        print(f"Found {len(shard_paths)} shard(s):")
+        for p in shard_paths:
+            print(f"  - {p}")
+        ds = CachedMotionAudioDataset(cache_source)
+        if isinstance(ds.config, dict):
+            dataset_kind = str(
+                ds.config.get("source_manifest", {}).get("dataset_kind")
+                or ds.config.get("dataset_kind", "")
+                or ""
+            ).strip()
+        if not dataset_kind and ds.samples:
+            dataset_kind = str(ds.samples[0].get("dataset_kind", "") or "").strip()
+        task_label_names = _prepare_dataset_for_task(ds, task_mode, task_speaker_id)
+        cached_embedding_dims = _infer_cached_embedding_dims(ds.samples)
+        _validate_cache_compatibility(ds, args)
+
     split_manifest = None
     manifest_hash = None
     manifest_summary: dict[str, Any] = {}
@@ -847,63 +950,61 @@ def main():
         manifest_summary = split_manifest.get("summary", {})
         dataset_kind = str(split_manifest.get("dataset_kind", dataset_kind) or dataset_kind)
         validity_summary = build_validity_summary(manifest_summary, task_mode, task_speaker_id)
-        train_manifest_items = filter_manifest_items_for_task(
+        train_manifest_items = _prepare_manifest_items_for_task(filter_manifest_items_for_task(
             select_manifest_items(split_manifest, "train"),
             task_mode,
             task_speaker_id,
-        )
-        val_manifest_items = filter_manifest_items_for_task(
+        ), task_mode, task_speaker_id)
+        val_manifest_items = _prepare_manifest_items_for_task(filter_manifest_items_for_task(
             select_manifest_items(split_manifest, "val"),
             task_mode,
             task_speaker_id,
-        )
+        ), task_mode, task_speaker_id)
 
-        stem_to_index: dict[str, int] = {}
-        duplicate_stems: set[str] = set()
-        for idx, sample in enumerate(ds.samples):
-            stem = str(sample.get("stem", idx))
-            if stem in stem_to_index:
-                duplicate_stems.add(stem)
-                continue
-            stem_to_index[stem] = idx
-        if duplicate_stems:
-            shown = ", ".join(sorted(list(duplicate_stems))[:10])
-            print(f"WARNING: duplicate stems in cached dataset; first occurrence will be used. Example(s): {shown}")
-
-        def _indices_for_manifest(items: list[dict[str, Any]], name: str) -> tuple[list[int], list[dict[str, Any]]]:
-            """把 manifest 中的样本序号映射成缓存数据集索引。
-
-            manifest 是基于 XLSX 生成的，可能包含“有标签但缺少原始媒体”的样本。
-            这些样本不会出现在 raw/feature cache 里，因此这里选择告警并跳过，
-            而不是让整轮训练因为 1 条缺失样本直接失败。
-            """
-
-            indices: list[int] = []
-            kept_items: list[dict[str, Any]] = []
-            missing_stems: list[str] = []
-            for item in items:
-                stem = str(item.get("seq", ""))
+        if pipeline_mode == "legacy":
+            assert ds is not None
+            stem_to_index: dict[str, int] = {}
+            duplicate_stems: set[str] = set()
+            for idx, sample in enumerate(ds.samples):
+                stem = str(sample.get("stem", idx))
                 if stem in stem_to_index:
-                    indices.append(stem_to_index[stem])
-                    kept_items.append(item)
-                else:
-                    missing_stems.append(stem)
-            if missing_stems:
-                preview = ", ".join(missing_stems[:10])
-                print(
-                    f"WARNING: {name} split manifest contains {len(missing_stems)} stem(s) missing from cache; "
-                    f"they will be skipped. Example(s): {preview}",
-                    flush=True,
-                )
-            return indices, kept_items
+                    duplicate_stems.add(stem)
+                    continue
+                stem_to_index[stem] = idx
+            if duplicate_stems:
+                shown = ", ".join(sorted(list(duplicate_stems))[:10])
+                print(f"WARNING: duplicate stems in cached dataset; first occurrence will be used. Example(s): {shown}")
 
-        train_indices, train_manifest_items = _indices_for_manifest(train_manifest_items, "train")
-        val_indices, val_manifest_items = _indices_for_manifest(val_manifest_items, "val")
-        if not train_indices or not val_indices:
-            raise RuntimeError("Split manifest produced an empty train or val subset.")
+            def _indices_for_manifest(items: list[dict[str, Any]], name: str) -> tuple[list[int], list[dict[str, Any]]]:
+                indices: list[int] = []
+                kept_items: list[dict[str, Any]] = []
+                missing_stems: list[str] = []
+                for item in items:
+                    stem = str(item.get("seq", ""))
+                    if stem in stem_to_index:
+                        indices.append(stem_to_index[stem])
+                        kept_items.append(item)
+                    else:
+                        missing_stems.append(stem)
+                if missing_stems:
+                    preview = ", ".join(missing_stems[:10])
+                    print(
+                        f"WARNING: {name} split manifest contains {len(missing_stems)} stem(s) missing from cache; "
+                        f"they will be skipped. Example(s): {preview}",
+                        flush=True,
+                    )
+                return indices, kept_items
+
+            train_indices, train_manifest_items = _indices_for_manifest(train_manifest_items, "train")
+            val_indices, val_manifest_items = _indices_for_manifest(val_manifest_items, "val")
+            if not train_indices or not val_indices:
+                raise RuntimeError("Split manifest produced an empty train or val subset.")
         print(f"Using split manifest: {args.split_manifest.expanduser()}")
         print(f"Manifest sha256: {manifest_hash}")
     else:
+        if pipeline_mode != "legacy":
+            raise RuntimeError("gpu_stream currently requires --split-manifest")
+        assert ds is not None
         # deterministic split
         candidate_indices = list(range(len(ds)))
         if task_mode == "within_speaker":
@@ -926,17 +1027,24 @@ def main():
             indices = list(candidate_indices)
         train_indices = indices[:n_train]
         val_indices = indices[n_train:]
-    train_ds = Subset(ds, train_indices)
-    val_ds = Subset(ds, val_indices)
-    _print_split_label_hist("train", ds, train_indices, task_label_names)
-    _print_split_label_hist("val", ds, val_indices, task_label_names)
+    if pipeline_mode == "legacy":
+        assert ds is not None
+        train_ds = Subset(ds, train_indices)
+        val_ds = Subset(ds, val_indices)
+        _print_split_label_hist("train", ds, train_indices, task_label_names)
+        _print_split_label_hist("val", ds, val_indices, task_label_names)
+    else:
+        train_ds = ManifestItemDataset(train_manifest_items)
+        val_ds = ManifestItemDataset(val_manifest_items)
+        _print_manifest_label_hist("train", train_manifest_items, task_label_names)
+        _print_manifest_label_hist("val", val_manifest_items, task_label_names)
     speaker_baseline = None
     speaker_only = None
     if split_manifest is not None and train_manifest_items and val_manifest_items and task_mode == "confounded_7way":
         speaker_baseline = speaker_majority_baseline(train_manifest_items, val_manifest_items, task_label_names)
         speaker_only = speaker_only_baseline(train_manifest_items, val_manifest_items, task_label_names)
 
-    using_feature_cache = bool(args.feature_cache is not None or ds.config.get("feature_cache"))
+    using_feature_cache = bool(pipeline_mode == "legacy" and ds is not None and (args.feature_cache is not None or ds.config.get("feature_cache")))
     resolved_batch_size = resolve_batch_size(
         args.batch_size,
         phase="train",
@@ -952,15 +1060,15 @@ def main():
         args.num_workers,
         phase="train",
         profile=profile,
-        dataset_in_memory=True,
-        total_items=len(ds),
+        dataset_in_memory=bool(pipeline_mode == "legacy"),
+        total_items=(len(ds) if ds is not None else len(train_manifest_items) + len(val_manifest_items)),
     )
     pin_memory = device.type == "cuda"
     persistent_workers = bool(args.persistent_workers) if int(resolved_num_workers) > 0 else False
     prefetch_factor = resolve_prefetch_factor(args.prefetch_factor, num_workers=int(resolved_num_workers))
     dl_kwargs = {
         "num_workers": int(resolved_num_workers),
-        "collate_fn": collate,
+        "collate_fn": collate if pipeline_mode == "legacy" else collate_manifest_items,
         "pin_memory": pin_memory,
     }
     if int(resolved_num_workers) > 0:
@@ -972,7 +1080,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=int(resolved_batch_size), shuffle=False, **dl_kwargs)
 
     tokenizer = None
-    needs_text_tokenizer = (not bool(args.zero_text)) and (not all("text_emb" in s for s in ds.samples))
+    needs_text_tokenizer = (not bool(args.zero_text)) and (pipeline_mode == "gpu_stream" or (ds is not None and not all("text_emb" in s for s in ds.samples)))
     if needs_text_tokenizer:
         try:
             from transformers import AutoTokenizer
@@ -982,7 +1090,9 @@ def main():
             ) from e
 
         tokenizer = AutoTokenizer.from_pretrained(str(args.text_model))
-        _cache_text_tokens(ds, tokenizer, int(args.max_text_len), text_policy=str(args.text_policy))
+        if pipeline_mode == "legacy":
+            assert ds is not None
+            _cache_text_tokens(ds, tokenizer, int(args.max_text_len), text_policy=str(args.text_policy))
 
     skip_audio_encoder_init = bool(using_feature_cache and args.freeze_audio and ("audio_emb" in cached_embedding_dims))
     if bool(args.zero_audio) and "audio_emb" not in cached_embedding_dims:
@@ -1024,8 +1134,31 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    aug_cfg = AudioAugConfig(sample_rate=int(ds.config.get("sample_rate", 24000)))
+    resolved_sample_rate = int(ds.config.get("sample_rate", args.sample_rate)) if ds is not None and isinstance(ds.config, dict) else int(args.sample_rate)
+    aug_cfg = AudioAugConfig(sample_rate=resolved_sample_rate)
     prosody_cfg = ProsodyConfig(sample_rate=aug_cfg.sample_rate, use_pitch=(not args.prosody_no_pitch))
+    stream_preprocessor = None
+    if pipeline_mode == "gpu_stream":
+        stream_preprocessor = GpuStreamPreprocessor(
+            GpuStreamConfig(
+                device=device,
+                video_backbone=str(args.video_backbone),
+                sample_rate=int(args.sample_rate),
+                max_audio_sec=float(args.max_audio_sec),
+                audio_backend_mode=str(args.audio_backend),
+                num_frames=int(args.num_frames),
+                flow_size=int(args.flow_size),
+                rgb_size=int(args.rgb_size),
+                zero_video=bool(args.zero_video),
+                zero_audio=bool(args.zero_audio),
+                zero_text=bool(args.zero_text),
+                prosody_use_pitch=(not bool(args.prosody_no_pitch)),
+                video_decode_backend=str(args.video_decode_backend),
+                flow_backend=str(args.flow_backend),
+                cache_mode=str(args.cache_mode),
+                ram_cache_size=int(args.ram_cache_size),
+            )
+        )
 
     requested_amp_mode = str(args.amp_mode)
     if bool(args.amp) and requested_amp_mode == "auto":
@@ -1048,6 +1181,8 @@ def main():
                 "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
                 "pin_memory": bool(pin_memory),
                 "using_feature_cache": using_feature_cache,
+                "pipeline": pipeline_mode,
+                "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
                 "amp_mode": resolved_amp_mode,
             },
             ensure_ascii=False,
@@ -1105,6 +1240,15 @@ def main():
         reg_pred_all: list[torch.Tensor] = []
         reg_true_all: list[torch.Tensor] = []
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]"):
+            if pipeline_mode == "gpu_stream":
+                if stream_preprocessor is None:
+                    raise RuntimeError("gpu_stream preprocessor is not initialized")
+                batch = stream_preprocessor.prepare_batch(
+                    batch,
+                    tokenizer=tokenizer,
+                    text_policy=str(args.text_policy),
+                    max_text_len=int(args.max_text_len),
+                )
             nb = pin_memory and device.type == "cuda"
 
             cached_audio_emb = batch.get("audio_emb", None)
@@ -1140,7 +1284,7 @@ def main():
                 if args.audio_aug:
                     wav_cpu = augment_wav(wav_cpu, aug_cfg)
                     wav_cpu = normalize_wav(wav_cpu, target_rms=0.1)
-                    if args.recompute_prosody_on_aug:
+                    if args.recompute_prosody_on_aug and pipeline_mode == "legacy":
                         # 韵律来自增强后的波形时，prosody 才与模型实际看到的音频一致。
                         prosody_list = [extract_prosody_features(wav_cpu[i].detach(), prosody_cfg) for i in range(wav_cpu.shape[0])]
                         prosody_cpu = torch.stack(prosody_list, dim=0)
@@ -1334,6 +1478,15 @@ def main():
         v_reg_true_all: list[torch.Tensor] = []
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]"):
+                if pipeline_mode == "gpu_stream":
+                    if stream_preprocessor is None:
+                        raise RuntimeError("gpu_stream preprocessor is not initialized")
+                    batch = stream_preprocessor.prepare_batch(
+                        batch,
+                        tokenizer=tokenizer,
+                        text_policy=str(args.text_policy),
+                        max_text_len=int(args.max_text_len),
+                    )
                 nb = pin_memory and device.type == "cuda"
                 flow_emb_t = batch.get("flow_emb", None)
                 rgb_emb_t = batch.get("rgb_emb", None)
@@ -1602,7 +1755,7 @@ def main():
                 "speaker_id": task_speaker_id,
                 "text_policy": str(args.text_policy),
                 "validity": validity_summary,
-                "cache_config": ds.config,
+                "cache_config": ds.config if ds is not None else {},
                 "resolved_runtime": {
                     "device": str(device),
                     "profile": profile.to_jsonable(),
@@ -1611,6 +1764,8 @@ def main():
                     "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
                     "amp_mode": resolved_amp_mode,
                     "using_feature_cache": using_feature_cache,
+                    "pipeline": pipeline_mode,
+                    "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
                 },
                 "benchmark_tag": str(args.benchmark_tag),
                 "dataset_kind": dataset_kind,
@@ -1647,7 +1802,7 @@ def main():
                 val_records.append(rec)
 
             val_metrics_summary = {
-                "cached_dataset": str(cache_source),
+                "cached_dataset": str(cache_source) if cache_source is not None else None,
                 "feature_cache": str(args.feature_cache.expanduser()) if args.feature_cache is not None else None,
                 "split_manifest": str(args.split_manifest.expanduser()) if args.split_manifest is not None else None,
                 "subset": "val",
@@ -1672,6 +1827,8 @@ def main():
                 "validity": validity_summary,
                 "speaker_majority_baseline": speaker_baseline,
                 "speaker_only_baseline": speaker_only,
+                "pipeline": pipeline_mode,
+                "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
             }
             _write_best_val_inference_outputs(out_dir, records=val_records, metrics_summary=val_metrics_summary)
         else:
@@ -1697,14 +1854,25 @@ def main():
         "speaker_id": task_speaker_id,
         "text_policy": str(args.text_policy),
         "validity": validity_summary,
-        "cache_config": ds.config,
+        "cache_config": ds.config if ds is not None else {},
+        "resolved_runtime": {
+            "device": str(device),
+            "profile": profile.to_jsonable(),
+            "batch_size": int(resolved_batch_size),
+            "num_workers": int(resolved_num_workers),
+            "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+            "amp_mode": resolved_amp_mode,
+            "using_feature_cache": using_feature_cache,
+            "pipeline": pipeline_mode,
+            "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
+        },
     }
     torch.save(last_ckpt, out_dir / "checkpoints" / "last.pt")
 
     metrics_payload: dict[str, Any] = dict(history)
     metrics_payload["meta"] = {
         "benchmark_tag": str(args.benchmark_tag),
-        "cached_dataset": str(cache_source),
+        "cached_dataset": str(cache_source) if cache_source is not None else None,
         "num_shards": len(shard_paths),
         "split_mode": str(args.split_mode),
         "split_manifest": str(args.split_manifest.expanduser()) if args.split_manifest is not None else None,
@@ -1713,14 +1881,14 @@ def main():
         "speaker_id": task_speaker_id,
         "text_policy": str(args.text_policy),
         "label_names": task_label_names,
-        "train_size": len(train_indices),
-        "val_size": len(val_indices),
+        "train_size": len(train_ds),
+        "val_size": len(val_ds),
         "ablation": str(args.ablation),
         "zero_video": bool(args.zero_video),
         "zero_audio": bool(args.zero_audio),
         "zero_text": bool(args.zero_text),
         "args": _to_jsonable(vars(args)),
-        "cache_config": _to_jsonable(ds.config),
+        "cache_config": _to_jsonable(ds.config if ds is not None else {}),
         "device": str(device),
         "runtime_profile": profile.to_jsonable(),
         "resolved_batch_size": int(resolved_batch_size),
@@ -1728,6 +1896,8 @@ def main():
         "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
         "amp_mode": resolved_amp_mode,
         "using_feature_cache": using_feature_cache,
+        "pipeline": pipeline_mode,
+        "cache_mode": str(args.cache_mode) if pipeline_mode == "gpu_stream" else "disk",
     }
     if manifest_summary:
         metrics_payload["meta"]["manifest_summary"] = manifest_summary
