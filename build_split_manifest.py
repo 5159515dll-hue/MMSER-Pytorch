@@ -17,7 +17,7 @@ def _ensure_project_root_on_path() -> None:
 
 _ensure_project_root_on_path()
 
-from manifest_utils import build_split_manifest
+from manifest_utils import DATASET_KINDS, build_split_manifest
 from path_utils import default_databases_dir, default_xlsx_path
 
 
@@ -26,8 +26,21 @@ def parse_args() -> argparse.Namespace:
 
     repo_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Build a split manifest for motion_prosody experiments")
+    parser.add_argument("--dataset-kind", type=str, default="mongolian_xlsx", choices=list(DATASET_KINDS))
     parser.add_argument("--data-root", type=Path, default=default_databases_dir(repo_root))
+    parser.add_argument(
+        "--metadata-root",
+        type=Path,
+        default=None,
+        help="Optional metadata root for datasets whose annotations live outside --data-root (e.g. MELD CSV files).",
+    )
     parser.add_argument("--xlsx", type=Path, default=default_xlsx_path(repo_root, "video_databases.xlsx"))
+    parser.add_argument(
+        "--audio-cache-root",
+        type=Path,
+        default=Path("outputs/datasets/meld/audio_cache"),
+        help="Expected audio sidecar root for datasets that require audio extraction (used by MELD manifests).",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -57,8 +70,11 @@ def main() -> None:
         strategy = "stratified_sequential_by_label"
 
     manifest = build_split_manifest(
+        dataset_kind=str(args.dataset_kind),
         data_root=args.data_root.expanduser(),
-        xlsx=args.xlsx.expanduser(),
+        metadata_root=args.metadata_root.expanduser() if args.metadata_root is not None else None,
+        xlsx=args.xlsx.expanduser() if args.dataset_kind == "mongolian_xlsx" else None,
+        audio_cache_root=args.audio_cache_root.expanduser() if args.dataset_kind == "meld" else None,
         train_split=float(args.train_split),
         seed=int(args.seed),
         split_strategy=strategy,
@@ -73,6 +89,7 @@ def main() -> None:
         json.dumps(
             {
                 "manifest_sha256": manifest.get("manifest_sha256"),
+                "dataset_kind": manifest.get("dataset_kind"),
                 "usable_rows": summary.get("usable_rows"),
                 "raw_usable_rows": summary.get("raw_usable_rows"),
                 "split_counts": summary.get("split_counts"),

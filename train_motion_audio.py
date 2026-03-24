@@ -800,6 +800,15 @@ def main():
         print(f"  - {p}")
 
     ds = CachedMotionAudioDataset(cache_source)
+    dataset_kind = ""
+    if isinstance(ds.config, dict):
+        dataset_kind = str(
+            ds.config.get("source_manifest", {}).get("dataset_kind")
+            or ds.config.get("dataset_kind", "")
+            or ""
+        ).strip()
+    if not dataset_kind and ds.samples:
+        dataset_kind = str(ds.samples[0].get("dataset_kind", "") or "").strip()
     task_mode = resolve_task_mode(args.task_mode)
     task_speaker_id = str(args.speaker_id).strip().upper() or None
     task_label_names = _prepare_dataset_for_task(ds, task_mode, task_speaker_id)
@@ -816,6 +825,7 @@ def main():
         split_manifest = load_split_manifest(args.split_manifest.expanduser())
         manifest_hash = manifest_sha256(args.split_manifest.expanduser())
         manifest_summary = split_manifest.get("summary", {})
+        dataset_kind = str(split_manifest.get("dataset_kind", dataset_kind) or dataset_kind)
         validity_summary = build_validity_summary(manifest_summary, task_mode, task_speaker_id)
         train_manifest_items = filter_manifest_items_for_task(
             select_manifest_items(split_manifest, "train"),
@@ -1576,6 +1586,7 @@ def main():
                     "using_feature_cache": using_feature_cache,
                 },
                 "benchmark_tag": str(args.benchmark_tag),
+                "dataset_kind": dataset_kind,
                 "split_manifest": str(args.split_manifest.expanduser()) if args.split_manifest is not None else None,
                 "manifest_sha256": manifest_hash,
                 "ablation": str(args.ablation),
@@ -1655,6 +1666,7 @@ def main():
         "args": vars(args),
         "label_names": task_label_names,
         "task_mode": task_mode,
+        "dataset_kind": dataset_kind,
         "speaker_id": task_speaker_id,
         "text_policy": str(args.text_policy),
         "validity": validity_summary,

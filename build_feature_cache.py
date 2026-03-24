@@ -27,8 +27,10 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from data import CachedMotionAudioDataset, collate
-from manifest_utils import EMOTIONS
+from manifest_utils import EMOTIONS, load_split_manifest, select_manifest_items
+from media_dataset import ManifestMediaDataset
 from models import FusionClassifier
+from prosody import ProsodyConfig
 from runtime_adapt import (
     detect_runtime,
     resolve_amp_mode,
@@ -38,6 +40,7 @@ from runtime_adapt import (
     select_device,
 )
 from text_policy_utils import resolve_text_policy, select_text_for_policy
+from video_motion import MotionConfig, RgbConfig
 
 
 def _atomic_torch_save(obj: Any, dst: Path) -> None:
@@ -74,7 +77,11 @@ def parse_args() -> argparse.Namespace:
     """解析 feature cache 构建命令行参数。"""
 
     p = argparse.ArgumentParser(description="Build GPU feature cache from raw predecoded shards")
-    p.add_argument("--cached-dataset", type=Path, required=True, help="Raw cached shard dir/file produced by predecode_dataset.py")
+    p.add_argument("--input-mode", type=str, default="auto", choices=["auto", "cached", "media"])
+    p.add_argument("--cached-dataset", type=Path, default=None, help="Raw cached shard dir/file produced by predecode_dataset.py")
+    p.add_argument("--split-manifest", type=Path, default=None, help="Manifest JSON used when --input-mode=media")
+    p.add_argument("--subset", type=str, default="all", choices=["all", "train", "val", "test"])
+    p.add_argument("--limit", type=int, default=0, help="Optional limit after subset filtering in media mode")
     p.add_argument("--output", type=Path, required=True, help="Output directory for feature cache shards")
     p.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint to load encoder weights/config from")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -95,6 +102,19 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--text-model", type=str, default="xlm-roberta-large")
     p.add_argument("--max-text-len", type=int, default=128)
+    p.add_argument("--num-frames", type=int, default=16, help="Frame count when building directly from media")
+    p.add_argument("--flow-size", type=int, default=112, help="Flow crop size when building directly from media")
+    p.add_argument("--rgb-size", type=int, default=224, help="RGB crop size when building directly from media")
+    p.add_argument("--sample-rate", type=int, default=24000, help="Audio sample rate when building directly from media")
+    p.add_argument("--max-audio-sec", type=float, default=6.0, help="Max audio duration when building directly from media")
+    p.add_argument(
+        "--audio-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torchaudio", "soundfile"],
+        help="Audio loading backend when building directly from media",
+    )
+    p.add_argument("--prosody-no-pitch", action="store_true", help="Disable pitch extraction when building directly from media")
     p.add_argument(
         "--text-policy",
         type=str,
@@ -203,9 +223,73 @@ def main() -> None:
     device = select_device(args.device)
     amp_mode = resolve_amp_mode(args.amp_mode, profile)
     model_args, state = _resolve_model_args(args)
+    input_mode = str(args.input_mode or "auto").strip().lower()
+    if input_mode == "auto":
+        if args.cached_dataset is not None:
+            input_mode = "cached"
+        elif args.split_manifest is not None:
+            input_mode = "media"
+        else:
+            raise RuntimeError("build_feature_cache.py requires either --cached-dataset or --split-manifest")
 
-    ds = CachedMotionAudioDataset(args.cached_dataset.expanduser())
+    text_policy = resolve_text_policy(args.text_policy)
+    effective_freeze_text = bool(args.freeze_text) and text_policy != "drop"
+    ds: Any
+    source_cache_config: dict[str, Any] = {}
+    source_manifest_config: dict[str, Any] | None = None
     dataset_in_memory = True
+    if input_mode == "cached":
+        if args.cached_dataset is None:
+            raise RuntimeError("--input-mode cached requires --cached-dataset")
+        ds = CachedMotionAudioDataset(args.cached_dataset.expanduser())
+        source_cache_config = ds.config if isinstance(ds.config, dict) else {}
+    elif input_mode == "media":
+        if args.split_manifest is None:
+            raise RuntimeError("--input-mode media requires --split-manifest")
+        manifest = load_split_manifest(args.split_manifest.expanduser())
+        items = select_manifest_items(manifest, args.subset)
+        if int(args.limit) > 0:
+            items = items[: int(args.limit)]
+        if not items:
+            raise RuntimeError(f"No manifest items selected for subset={args.subset}")
+
+        video_backbone = str(model_args["video_backbone"])
+        need_flow = bool(args.freeze_flow or (args.retain_raw and video_backbone in {"flow", "dual"}))
+        need_rgb = bool(args.freeze_rgb or (args.retain_raw and video_backbone in {"videomae", "dual"}))
+        need_audio = True
+        if video_backbone == "videomae" and not need_rgb:
+            raise RuntimeError(
+                "media input mode with --video-backbone videomae requires either --freeze-rgb or --retain-raw"
+            )
+        if video_backbone in {"flow", "dual"} and not need_flow:
+            raise RuntimeError(
+                "media input mode with a flow branch requires either --freeze-flow or --retain-raw. "
+                "For large benchmarks, the recommended default is --video-backbone videomae."
+            )
+
+        ds = ManifestMediaDataset(
+            items,
+            need_audio=need_audio,
+            need_flow=need_flow,
+            need_rgb=need_rgb,
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            audio_backend_mode=str(args.audio_backend),
+            motion_cfg=MotionConfig(num_frames=int(args.num_frames), flow_size=int(args.flow_size)),
+            rgb_cfg=RgbConfig(num_frames=int(args.num_frames), rgb_size=int(args.rgb_size)),
+            prosody_cfg=ProsodyConfig(enable_pitch=not bool(args.prosody_no_pitch)),
+        )
+        source_manifest_config = {
+            "path": str(args.split_manifest.expanduser()),
+            "subset": str(args.subset),
+            "limit": int(args.limit),
+            "dataset_kind": str(manifest.get("dataset_kind", "")),
+            "manifest_sha256": str(manifest.get("manifest_sha256", "")),
+        }
+        dataset_in_memory = False
+    else:
+        raise RuntimeError(f"Unsupported input mode: {input_mode}")
+
     batch_size = resolve_batch_size(
         args.batch_size,
         phase="feature_cache",
@@ -245,8 +329,6 @@ def main() -> None:
         raise RuntimeError("transformers is required for build_feature_cache.py") from e
 
     tokenizer = None
-    text_policy = resolve_text_policy(args.text_policy)
-    effective_freeze_text = bool(args.freeze_text) and text_policy != "drop"
     if effective_freeze_text:
         tokenizer = AutoTokenizer.from_pretrained(str(model_args["text_model"]))
 
@@ -279,7 +361,10 @@ def main() -> None:
                 "amp_mode": amp_mode,
                 "batch_size": int(batch_size),
                 "num_workers": int(num_workers),
-                "cached_dataset": str(args.cached_dataset.expanduser()),
+                "input_mode": input_mode,
+                "cached_dataset": str(args.cached_dataset.expanduser()) if args.cached_dataset is not None else None,
+                "split_manifest": str(args.split_manifest.expanduser()) if args.split_manifest is not None else None,
+                "subset": str(args.subset),
                 "output": str(args.output.expanduser()),
                 "freeze_audio": bool(args.freeze_audio),
                 "freeze_flow": bool(args.freeze_flow),
@@ -403,12 +488,16 @@ def main() -> None:
                     "prosody": batch["prosody"][i].detach().cpu().to(torch.float32),
                     "label": batch["labels"][i].detach().cpu().to(torch.long),
                     "stem": str(batch["stems"][i]),
+                    "dataset_kind": str(batch.get("dataset_kind", [""] * batch_size_actual)[i]) if "dataset_kind" in batch else "",
+                    "text": str(batch["mn"][i]),
                     "mn": str(batch["mn"][i]),
+                    "masked_text": str(batch.get("masked_mn", [""] * batch_size_actual)[i]),
                     "masked_mn": str(batch.get("masked_mn", [""] * batch_size_actual)[i]),
                     "speaker_id": str(batch["speaker_id"][i]),
                     "text_cue_flag": bool(batch["text_cue_flag"][i].item()),
                     "cue_severity": str(batch.get("cue_severity", ["none"] * batch_size_actual)[i]),
                     "prompt_group_id": str(batch.get("prompt_group_id", [""] * batch_size_actual)[i]),
+                    "_global_label_en": str(batch.get("_global_label_en", [""] * batch_size_actual)[i]),
                     "intensity": batch["intensity"][i].detach().cpu().to(torch.float32),
                 }
                 if bool(args.freeze_flow):
@@ -456,8 +545,10 @@ def main() -> None:
                         {
                             "samples": cached,
                             "config": {
-                                "source_cached_dataset": str(args.cached_dataset.expanduser()),
-                                "source_cache_config": ds.config,
+                                "input_mode": input_mode,
+                                "source_cached_dataset": str(args.cached_dataset.expanduser()) if args.cached_dataset is not None else None,
+                                "source_manifest": source_manifest_config,
+                                "source_cache_config": source_cache_config,
                                 "runtime": profile.to_jsonable(),
                                 "feature_cache": {
                                     "checkpoint": str(args.checkpoint.expanduser()) if args.checkpoint is not None else None,
@@ -492,8 +583,10 @@ def main() -> None:
             {
                 "samples": cached,
                 "config": {
-                    "source_cached_dataset": str(args.cached_dataset.expanduser()),
-                    "source_cache_config": ds.config,
+                    "input_mode": input_mode,
+                    "source_cached_dataset": str(args.cached_dataset.expanduser()) if args.cached_dataset is not None else None,
+                    "source_manifest": source_manifest_config,
+                    "source_cache_config": source_cache_config,
                     "runtime": profile.to_jsonable(),
                     "feature_cache": {
                         "checkpoint": str(args.checkpoint.expanduser()) if args.checkpoint is not None else None,

@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         "--subset",
         type=str,
         default="all",
-        choices=["all", "train", "val"],
+        choices=["all", "train", "val", "test"],
         help="Subset to evaluate when --split-manifest is provided",
     )
     p.add_argument(
@@ -1136,8 +1136,17 @@ def main() -> None:
     manifest: dict[str, Any] | None = None
     manifest_items: list[dict[str, Any]] = []
     manifest_hash: str | None = None
+    dataset_kind = ""
     cached_input = feature_cache if feature_cache is not None else cached_dataset
     cached_ds: CachedMotionAudioDataset | None = CachedMotionAudioDataset(cached_input) if cached_input is not None else None
+    if cached_ds is not None and isinstance(cached_ds.config, dict):
+        dataset_kind = str(
+            cached_ds.config.get("source_manifest", {}).get("dataset_kind")
+            or cached_ds.config.get("dataset_kind", "")
+            or ""
+        ).strip()
+    if not dataset_kind and cached_ds is not None and cached_ds.samples:
+        dataset_kind = str(cached_ds.samples[0].get("dataset_kind", "") or "").strip()
     cached_embedding_dims = _infer_cached_embedding_dims(cached_ds.samples) if cached_ds is not None else {}
 
     model, ckpt_use_intensity, label_names, task_mode, task_speaker_id, validity = _load_model(
@@ -1153,6 +1162,7 @@ def main() -> None:
 
     if split_manifest_path is not None:
         manifest = load_split_manifest(split_manifest_path)
+        dataset_kind = str(manifest.get("dataset_kind", dataset_kind) or dataset_kind)
         manifest_items = filter_manifest_items_for_task(
             select_manifest_items(manifest, args.subset),
             task_mode,
@@ -1751,6 +1761,7 @@ def main() -> None:
         "split_manifest": str(split_manifest_path) if split_manifest_path is not None else None,
         "subset": str(args.subset),
         "benchmark_tag": str(args.benchmark_tag),
+        "dataset_kind": dataset_kind,
         "ablation": str(args.ablation),
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,

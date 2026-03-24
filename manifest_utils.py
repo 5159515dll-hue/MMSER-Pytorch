@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -39,7 +40,33 @@ CN_TO_EN = {
     "惊讶": "surprise",
 }
 
+EN_TO_EN = {
+    "angry": "angry",
+    "anger": "angry",
+    "disgusted": "disgusted",
+    "disgust": "disgusted",
+    "fear": "fear",
+    "happy": "happy",
+    "joy": "happy",
+    "neutral": "neutral",
+    "sad": "sad",
+    "sadness": "sad",
+    "surprise": "surprise",
+}
+
 EMOTIONS = ["angry", "disgusted", "fear", "happy", "neutral", "sad", "surprise"]
+DATASET_KINDS = ("mongolian_xlsx", "meld")
+MELD_SPLITS = ("train", "val", "test")
+MELD_CSV_BY_SPLIT = {
+    "train": "train_sent_emo.csv",
+    "val": "dev_sent_emo.csv",
+    "test": "test_sent_emo.csv",
+}
+MELD_SPLIT_PATH_HINTS = {
+    "train": ("train_splits", "train"),
+    "val": ("dev_splits_complete", "dev_splits", "dev"),
+    "test": ("output_repeated_splits_test", "test_splits", "test"),
+}
 
 SPEAKER_LABELS_EN = {
     "A": {"surprise", "fear", "angry"},
@@ -138,8 +165,18 @@ def resolve_label_en(raw: Any) -> str | None:
 
     if raw is None:
         return None
-    label = CN_TO_EN.get(str(raw).strip(), str(raw).strip().lower()).strip().lower()
+    key = str(raw).strip()
+    label = CN_TO_EN.get(key, EN_TO_EN.get(key.lower(), key.lower())).strip().lower()
     return label if label in EMOTIONS else None
+
+
+def resolve_dataset_kind(raw: Any) -> str:
+    """规范化数据集类型名称。"""
+
+    value = str(raw or "mongolian_xlsx").strip().lower()
+    if value not in DATASET_KINDS:
+        raise RuntimeError(f"Unsupported dataset kind: {raw}")
+    return value
 
 
 def infer_speaker_id(label_en: str | None) -> str:
@@ -169,14 +206,21 @@ def _ensure_text_control_fields(item: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(item)
     label_raw = str(enriched.get("label_raw") or "")
     label_en = str(enriched.get("label_en") or "")
-    mn = str(enriched.get("mn") or "")
+    text = str(enriched.get("text") or enriched.get("mn") or "")
+    mn = str(enriched.get("mn") or text)
     zh = str(enriched.get("zh") or "")
+    enriched["text"] = text
+    enriched["mn"] = mn
     cue_details = enriched.get("text_cue_details") or {}
 
+    if not enriched.get("masked_text"):
+        enriched["masked_text"] = mask_emotion_cues(text, label_raw=label_raw, label_en=label_en)
     if not enriched.get("masked_mn"):
         enriched["masked_mn"] = mask_emotion_cues(mn, label_raw=label_raw, label_en=label_en)
     if not enriched.get("masked_zh"):
         enriched["masked_zh"] = mask_emotion_cues(zh, label_raw=label_raw, label_en=label_en)
+    if not enriched.get("normalized_text"):
+        enriched["normalized_text"] = normalize_text_for_grouping(text)
     if not enriched.get("normalized_mn"):
         enriched["normalized_mn"] = normalize_text_for_grouping(mn)
     if not enriched.get("normalized_zh"):
@@ -330,6 +374,158 @@ def detect_text_cue_flags(mn_text: str, zh_text: str, label_raw: str) -> dict[st
         ),
     }
     return flags
+
+
+def _normalize_csv_header(name: str) -> str:
+    """规范化 CSV 表头，兼容大小写、空格与 BOM。"""
+
+    return str(name or "").replace("\ufeff", "").strip().lower().replace(" ", "_")
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    """把 CSV 读取成规范化 key 的字典列表。"""
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows: list[dict[str, Any]] = []
+        for row in reader:
+            normalized = {_normalize_csv_header(str(k)): v for k, v in row.items() if k is not None}
+            rows.append(normalized)
+    return rows
+
+
+def _discover_meld_csv_paths(metadata_root: Path) -> dict[str, Path]:
+    """发现 MELD 官方 train/dev/test 标注 CSV。"""
+
+    root = metadata_root.expanduser()
+    if not root.exists():
+        raise FileNotFoundError(f"MELD metadata root not found: {root}")
+    resolved: dict[str, Path] = {}
+    for split, filename in MELD_CSV_BY_SPLIT.items():
+        matches = sorted(root.rglob(filename))
+        if not matches:
+            raise FileNotFoundError(
+                f"Could not find MELD metadata file '{filename}' under {root}. "
+                "Please point --metadata-root to the directory containing the official MELD CSV files."
+            )
+        resolved[split] = matches[0]
+    return resolved
+
+
+def _build_mp4_index(data_root: Path) -> dict[str, list[Path]]:
+    """索引媒体根目录下所有 mp4，供 MELD 行级路径解析使用。"""
+
+    index: dict[str, list[Path]] = defaultdict(list)
+    for path in data_root.expanduser().rglob("*.mp4"):
+        index[path.name].append(path)
+    return index
+
+
+def _pick_meld_video_path(split: str, filename: str, video_index: dict[str, list[Path]]) -> Path | None:
+    """从已发现的 mp4 索引中选出 MELD 某个 split 对应的视频路径。"""
+
+    candidates = list(video_index.get(filename, []))
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    split_tokens = tuple(token.lower() for token in MELD_SPLIT_PATH_HINTS.get(split, (split,)))
+    filtered = []
+    for path in candidates:
+        lower_parts = [part.lower() for part in path.parts]
+        if any(token in part for token in split_tokens for part in lower_parts):
+            filtered.append(path)
+    if len(filtered) == 1:
+        return filtered[0]
+    if filtered:
+        candidates = filtered
+    return sorted(candidates, key=lambda p: (len(p.parts), str(p)))[0]
+
+
+def _meld_row_value(row: dict[str, Any], *names: str) -> Any:
+    """按多个候选字段名读取 MELD CSV 字段。"""
+
+    normalized = {_normalize_csv_header(k): v for k, v in row.items()}
+    for name in names:
+        key = _normalize_csv_header(name)
+        if key in normalized and str(normalized[key] or "").strip():
+            return normalized[key]
+    return None
+
+
+def _build_meld_manifest_items(
+    *,
+    data_root: Path,
+    metadata_root: Path,
+    audio_cache_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """构建 MELD 的标准化 manifest 条目。"""
+
+    csv_paths = _discover_meld_csv_paths(metadata_root)
+    video_index = _build_mp4_index(data_root)
+    cache_root = (audio_cache_root.expanduser() if audio_cache_root is not None else data_root.expanduser() / "audio_cache")
+
+    items: list[dict[str, Any]] = []
+    for split in MELD_SPLITS:
+        rows = _read_csv_rows(csv_paths[split])
+        for row in rows:
+            dialogue_id = normalize_seq(_meld_row_value(row, "Dialogue_ID", "dialogue_id"))
+            utterance_id = normalize_seq(_meld_row_value(row, "Utterance_ID", "utterance_id"))
+            if not dialogue_id or not utterance_id:
+                continue
+
+            raw_emotion = str(_meld_row_value(row, "Emotion", "emotion") or "").strip()
+            label_en = resolve_label_en(raw_emotion)
+            text = str(_meld_row_value(row, "Utterance", "utterance") or "").strip()
+            speaker_id = str(_meld_row_value(row, "Speaker", "speaker") or "UNKNOWN").strip() or "UNKNOWN"
+            season = normalize_seq(_meld_row_value(row, "Season", "season"))
+            episode = normalize_seq(_meld_row_value(row, "Episode", "episode"))
+            sample_stub = f"dia{dialogue_id}_utt{utterance_id}"
+            seq = f"meld_{split}_{sample_stub}"
+            video_name = f"{sample_stub}.mp4"
+            video_path = _pick_meld_video_path(split, video_name, video_index)
+            audio_path = cache_root / split / f"{sample_stub}.wav"
+
+            cue_details = detect_text_cue_flags(text, "", raw_emotion)
+            item = {
+                "dataset_kind": "meld",
+                "seq": seq,
+                "sample_id": seq,
+                "dialogue_id": dialogue_id,
+                "utterance_id": utterance_id,
+                "season": season,
+                "episode": episode,
+                "split": split,
+                "label_raw": raw_emotion,
+                "label_en": label_en,
+                "label_idx": EMOTIONS.index(label_en) if label_en in EMOTIONS else None,
+                "text": text,
+                "mn": text,
+                "zh": "",
+                "masked_text": mask_emotion_cues(text, label_raw=raw_emotion, label_en=label_en),
+                "masked_mn": mask_emotion_cues(text, label_raw=raw_emotion, label_en=label_en),
+                "masked_zh": "",
+                "normalized_text": normalize_text_for_grouping(text),
+                "normalized_mn": normalize_text_for_grouping(text),
+                "normalized_zh": "",
+                "prompt_group_text": build_prompt_group_text(text, "", label_raw=raw_emotion, label_en=label_en),
+                "prompt_group_id": build_prompt_group_id(text, "", label_raw=raw_emotion, label_en=label_en),
+                "intensity": None,
+                "speaker_id": speaker_id,
+                "video_path": str(video_path) if video_path is not None else None,
+                "audio_path": str(audio_path),
+                "has_video": bool(video_path is not None and video_path.exists()),
+                "has_audio": bool(audio_path.exists()),
+                "has_text": bool(text),
+                "text_cue_flag": any(cue_details.values()),
+                "text_cue_details": cue_details,
+                "cue_severity": derive_cue_severity(cue_details),
+                "is_usable": bool(seq and label_en and video_path is not None),
+                "is_raw_usable": bool(seq and label_en and video_path is not None and audio_path.exists()),
+                "speaker_source": "metadata",
+            }
+            items.append(item)
+    return items
 
 
 def read_xlsx_rows(path: Path) -> list[dict[str, Any]]:
@@ -520,8 +716,11 @@ def _summarize_manifest_items(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 def build_split_manifest(
     *,
+    dataset_kind: str = "mongolian_xlsx",
     data_root: Path,
-    xlsx: Path,
+    xlsx: Path | None = None,
+    metadata_root: Path | None = None,
+    audio_cache_root: Path | None = None,
     train_split: float = 0.8,
     seed: int = 42,
     split_strategy: str = "stratified_random_by_label",
@@ -539,78 +738,96 @@ def build_split_manifest(
         一个可直接序列化为 JSON 的 manifest 字典。
     """
 
-    rows = read_xlsx_rows(xlsx)
+    resolved_dataset_kind = resolve_dataset_kind(dataset_kind)
     items: list[dict[str, Any]] = []
-    usable_indices_by_label: dict[str, list[int]] = defaultdict(list)
+    if resolved_dataset_kind == "meld":
+        meta_root = metadata_root.expanduser() if metadata_root is not None else data_root.expanduser()
+        items = _build_meld_manifest_items(
+            data_root=data_root.expanduser(),
+            metadata_root=meta_root,
+            audio_cache_root=audio_cache_root.expanduser() if audio_cache_root is not None else None,
+        )
+    else:
+        if xlsx is None:
+            raise RuntimeError("mongolian_xlsx manifest build requires --xlsx")
+        rows = read_xlsx_rows(xlsx)
+        usable_indices_by_label: dict[str, list[int]] = defaultdict(list)
 
-    for row in rows:
-        seq = normalize_seq(row.get("序号"))
-        label_raw = str(row.get("情感类别", "") or "").strip()
-        label_en = resolve_label_en(label_raw)
-        mn = str(row.get("蒙文", "") or "").strip()
-        zh = str(row.get("中文", "") or "").strip()
-        intensity = parse_intensity(row.get("情感强度"))
-        speaker_id = infer_speaker_id(label_en)
-        cue_details = detect_text_cue_flags(mn, zh, label_raw)
-        cue_severity = derive_cue_severity(cue_details)
-        masked_mn = mask_emotion_cues(mn, label_raw=label_raw, label_en=label_en)
-        masked_zh = mask_emotion_cues(zh, label_raw=label_raw, label_en=label_en)
-        prompt_group_text = build_prompt_group_text(mn, zh, label_raw=label_raw, label_en=label_en)
-        prompt_group_id = build_prompt_group_id(mn, zh, label_raw=label_raw, label_en=label_en)
-        video_path = None
-        audio_path = None
-        if seq and label_en:
-            video_path, audio_path = resolve_paths_for_seq(data_root, label_en, seq)
-        item = {
-            "seq": seq,
-            "label_raw": label_raw,
-            "label_en": label_en,
-            "label_idx": EMOTIONS.index(label_en) if label_en in EMOTIONS else None,
-            "mn": mn,
-            "zh": zh,
-            "masked_mn": masked_mn,
-            "masked_zh": masked_zh,
-            "normalized_mn": normalize_text_for_grouping(mn),
-            "normalized_zh": normalize_text_for_grouping(zh),
-            "prompt_group_text": prompt_group_text,
-            "prompt_group_id": prompt_group_id,
-            "intensity": intensity,
-            "speaker_id": speaker_id,
-            "video_path": str(video_path) if video_path is not None else None,
-            "audio_path": str(audio_path) if audio_path is not None else None,
-            "has_video": bool(video_path is not None and video_path.exists()),
-            "has_audio": bool(audio_path is not None and audio_path.exists()),
-            "has_text": bool(mn or zh),
-            "text_cue_flag": any(cue_details.values()),
-            "text_cue_details": cue_details,
-            "cue_severity": cue_severity,
-            "is_usable": bool(seq and label_en),
-            "is_raw_usable": bool(seq and label_en and video_path is not None and audio_path is not None),
-            "split": "excluded",
-        }
-        items.append(item)
-        if item["is_usable"] and label_en is not None:
-            usable_indices_by_label[label_en].append(len(items) - 1)
+        for row in rows:
+            seq = normalize_seq(row.get("序号"))
+            label_raw = str(row.get("情感类别", "") or "").strip()
+            label_en = resolve_label_en(label_raw)
+            mn = str(row.get("蒙文", "") or "").strip()
+            zh = str(row.get("中文", "") or "").strip()
+            intensity = parse_intensity(row.get("情感强度"))
+            speaker_id = infer_speaker_id(label_en)
+            cue_details = detect_text_cue_flags(mn, zh, label_raw)
+            cue_severity = derive_cue_severity(cue_details)
+            masked_mn = mask_emotion_cues(mn, label_raw=label_raw, label_en=label_en)
+            masked_zh = mask_emotion_cues(zh, label_raw=label_raw, label_en=label_en)
+            prompt_group_text = build_prompt_group_text(mn, zh, label_raw=label_raw, label_en=label_en)
+            prompt_group_id = build_prompt_group_id(mn, zh, label_raw=label_raw, label_en=label_en)
+            video_path = None
+            audio_path = None
+            if seq and label_en:
+                video_path, audio_path = resolve_paths_for_seq(data_root, label_en, seq)
+            item = {
+                "dataset_kind": "mongolian_xlsx",
+                "seq": seq,
+                "sample_id": seq,
+                "label_raw": label_raw,
+                "label_en": label_en,
+                "label_idx": EMOTIONS.index(label_en) if label_en in EMOTIONS else None,
+                "text": mn,
+                "mn": mn,
+                "zh": zh,
+                "masked_text": masked_mn,
+                "masked_mn": masked_mn,
+                "masked_zh": masked_zh,
+                "normalized_text": normalize_text_for_grouping(mn),
+                "normalized_mn": normalize_text_for_grouping(mn),
+                "normalized_zh": normalize_text_for_grouping(zh),
+                "prompt_group_text": prompt_group_text,
+                "prompt_group_id": prompt_group_id,
+                "intensity": intensity,
+                "speaker_id": speaker_id,
+                "video_path": str(video_path) if video_path is not None else None,
+                "audio_path": str(audio_path) if audio_path is not None else None,
+                "has_video": bool(video_path is not None and video_path.exists()),
+                "has_audio": bool(audio_path is not None and audio_path.exists()),
+                "has_text": bool(mn or zh),
+                "text_cue_flag": any(cue_details.values()),
+                "text_cue_details": cue_details,
+                "cue_severity": cue_severity,
+                "is_usable": bool(seq and label_en),
+                "is_raw_usable": bool(seq and label_en and video_path is not None and audio_path is not None),
+                "split": "excluded",
+            }
+            items.append(item)
+            if item["is_usable"] and label_en is not None:
+                usable_indices_by_label[label_en].append(len(items) - 1)
 
-    rng = random.Random(int(seed))
-    for label_en, indices in usable_indices_by_label.items():
-        if split_strategy == "stratified_random_by_label":
-            shuffled = list(indices)
-            rng.shuffle(shuffled)
-        else:
-            shuffled = sorted(indices, key=lambda idx: items[idx]["seq"])
-        cutoff = int(len(shuffled) * float(train_split))
-        # 这里按标签分别切分，确保每个情绪类别在 train/val 都尽量保留比例。
-        for index in shuffled[:cutoff]:
-            items[index]["split"] = "train"
-        for index in shuffled[cutoff:]:
-            items[index]["split"] = "val"
+        rng = random.Random(int(seed))
+        for label_en, indices in usable_indices_by_label.items():
+            if split_strategy == "stratified_random_by_label":
+                shuffled = list(indices)
+                rng.shuffle(shuffled)
+            else:
+                shuffled = sorted(indices, key=lambda idx: items[idx]["seq"])
+            cutoff = int(len(shuffled) * float(train_split))
+            for index in shuffled[:cutoff]:
+                items[index]["split"] = "train"
+            for index in shuffled[cutoff:]:
+                items[index]["split"] = "val"
 
     summary = _summarize_manifest_items(items)
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": 2,
+        "dataset_kind": resolved_dataset_kind,
         "data_root": str(data_root),
-        "xlsx": str(xlsx),
+        "metadata_root": str(metadata_root.expanduser()) if metadata_root is not None else None,
+        "audio_cache_root": str(audio_cache_root.expanduser()) if audio_cache_root is not None else None,
+        "xlsx": str(xlsx.expanduser()) if xlsx is not None else None,
         "seed": int(seed),
         "train_split": float(train_split),
         "split_strategy": split_strategy,

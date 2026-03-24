@@ -105,13 +105,16 @@ class CachedMotionAudioDataset(Dataset):
             "prosody": s["prosody"].to(torch.float32),
             "label": s["label"].to(torch.long) if isinstance(s["label"], torch.Tensor) else torch.tensor(int(s["label"]), dtype=torch.long),
             "stem": s.get("stem", str(idx)),
+            "text": str(s.get("text", s.get("mn", ""))),
             "mn": str(s.get("mn", "")),
+            "masked_text": str(s.get("masked_text", s.get("masked_mn", ""))),
             "masked_mn": str(s.get("masked_mn", "")),
             "speaker_id": str(s.get("speaker_id", "UNKNOWN")),
             "text_cue_flag": bool(s.get("text_cue_flag", False)),
             "cue_severity": str(s.get("cue_severity", "none")),
             "prompt_group_id": str(s.get("prompt_group_id", "")),
             "_global_label_en": str(s.get("_global_label_en", "")),
+            "dataset_kind": str(s.get("dataset_kind", "")),
             "intensity": intensity_t,
         }
         if "audio" in s:
@@ -193,13 +196,16 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     prosody = torch.stack([b["prosody"] for b in batch], dim=0)
 
-    mn_list = [str(b.get("mn", "")) for b in batch]
-    masked_mn_list = [str(b.get("masked_mn", "")) for b in batch]
+    text_list = [str(b.get("text", b.get("mn", ""))) for b in batch]
+    mn_list = [str(b.get("mn", b.get("text", ""))) for b in batch]
+    masked_text_list = [str(b.get("masked_text", b.get("masked_mn", ""))) for b in batch]
+    masked_mn_list = [str(b.get("masked_mn", b.get("masked_text", ""))) for b in batch]
     stems = [str(b.get("stem", "")) for b in batch]
     speaker_ids = [str(b.get("speaker_id", "UNKNOWN")) for b in batch]
     cue_severities = [str(b.get("cue_severity", "none")) for b in batch]
     prompt_group_ids = [str(b.get("prompt_group_id", "")) for b in batch]
     global_labels = [str(b.get("_global_label_en", "")) for b in batch]
+    dataset_kinds = [str(b.get("dataset_kind", "")) for b in batch]
     text_cue_flags = torch.tensor([1 if bool(b.get("text_cue_flag", False)) else 0 for b in batch], dtype=torch.bool)
 
     intensity = torch.stack(
@@ -211,13 +217,16 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch_out = {
         "prosody": prosody,
         "labels": labels,
+        "text": text_list,
         "mn": mn_list,
+        "masked_text": masked_text_list,
         "masked_mn": masked_mn_list,
         "stems": stems,
         "speaker_id": speaker_ids,
         "cue_severity": cue_severities,
         "prompt_group_id": prompt_group_ids,
         "_global_label_en": global_labels,
+        "dataset_kind": dataset_kinds,
         "text_cue_flag": text_cue_flags,
         "intensity": intensity,
         "intensity_mask": intensity_mask,

@@ -241,7 +241,7 @@ def parse_args():
         "--subset",
         type=str,
         default="all",
-        choices=["all", "train", "val"],
+        choices=["all", "train", "val", "test"],
         help="Subset to predecode when --split-manifest is provided",
     )
     p.add_argument(
