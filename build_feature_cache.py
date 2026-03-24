@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefetch-factor", type=str, default="auto")
     p.add_argument("--shard-size", type=int, default=100)
     p.add_argument("--retain-raw", action="store_true", help="Keep raw tensors even when an embedding cache is produced")
+    p.add_argument(
+        "--zero-video",
+        action="store_true",
+        help=(
+            "Do not decode video when building the feature cache. "
+            "Instead, materialize zero video embeddings so downstream no-video ablations can train "
+            "without paying the MELD video decode cost."
+        ),
+    )
     p.add_argument("--video-backbone", type=str, default="dual", choices=["flow", "videomae", "dual"])
     p.add_argument("--video-model", type=str, default="MCG-NJU/videomae-large")
     p.add_argument("--audio-model", type=str, default="microsoft/wavlm-large")
@@ -283,14 +292,14 @@ def main() -> None:
             raise RuntimeError(f"No manifest items selected for subset={args.subset}")
 
         video_backbone = str(model_args["video_backbone"])
-        need_flow = bool(args.freeze_flow or (args.retain_raw and video_backbone in {"flow", "dual"}))
-        need_rgb = bool(args.freeze_rgb or (args.retain_raw and video_backbone in {"videomae", "dual"}))
+        need_flow = bool((not args.zero_video) and (args.freeze_flow or (args.retain_raw and video_backbone in {"flow", "dual"})))
+        need_rgb = bool((not args.zero_video) and (args.freeze_rgb or (args.retain_raw and video_backbone in {"videomae", "dual"})))
         need_audio = True
-        if video_backbone == "videomae" and not need_rgb:
+        if video_backbone == "videomae" and not need_rgb and not bool(args.zero_video):
             raise RuntimeError(
                 "media input mode with --video-backbone videomae requires either --freeze-rgb or --retain-raw"
             )
-        if video_backbone in {"flow", "dual"} and not need_flow:
+        if video_backbone in {"flow", "dual"} and not need_flow and not bool(args.zero_video):
             raise RuntimeError(
                 "media input mode with a flow branch requires either --freeze-flow or --retain-raw. "
                 "For large benchmarks, the recommended default is --video-backbone videomae."
@@ -368,7 +377,7 @@ def main() -> None:
         tokenizer = AutoTokenizer.from_pretrained(str(model_args["text_model"]))
 
     need_audio_encoder = bool(args.freeze_audio)
-    need_rgb_encoder = bool(args.freeze_rgb) and str(model_args["video_backbone"]) in {"dual", "videomae"}
+    need_rgb_encoder = bool(args.freeze_rgb) and str(model_args["video_backbone"]) in {"dual", "videomae"} and not bool(args.zero_video)
     need_text_encoder = bool(effective_freeze_text)
 
     model = FusionClassifier(
@@ -415,6 +424,7 @@ def main() -> None:
                 "freeze_flow": bool(args.freeze_flow),
                 "freeze_rgb": bool(args.freeze_rgb),
                 "freeze_text": bool(effective_freeze_text),
+                "zero_video": bool(args.zero_video),
                 "text_policy": text_policy,
                 "retain_raw": bool(args.retain_raw),
             },
@@ -495,7 +505,13 @@ def main() -> None:
 
             with _amp_context(device, amp_mode):
                 if bool(args.freeze_flow) and batch_flow_emb is None:
-                    if str(model_args["video_backbone"]) == "dual":
+                    if bool(args.zero_video):
+                        if str(model_args["video_backbone"]) == "dual":
+                            flow_dim = int(getattr(model.video_flow, "out_dim", 256)) if model.video_flow is not None else 256
+                        else:
+                            flow_dim = int(getattr(model.video, "out_dim", 256)) if model.video is not None else 256
+                        batch_flow_emb = torch.zeros((int(batch["labels"].shape[0]), flow_dim), device=device, dtype=torch.float32)
+                    elif str(model_args["video_backbone"]) == "dual":
                         if flow is None or model.video_flow is None:
                             raise RuntimeError("Cannot build flow_emb without raw flow tensors")
                         batch_flow_emb = model.video_flow(flow)
@@ -504,7 +520,13 @@ def main() -> None:
                             raise RuntimeError("Cannot build flow_emb without raw flow tensors")
                         batch_flow_emb = model.video(flow)
                 if bool(args.freeze_rgb) and batch_rgb_emb is None:
-                    if str(model_args["video_backbone"]) == "dual":
+                    if bool(args.zero_video):
+                        if str(model_args["video_backbone"]) == "dual":
+                            rgb_dim = int(getattr(model.video_rgb, "out_dim", _infer_rgb_dim(str(model_args["video_model"])))) if model.video_rgb is not None else _infer_rgb_dim(str(model_args["video_model"]))
+                        else:
+                            rgb_dim = int(getattr(model.video, "out_dim", _infer_rgb_dim(str(model_args["video_model"])))) if model.video is not None else _infer_rgb_dim(str(model_args["video_model"]))
+                        batch_rgb_emb = torch.zeros((int(batch["labels"].shape[0]), rgb_dim), device=device, dtype=torch.float32)
+                    elif str(model_args["video_backbone"]) == "dual":
                         if rgb is None or model.video_rgb is None:
                             raise RuntimeError("Cannot build rgb_emb without raw rgb tensors")
                         batch_rgb_emb = model.video_rgb(rgb)
@@ -609,6 +631,7 @@ def main() -> None:
                                     "freeze_flow": bool(args.freeze_flow),
                                     "freeze_rgb": bool(args.freeze_rgb),
                                     "freeze_text": bool(effective_freeze_text),
+                                    "zero_video": bool(args.zero_video),
                                     "text_policy": text_policy,
                                     "retain_raw": bool(args.retain_raw),
                                 },
@@ -647,6 +670,7 @@ def main() -> None:
                         "freeze_flow": bool(args.freeze_flow),
                         "freeze_rgb": bool(args.freeze_rgb),
                         "freeze_text": bool(effective_freeze_text),
+                        "zero_video": bool(args.zero_video),
                         "text_policy": text_policy,
                         "retain_raw": bool(args.retain_raw),
                     },
