@@ -42,6 +42,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def resolve_ffmpeg_bin(explicit_bin: str) -> str:
+    """解析可执行的 ffmpeg 路径，优先用户显式参数，其次回退到 imageio-ffmpeg。"""
+
+    explicit_bin = str(explicit_bin).strip() or "ffmpeg"
+    resolved = shutil.which(explicit_bin)
+    if resolved is not None:
+        return resolved
+
+    # Public benchmark servers often lack a system ffmpeg package. If imageio-ffmpeg
+    # is installed, reuse its bundled binary instead of failing the whole pipeline.
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(str(bundled)).exists():
+            return str(bundled)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"ffmpeg not found: {explicit_bin}. Install ffmpeg or the Python package imageio-ffmpeg."
+    )
+
+
 def _extract_audio_sidecar(*, ffmpeg_bin: str, video_path: Path, audio_path: Path, sample_rate: int, overwrite: bool) -> dict[str, Any]:
     """把视频容器里的音轨提取成单声道 wav sidecar。"""
 
@@ -95,9 +119,7 @@ def main() -> None:
     dataset_kind = resolve_dataset_kind(args.dataset_kind)
     if dataset_kind != "meld":
         raise RuntimeError("prepare_dataset_media.py currently only needs to run for --dataset-kind meld")
-
-    if shutil.which(str(args.ffmpeg_bin)) is None:
-        raise RuntimeError(f"ffmpeg not found: {args.ffmpeg_bin}")
+    ffmpeg_bin = resolve_ffmpeg_bin(str(args.ffmpeg_bin))
 
     manifest = load_split_manifest(args.split_manifest.expanduser())
     items = select_manifest_items(manifest, args.subset)
@@ -121,7 +143,7 @@ def main() -> None:
     )
     print(
         f"Preparing audio sidecars from {len(tasks)} sample(s) "
-        f"(dataset_kind={dataset_kind}, subset={args.subset}, workers={num_workers}, sample_rate={args.sample_rate})",
+        f"(dataset_kind={dataset_kind}, subset={args.subset}, workers={num_workers}, sample_rate={args.sample_rate}, ffmpeg={ffmpeg_bin})",
         flush=True,
     )
 
@@ -132,7 +154,7 @@ def main() -> None:
         futures = [
             ex.submit(
                 _extract_audio_sidecar,
-                ffmpeg_bin=str(args.ffmpeg_bin),
+                ffmpeg_bin=ffmpeg_bin,
                 video_path=video_path,
                 audio_path=audio_path,
                 sample_rate=int(args.sample_rate),

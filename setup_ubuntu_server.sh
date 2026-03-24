@@ -161,6 +161,7 @@ CORE_PACKAGE_SPECS=(
   "openpyxl:openpyxl>=3.1,<3.2"
   "pandas:pandas>=2.0,<2.3"
   "soundfile:soundfile>=0.13,<0.14"
+  "imageio_ffmpeg:imageio-ffmpeg>=0.5,<0.6"
   "transformers:transformers>=4.57,<4.58"
   "sentencepiece:sentencepiece>=0.2,<0.3"
   "tqdm:tqdm>=4.66,<5"
@@ -238,6 +239,7 @@ fi
 log "Running import checks"
 run_python_check <<'PY'
 import cv2
+import imageio_ffmpeg
 import openpyxl
 import pandas
 import sentencepiece
@@ -248,6 +250,7 @@ import matplotlib
 
 print("core_imports_ok")
 print("cv2", cv2.__version__)
+print("imageio_ffmpeg", imageio_ffmpeg.__version__)
 print("transformers", transformers.__version__)
 print("pandas", pandas.__version__)
 PY
