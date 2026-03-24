@@ -5,6 +5,7 @@ import contextlib
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -66,6 +67,123 @@ def _atomic_torch_save(obj: Any, dst: Path) -> None:
                 os.close(tmp_fd)
             except Exception:
                 pass
+
+
+def _probe_zero_video_media_workers(
+    *,
+    items: list[dict[str, Any]],
+    sample_rate: int,
+    max_audio_sec: float,
+    audio_backend_mode: str,
+    num_frames: int,
+    flow_size: int,
+    rgb_size: int,
+    use_pitch: bool,
+    batch_size: int,
+    num_workers: int,
+) -> bool:
+    """在单独子进程里预检 zero-video media workers 是否稳定。
+
+    目的不是测吞吐，而是避免某些服务器上 DataLoader worker 直接把主进程打挂。
+    预检只读取一个很小的子集，并尝试取出第一个 batch。
+    """
+
+    probe_items = list(items[: max(1, min(len(items), max(int(batch_size), 8)))])
+    if not probe_items or int(num_workers) <= 0:
+        return True
+
+    payload = {
+        "repo_root": str(Path(__file__).resolve().parent),
+        "items": probe_items,
+        "sample_rate": int(sample_rate),
+        "max_audio_sec": float(max_audio_sec),
+        "audio_backend_mode": str(audio_backend_mode),
+        "num_frames": int(num_frames),
+        "flow_size": int(flow_size),
+        "rgb_size": int(rgb_size),
+        "use_pitch": bool(use_pitch),
+        "batch_size": int(batch_size),
+        "num_workers": int(num_workers),
+    }
+    probe_code = r"""
+import json
+import sys
+from pathlib import Path
+
+payload_path = Path(sys.argv[1])
+cfg = json.loads(payload_path.read_text(encoding="utf-8"))
+repo_root = cfg["repo_root"]
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+from torch.utils.data import DataLoader
+from data import collate
+from media_dataset import ManifestMediaDataset
+from prosody import ProsodyConfig
+from video_motion import MotionConfig, RgbConfig
+
+ds = ManifestMediaDataset(
+    cfg["items"],
+    need_audio=True,
+    need_flow=False,
+    need_rgb=False,
+    sample_rate=int(cfg["sample_rate"]),
+    max_audio_sec=float(cfg["max_audio_sec"]),
+    audio_backend_mode=str(cfg["audio_backend_mode"]),
+    motion_cfg=MotionConfig(num_frames=int(cfg["num_frames"]), flow_size=int(cfg["flow_size"])),
+    rgb_cfg=RgbConfig(num_frames=int(cfg["num_frames"]), rgb_size=int(cfg["rgb_size"])),
+    prosody_cfg=ProsodyConfig(use_pitch=bool(cfg["use_pitch"])),
+)
+loader = DataLoader(
+    ds,
+    batch_size=int(cfg["batch_size"]),
+    shuffle=False,
+    num_workers=int(cfg["num_workers"]),
+    collate_fn=collate,
+    pin_memory=False,
+    persistent_workers=(int(cfg["num_workers"]) > 0),
+)
+it = iter(loader)
+batch = next(it)
+assert "audio" in batch and "prosody" in batch
+print("probe_ok")
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+        payload_path = f.name
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", probe_code, payload_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+            env=os.environ.copy(),
+        )
+        if proc.returncode == 0:
+            return True
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        reason = stderr or stdout or f"returncode={proc.returncode}"
+        print(
+            f"WARNING: zero-video media worker probe failed for num_workers={num_workers}; "
+            f"falling back to single-process. Reason: {reason}",
+            flush=True,
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        print(
+            f"WARNING: zero-video media worker probe timed out for num_workers={num_workers}; "
+            "falling back to single-process.",
+            flush=True,
+        )
+        return False
+    finally:
+        try:
+            Path(payload_path).unlink()
+        except Exception:
+            pass
         if tmp_path is not None and tmp_path.exists():
             try:
                 tmp_path.unlink()
@@ -277,6 +395,7 @@ def main() -> None:
     source_manifest_config: dict[str, Any] | None = None
     dataset_in_memory = True
     resolved_audio_backend = str(args.audio_backend)
+    media_items_for_worker_probe: list[dict[str, Any]] = []
     if input_mode == "cached":
         if args.cached_dataset is None:
             raise RuntimeError("--input-mode cached requires --cached-dataset")
@@ -330,6 +449,7 @@ def main() -> None:
             "manifest_sha256": str(manifest.get("manifest_sha256", "")),
         }
         dataset_in_memory = False
+        media_items_for_worker_probe = list(items)
     else:
         raise RuntimeError(f"Unsupported input mode: {input_mode}")
 
@@ -349,7 +469,7 @@ def main() -> None:
         if bool(args.zero_video):
             # no-video practical baseline 不再触发 OpenCV/ffmpeg 的高风险路径；
             # 允许小规模 worker 并行，让 wav 读取与 prosody 提取不要完全串行。
-            num_workers = min(
+            candidate_num_workers = min(
                 2,
                 resolve_worker_count(
                     args.num_workers,
@@ -359,6 +479,21 @@ def main() -> None:
                     total_items=len(ds),
                 ),
             )
+            if int(candidate_num_workers) > 0 and not _probe_zero_video_media_workers(
+                items=media_items_for_worker_probe,
+                sample_rate=int(args.sample_rate),
+                max_audio_sec=float(args.max_audio_sec),
+                audio_backend_mode=str(resolved_audio_backend),
+                num_frames=int(args.num_frames),
+                flow_size=int(args.flow_size),
+                rgb_size=int(args.rgb_size),
+                use_pitch=(not bool(args.prosody_no_pitch)),
+                batch_size=int(batch_size),
+                num_workers=int(candidate_num_workers),
+            ):
+                num_workers = 0
+            else:
+                num_workers = int(candidate_num_workers)
         else:
             # On some Linux accelerator stacks, spawning DataLoader workers that call
             # OpenCV/ffmpeg/torchaudio during media decode can crash with SIGSEGV.
