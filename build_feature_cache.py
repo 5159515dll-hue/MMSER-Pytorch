@@ -277,7 +277,7 @@ def main() -> None:
             audio_backend_mode=str(args.audio_backend),
             motion_cfg=MotionConfig(num_frames=int(args.num_frames), flow_size=int(args.flow_size)),
             rgb_cfg=RgbConfig(num_frames=int(args.num_frames), rgb_size=int(args.rgb_size)),
-            prosody_cfg=ProsodyConfig(enable_pitch=not bool(args.prosody_no_pitch)),
+            prosody_cfg=ProsodyConfig(use_pitch=not bool(args.prosody_no_pitch)),
         )
         source_manifest_config = {
             "path": str(args.split_manifest.expanduser()),
