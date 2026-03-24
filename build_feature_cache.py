@@ -330,13 +330,20 @@ def main() -> None:
         freeze_flow=bool(args.freeze_flow),
         freeze_rgb=bool(args.freeze_rgb),
     )
-    num_workers = resolve_worker_count(
-        args.num_workers,
-        phase="feature_cache",
-        profile=profile,
-        dataset_in_memory=dataset_in_memory,
-        total_items=len(ds),
-    )
+    auto_num_workers = str(args.num_workers).strip().lower() in {"", "auto", "none"}
+    if input_mode == "media" and auto_num_workers:
+        # On some Linux accelerator stacks, spawning DataLoader workers that call
+        # OpenCV/ffmpeg/torchaudio during media decode can crash with SIGSEGV.
+        # The stable default for raw-media feature-cache building is single-process.
+        num_workers = 0
+    else:
+        num_workers = resolve_worker_count(
+            args.num_workers,
+            phase="feature_cache",
+            profile=profile,
+            dataset_in_memory=dataset_in_memory,
+            total_items=len(ds),
+        )
     prefetch_factor = resolve_prefetch_factor(args.prefetch_factor, num_workers=num_workers)
     pin_memory = device.type == "cuda"
     dl_kwargs: dict[str, Any] = {
