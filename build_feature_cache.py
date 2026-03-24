@@ -276,6 +276,7 @@ def main() -> None:
     source_cache_config: dict[str, Any] = {}
     source_manifest_config: dict[str, Any] | None = None
     dataset_in_memory = True
+    resolved_audio_backend = str(args.audio_backend)
     if input_mode == "cached":
         if args.cached_dataset is None:
             raise RuntimeError("--input-mode cached requires --cached-dataset")
@@ -295,6 +296,10 @@ def main() -> None:
         need_flow = bool((not args.zero_video) and (args.freeze_flow or (args.retain_raw and video_backbone in {"flow", "dual"})))
         need_rgb = bool((not args.zero_video) and (args.freeze_rgb or (args.retain_raw and video_backbone in {"videomae", "dual"})))
         need_audio = True
+        if bool(args.zero_video) and str(resolved_audio_backend).strip().lower() == "auto":
+            # no-video practical baseline 只读 wav sidecar；
+            # 这里优先走 soundfile，避免 worker 模式下 torchaudio/torchcodec 带来的不稳定因素。
+            resolved_audio_backend = "soundfile"
         if video_backbone == "videomae" and not need_rgb and not bool(args.zero_video):
             raise RuntimeError(
                 "media input mode with --video-backbone videomae requires either --freeze-rgb or --retain-raw"
@@ -312,7 +317,7 @@ def main() -> None:
             need_rgb=need_rgb,
             sample_rate=int(args.sample_rate),
             max_audio_sec=float(args.max_audio_sec),
-            audio_backend_mode=str(args.audio_backend),
+            audio_backend_mode=str(resolved_audio_backend),
             motion_cfg=MotionConfig(num_frames=int(args.num_frames), flow_size=int(args.flow_size)),
             rgb_cfg=RgbConfig(num_frames=int(args.num_frames), rgb_size=int(args.rgb_size)),
             prosody_cfg=ProsodyConfig(use_pitch=not bool(args.prosody_no_pitch)),
@@ -341,10 +346,24 @@ def main() -> None:
     )
     auto_num_workers = str(args.num_workers).strip().lower() in {"", "auto", "none"}
     if input_mode == "media" and auto_num_workers:
-        # On some Linux accelerator stacks, spawning DataLoader workers that call
-        # OpenCV/ffmpeg/torchaudio during media decode can crash with SIGSEGV.
-        # The stable default for raw-media feature-cache building is single-process.
-        num_workers = 0
+        if bool(args.zero_video):
+            # no-video practical baseline 不再触发 OpenCV/ffmpeg 的高风险路径；
+            # 允许小规模 worker 并行，让 wav 读取与 prosody 提取不要完全串行。
+            num_workers = min(
+                2,
+                resolve_worker_count(
+                    args.num_workers,
+                    phase="feature_cache",
+                    profile=profile,
+                    dataset_in_memory=dataset_in_memory,
+                    total_items=len(ds),
+                ),
+            )
+        else:
+            # On some Linux accelerator stacks, spawning DataLoader workers that call
+            # OpenCV/ffmpeg/torchaudio during media decode can crash with SIGSEGV.
+            # The stable default for raw-media feature-cache building is single-process.
+            num_workers = 0
     else:
         num_workers = resolve_worker_count(
             args.num_workers,
@@ -425,6 +444,7 @@ def main() -> None:
                 "freeze_rgb": bool(args.freeze_rgb),
                 "freeze_text": bool(effective_freeze_text),
                 "zero_video": bool(args.zero_video),
+                "audio_backend": str(resolved_audio_backend),
                 "text_policy": text_policy,
                 "retain_raw": bool(args.retain_raw),
             },
