@@ -762,13 +762,18 @@ class FusionClassifier(nn.Module):
         if audio_emb is not None:
             a = audio_emb.to(dtype=v.dtype)
         else:
-            if audio_lens is not None:
-                try:
-                    a = self.audio(wav, lengths=audio_lens)
-                except TypeError:
-                    a = self.audio(wav)
+            if isinstance(self.audio, EmbeddingPlaceholderEncoder):
+                # 用于 no-audio / lazy-init 场景：没有缓存 embedding 时，直接把音频模态置零，
+                # 而不是错误调用占位编码器。
+                a = torch.zeros((v.shape[0], int(self.audio.out_dim)), device=v.device, dtype=v.dtype)
             else:
-                a = self.audio(wav)
+                if audio_lens is not None:
+                    try:
+                        a = self.audio(wav, lengths=audio_lens)
+                    except TypeError:
+                        a = self.audio(wav)
+                else:
+                    a = self.audio(wav)
         p = self.prosody(prosody)
 
         # Modality dropout (non-text) for robustness
