@@ -69,6 +69,8 @@ python3 download.py
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
+- 即使实验命令写的是 `--cache-mode none`，冻结编码器实验也会自动启用**进程内 RAM embedding cache**；这不是旧的磁盘 feature cache，不会写 `feature_cache_*` shard。
+- 训练/推理开始后，控制台会额外打印 `gpu_stream_backends`、`gpu_stream_prepare_stats`，训练日志还会带 `train_prepare_s`、`val_prepare_s`，它们用于判断瓶颈是在 CPU ingress 还是模型前向。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
 ```bash
@@ -99,6 +101,11 @@ export TRANSFORMERS_OFFLINE=1
 推理统一都是：
 
 - `python3 batch_inference.py --pipeline gpu_stream --cache-mode none ...`
+
+这里的 `cache-mode none` 要理解成：
+
+- 不再生成 raw/feature shard 这类**磁盘缓存**
+- 不是“禁止进程内 RAM 级复用”
 
 ---
 
