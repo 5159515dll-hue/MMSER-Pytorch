@@ -3,15 +3,11 @@
 # Notes:
 # - The mainline pipeline depends on torch / torchvision / torchaudio, but many
 #   accelerator server images ship a vendor-specific prebuilt torch stack.
-#   If your server image already provides torch, keep the image version unless
-#   you explicitly want to replace it.
+#   This file intentionally does NOT install or upgrade the torch stack.
+#   Use the server image's preinstalled torch / torchvision / torchaudio to
+#   preserve CUDA / ROCm / DTK compatibility.
 # - `facenet-pytorch` and `decord` are optional. They support the archived
 #   baseline / optional decoding acceleration.
-
-# Core torch stack
-torch>=2.5,<2.6
-torchvision>=0.20,<0.21
-torchaudio>=2.5,<2.6
 
 # Mainline runtime + MELD benchmark pipeline
 numpy>=1.26,<2.0
