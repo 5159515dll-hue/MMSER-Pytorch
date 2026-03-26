@@ -271,10 +271,9 @@ if [ "$RUN_SMOKE_TESTS" = "1" ]; then
   log "Running CLI smoke tests"
   pushd "$REPO_ROOT" >/dev/null
   "$PYTHON_BIN" build_split_manifest.py --help >/dev/null
-  "$PYTHON_BIN" predecode_dataset.py --help >/dev/null
+  "$PYTHON_BIN" prepare_dataset_media.py --help >/dev/null
   "$PYTHON_BIN" train.py --help >/dev/null
   "$PYTHON_BIN" batch_inference.py --help >/dev/null
-  "$PYTHON_BIN" validate_cached_shards.py --help >/dev/null
 
   if [ "$INSTALL_LEGACY_EXTRAS" = "1" ] && [ "$TORCHVISION_READY" = "1" ]; then
     "$PYTHON_BIN" legacy/baseline_v1/train.py --help >/dev/null
@@ -286,6 +285,7 @@ log "Setup finished"
 log "Notes:"
 log "- By default this script creates .venv-server with --system-site-packages, so server-provided torch remains visible while pip installs stay isolated."
 log "- This script does not install torch/torchaudio/torchvision."
+log "- The active mainline defaults to HuggingFace audio encoders (for example WavLM). The optional audio model value wav2vec2_base still requires torchaudio and is not part of the default server setup."
 log "- Hugging Face model weights are downloaded lazily on first real train/inference run."
 log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh"
 log "- pip/setuptools/wheel upgrade is disabled by default; enable it explicitly with: UPGRADE_PIP_TOOLS=1 bash setup_ubuntu_server.sh"
