@@ -20,6 +20,8 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_PYTHON_BIN="${BASE_PYTHON_BIN:-python3}"
 CONDA_BIN="${CONDA_BIN:-conda}"
+MINICONDA_DIR="${MINICONDA_DIR:-$REPO_ROOT/.miniconda}"
+MINICONDA_INSTALLER="${MINICONDA_INSTALLER:-$REPO_ROOT/.cache/Miniconda3-latest.sh}"
 INSTALL_LEGACY_EXTRAS="${INSTALL_LEGACY_EXTRAS:-1}"
 TRY_INSTALL_DECORD="${TRY_INSTALL_DECORD:-1}"
 UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-0}"
@@ -79,6 +81,45 @@ resolve_conda_bin() {
   done
 
   return 1
+}
+
+bootstrap_local_miniconda() {
+  local arch installer_url installer_path
+
+  if [ -x "$MINICONDA_DIR/bin/conda" ]; then
+    printf '%s\n' "$MINICONDA_DIR/bin/conda"
+    return 0
+  fi
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)
+      installer_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+      ;;
+    aarch64|arm64)
+      installer_url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"
+      ;;
+    *)
+      die "Unsupported architecture for automatic Miniconda bootstrap: $arch"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$MINICONDA_INSTALLER")"
+  installer_path="$MINICONDA_INSTALLER"
+  if [ ! -s "$installer_path" ]; then
+    log "Downloading local Miniconda bootstrap: $installer_url"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$installer_url" -o "$installer_path" || die "Failed to download Miniconda installer"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -O "$installer_path" "$installer_url" || die "Failed to download Miniconda installer"
+    else
+      die "Need curl or wget to bootstrap Miniconda"
+    fi
+  fi
+
+  log "Installing local Miniconda at $MINICONDA_DIR"
+  bash "$installer_path" -b -p "$MINICONDA_DIR" >/dev/null || die "Miniconda bootstrap failed"
+  printf '%s\n' "$MINICONDA_DIR/bin/conda"
 }
 
 pip_install() {
@@ -268,6 +309,9 @@ run_python_check() {
 
 require_cmd "$BASE_PYTHON_BIN"
 CONDA_BIN="$(resolve_conda_bin || true)"
+if [ -z "$CONDA_BIN" ]; then
+  CONDA_BIN="$(bootstrap_local_miniconda || true)"
+fi
 [ -n "$CONDA_BIN" ] || die "Missing required command: conda"
 export CONDA_BIN
 
@@ -445,6 +489,7 @@ if [ "$RUN_SMOKE_TESTS" = "1" ]; then
   popd >/dev/null
 fi
 
+mkdir -p "$(dirname "$SETUP_STATE_FILE")"
 printf '%s\n' "$CURRENT_STATE_HASH" > "$SETUP_STATE_FILE"
 
 log "Setup finished"
