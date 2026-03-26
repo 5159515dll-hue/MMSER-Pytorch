@@ -22,6 +22,7 @@ BASE_PYTHON_BIN="${BASE_PYTHON_BIN:-python3}"
 CONDA_BIN="${CONDA_BIN:-conda}"
 MINICONDA_DIR="${MINICONDA_DIR:-$REPO_ROOT/.miniconda}"
 MINICONDA_INSTALLER="${MINICONDA_INSTALLER:-$REPO_ROOT/.cache/Miniconda3-latest.sh}"
+USE_GLOBAL_ENV="${USE_GLOBAL_ENV:-0}"
 INSTALL_LEGACY_EXTRAS="${INSTALL_LEGACY_EXTRAS:-1}"
 TRY_INSTALL_DECORD="${TRY_INSTALL_DECORD:-1}"
 UPGRADE_PIP_TOOLS="${UPGRADE_PIP_TOOLS:-0}"
@@ -234,6 +235,10 @@ configure_local_model_cache() {
   export TRANSFORMERS_CACHE="$hub_cache"
   export TORCH_HOME="$torch_cache"
 
+  if [ -z "${CONDA_PREFIX:-}" ] || [ ! -d "$CONDA_PREFIX" ]; then
+    return 0
+  fi
+
   activate_dir="$CONDA_PREFIX/etc/conda/activate.d"
   deactivate_dir="$CONDA_PREFIX/etc/conda/deactivate.d"
   activate_hook="$activate_dir/mms_cache_env.sh"
@@ -308,12 +313,15 @@ run_python_check() {
 }
 
 require_cmd "$BASE_PYTHON_BIN"
-CONDA_BIN="$(resolve_conda_bin || true)"
-if [ -z "$CONDA_BIN" ]; then
-  CONDA_BIN="$(bootstrap_local_miniconda || true)"
+
+if [ "$USE_GLOBAL_ENV" != "1" ]; then
+  CONDA_BIN="$(resolve_conda_bin || true)"
+  if [ -z "$CONDA_BIN" ]; then
+    CONDA_BIN="$(bootstrap_local_miniconda || true)"
+  fi
+  [ -n "$CONDA_BIN" ] || die "Missing required command: conda"
+  export CONDA_BIN
 fi
-[ -n "$CONDA_BIN" ] || die "Missing required command: conda"
-export CONDA_BIN
 
 DEFAULT_CONDA_PYTHON_VERSION="$("$BASE_PYTHON_BIN" - <<'PY'
 import sys
@@ -321,7 +329,11 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
 )"
 CONDA_PYTHON_VERSION="${CONDA_PYTHON_VERSION:-$DEFAULT_CONDA_PYTHON_VERSION}"
-SETUP_STATE_FILE="${SETUP_STATE_FILE:-$CONDA_ENV_PREFIX/.mms_setup_state}"
+if [ "$USE_GLOBAL_ENV" = "1" ]; then
+  SETUP_STATE_FILE="${SETUP_STATE_FILE:-$REPO_ROOT/.mms_setup_state_global}"
+else
+  SETUP_STATE_FILE="${SETUP_STATE_FILE:-$CONDA_ENV_PREFIX/.mms_setup_state}"
+fi
 
 MAINLINE_PACKAGE_SPECS=(
   "numpy>=1.26,<2.0"
@@ -345,12 +357,19 @@ LEGACY_PACKAGE_SPECS=(
 
 log "Repo root: $REPO_ROOT"
 log "Base Python: $("$BASE_PYTHON_BIN" -c 'import sys; print(sys.executable)')"
-log "Conda env prefix: $CONDA_ENV_PREFIX"
 
-ensure_conda_env
-activate_conda_env
-verify_python_version_match
-write_base_site_bridge
+if [ "$USE_GLOBAL_ENV" = "1" ]; then
+  PYTHON_BIN="$BASE_PYTHON_BIN"
+  export PYTHON_BIN
+  log "Using global Python environment"
+else
+  log "Conda env prefix: $CONDA_ENV_PREFIX"
+  ensure_conda_env
+  activate_conda_env
+  verify_python_version_match
+  write_base_site_bridge
+fi
+
 configure_local_model_cache
 
 log "Active Python: $(python -c 'import sys; print(sys.executable)')"
@@ -494,12 +513,20 @@ printf '%s\n' "$CURRENT_STATE_HASH" > "$SETUP_STATE_FILE"
 
 log "Setup finished"
 log "Notes:"
-log "- This script creates a local conda env at $CONDA_ENV_PREFIX."
-log "- The env reuses the server's preinstalled torch/torchvision/torchaudio via a .pth bridge instead of reinstalling the torch stack."
+if [ "$USE_GLOBAL_ENV" = "1" ]; then
+  log "- This run used the server's global Python environment directly."
+else
+  log "- This script creates a local conda env at $CONDA_ENV_PREFIX."
+  log "- The env reuses the server's preinstalled torch/torchvision/torchaudio via a .pth bridge instead of reinstalling the torch stack."
+fi
 log "- Hugging Face and Transformers caches are pinned to $REPO_ROOT/.hf-cache, and torch hub assets are pinned to $REPO_ROOT/.torch-cache."
 log "- The active mainline defaults to HuggingFace audio encoders (for example WavLM). The optional audio model value wav2vec2_base still requires torchaudio."
 log "- Hugging Face model weights are downloaded lazily on first real train/inference run."
-log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh"
+if [ "$USE_GLOBAL_ENV" = "1" ]; then
+  log "- Re-enter the global-mode setup with: USE_GLOBAL_ENV=1 INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh"
+else
+  log "- If you only care about the current mainline, you can skip legacy extras with: INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh"
+fi
 log "- Running this script again will skip dependency installation once the setup marker matches."
 log "- For persistent activation in your current shell, use: source setup_ubuntu_server.sh"
 
