@@ -31,6 +31,8 @@
 
 下面四组实验都共享这一段准备流程。只要同一台服务器已经做过一次，就不需要每次重复。
 
+当前推荐默认使用服务器全局 Python 环境，不再额外创建 `.venv-server` 或 conda 环境。`setup_ubuntu_server.sh` 会在全局环境上补装缺失依赖，并把模型缓存固定到仓库本地目录。
+
 ```bash
 cd /root/private_data/MMSER-Pytorch
 git pull
@@ -41,7 +43,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 #unset HF_HUB_OFFLINE
 #unset TRANSFORMERS_OFFLINE
 
-INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh
+USE_GLOBAL_ENV=1 INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 
 # 先确认真正存放 MELD MP4 的目录层级。
@@ -70,6 +72,7 @@ python3 download.py
 
 说明：
 
+- 当前手册默认使用全局环境模式：`USE_GLOBAL_ENV=1`。只有在你明确想隔离依赖、并且服务器本身没有环境兼容问题时，才考虑脚本里的 conda 路线。
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
 - `filter_meld_manifest.py` 只做本地 manifest 过滤，不会下载任何模型或远程资源。
@@ -79,6 +82,7 @@ python3 download.py
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
 - 训练/推理主线已经不再公开 `--pipeline` / `--cache-mode` 这类旧运行时参数；当前应该直接使用最短的 manifest/gpu_stream 命令。
 - 训练/推理开始后，控制台会额外打印 `gpu_stream_backends`、`gpu_stream_prepare_stats`，训练日志还会带 `train_prepare_s`、`val_prepare_s`，它们用于判断瓶颈是在 CPU ingress 还是模型前向。
+- 再次进入同一台机器上的同一仓库时，仍然直接执行 `USE_GLOBAL_ENV=1 source setup_ubuntu_server.sh` 即可。依赖如果已经装好，脚本会自动跳过重复安装。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
 ```bash
