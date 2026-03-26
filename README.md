@@ -1,13 +1,17 @@
 # MMSER-Pytorch
 
-当前仓库主线已经完整移动到仓库根目录。日常训练、预解码、批量推理和 split manifest 构建都直接从根目录源码与入口执行：
+当前仓库主线已经收敛到 manifest 驱动的 `gpu_stream` 路线。日常使用只保留这几个根目录入口：
 
-- `python build_split_manifest.py --data-root databases --xlsx databases/video_databases.xlsx`
-- `python predecode_dataset.py --data-root databases --xlsx databases/video_databases.xlsx`
-- `python train.py --cached-dataset <cached_dir_or_shard>`
-- `python batch_inference.py --xlsx databases/video_databases.xlsx --checkpoint outputs/motion_prosody/checkpoints/best.pt`
-- `python validate_cached_shards.py --cached-dataset <cached_dir_or_shard>`
+- `python build_split_manifest.py --dataset-kind meld --data-root <media_root> --metadata-root <metadata_root> --output <manifest.json>`
+- `python prepare_dataset_media.py --dataset-kind meld --split-manifest <manifest.json> --subset all`
+- `python train.py --split-manifest <manifest.json> --output-dir outputs/motion_prosody`
+- `python batch_inference.py --split-manifest <manifest.json> --subset val --checkpoint outputs/motion_prosody/checkpoints/best.pt`
 
-当前根目录下的 `train_motion_audio.py`、`predecode_motion_audio.py`、`batch_inference_motion_prosody.py`、`models.py`、`data.py` 等文件就是主线实现本体。`motion_prosody/` 目录现在只保留兼容导入层，`experiments/motion_prosody/` 只保留旧命令兼容层。第一版基线已经封存在 `legacy/baseline_v1/`，仅用于历史复现、轻量对照或回归排查，不再作为默认开发主线。
+主线训练和推理由 [train.py](/Users/dailulu/projects/MMSER-Pytorch/train.py) 和 [batch_inference.py](/Users/dailulu/projects/MMSER-Pytorch/batch_inference.py) 进入，具体实现收敛在 [gpu_stream_train.py](/Users/dailulu/projects/MMSER-Pytorch/gpu_stream_train.py) 和 [gpu_stream_infer.py](/Users/dailulu/projects/MMSER-Pytorch/gpu_stream_infer.py)。`motion_prosody/` 只保留给 `legacy/baseline_v1/` 的最小导入兼容层。
 
-更详细的主线说明暂存于 `motion_prosody/README.md`，后续会继续收敛到根目录文档。
+以下脚本已经退出主线支持面，只保留迁移提示：
+
+- `predecode_dataset.py`
+- `build_feature_cache.py`
+- `validate_cached_shards.py`
+- `run_scientific_suite.py`

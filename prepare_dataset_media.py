@@ -24,7 +24,6 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from manifest_utils import DATASET_KINDS, load_split_manifest, resolve_dataset_kind, select_manifest_items
-from runtime_adapt import detect_runtime, resolve_worker_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +115,8 @@ def main() -> None:
     """执行 sidecar 媒体准备。"""
 
     args = parse_args()
+    from runtime_adapt import detect_runtime, resolve_worker_count
+
     dataset_kind = resolve_dataset_kind(args.dataset_kind)
     if dataset_kind != "meld":
         raise RuntimeError("prepare_dataset_media.py currently only needs to run for --dataset-kind meld")
@@ -132,6 +133,16 @@ def main() -> None:
         if not video_path or not audio_path:
             continue
         tasks.append((Path(str(video_path)), Path(str(audio_path))))
+    if not tasks:
+        summary = manifest.get("summary", {})
+        raise RuntimeError(
+            "No usable MELD manifest items were selected for media preparation. "
+            f"subset={args.subset}, manifest_usable_rows={summary.get('usable_rows')}, "
+            f"manifest_total_rows={summary.get('total_rows')}. "
+            "This usually means build_split_manifest.py was run with a --data-root that does not point "
+            "to the MELD MP4 directory. Rebuild the manifest with the directory that actually contains "
+            "`train_splits`, `dev_splits_complete`, or `output_repeated_splits_test`."
+        )
 
     profile = detect_runtime("auto")
     num_workers = resolve_worker_count(

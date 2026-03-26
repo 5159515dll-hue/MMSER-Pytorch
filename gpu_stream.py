@@ -1,15 +1,7 @@
-"""CUDA-first streaming preprocessors for manifest-driven training/inference.
-
-设计目标
-- 尽量避免 raw/feature shard 中间落盘；
-- CPU 仅负责必要的文件读取与轻量调度；
-- 批内重计算（归一化、韵律、RGB 变换、运动张量生成）尽量在当前 device 上完成；
-- 对外输出与 `data.collate()` 保持一致的 batch 字典，复用现有模型前向逻辑。
-"""
+"""CUDA-first streaming preprocessors for manifest-driven training and inference."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,27 +24,6 @@ def _select_indices(total: int, num_frames: int) -> list[int]:
         return torch.linspace(0, total - 1, num_frames).round().to(torch.long).tolist()
     return list(range(total)) + [total - 1] * (num_frames - total)
 
-
-def _move_sample_tensors(sample: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    moved: dict[str, Any] = {}
-    for key, value in sample.items():
-        if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
-        else:
-            moved[key] = value
-    return moved
-
-
-def _cpu_clone_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    cloned: dict[str, Any] = {}
-    for key, value in sample.items():
-        if isinstance(value, torch.Tensor):
-            cloned[key] = value.detach().cpu().clone()
-        else:
-            cloned[key] = value
-    return cloned
-
-
 @dataclass
 class GpuStreamConfig:
     device: torch.device
@@ -69,31 +40,6 @@ class GpuStreamConfig:
     prosody_use_pitch: bool = True
     video_decode_backend: str = "auto"
     flow_backend: str = "torch_motion"
-    cache_mode: str = "none"
-    ram_cache_size: int = 0
-
-
-class _RamSampleCache:
-    """进程内 LRU 样本缓存。"""
-
-    def __init__(self, max_items: int):
-        self.max_items = max(0, int(max_items))
-        self._items: OrderedDict[str, dict[str, Any]] = OrderedDict()
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        item = self._items.get(key)
-        if item is None:
-            return None
-        self._items.move_to_end(key)
-        return _cpu_clone_sample(item)
-
-    def put(self, key: str, value: dict[str, Any]) -> None:
-        if self.max_items <= 0:
-            return
-        self._items[key] = _cpu_clone_sample(value)
-        self._items.move_to_end(key)
-        while len(self._items) > self.max_items:
-            self._items.popitem(last=False)
 
 
 class GpuStreamPreprocessor:
@@ -101,7 +47,6 @@ class GpuStreamPreprocessor:
 
     def __init__(self, cfg: GpuStreamConfig):
         self.cfg = cfg
-        self._cache = _RamSampleCache(cfg.ram_cache_size) if str(cfg.cache_mode) == "ram" else None
         self._decord_ready = False
         self._decord = None
         self._audio_backend_counts: dict[str, int] = {}
@@ -243,11 +188,6 @@ class GpuStreamPreprocessor:
 
     def _process_item(self, item: dict[str, Any]) -> dict[str, Any]:
         stem = str(item.get("stem", ""))
-        if self._cache is not None:
-            cached = self._cache.get(stem)
-            if cached is not None:
-                return _move_sample_tensors(cached, self.cfg.device)
-
         sample: dict[str, Any] = {
             "label": item["label"].to(torch.long),
             "stem": stem,
@@ -297,9 +237,6 @@ class GpuStreamPreprocessor:
                 sample["rgb"] = self._prepare_rgb(frames)
             if need_flow:
                 sample["flow"] = self._prepare_motion(frames)
-
-        if self._cache is not None:
-            self._cache.put(stem, sample)
         return sample
 
     def prepare_batch(

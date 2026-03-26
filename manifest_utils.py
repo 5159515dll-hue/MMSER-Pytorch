@@ -415,8 +415,17 @@ def _discover_meld_csv_paths(metadata_root: Path) -> dict[str, Path]:
 def _build_mp4_index(data_root: Path) -> dict[str, list[Path]]:
     """索引媒体根目录下所有 mp4，供 MELD 行级路径解析使用。"""
 
+    root = data_root.expanduser()
+    if not root.exists():
+        raise FileNotFoundError(
+            f"MELD data root not found: {root}. "
+            "Point --data-root to the directory that contains the official MELD MP4 files."
+        )
+    if not root.is_dir():
+        raise NotADirectoryError(f"MELD data root is not a directory: {root}")
+
     index: dict[str, list[Path]] = defaultdict(list)
-    for path in data_root.expanduser().rglob("*.mp4"):
+    for path in root.rglob("*.mp4"):
         index[path.name].append(path)
     return index
 
@@ -464,6 +473,13 @@ def _build_meld_manifest_items(
     csv_paths = _discover_meld_csv_paths(metadata_root)
     video_index = _build_mp4_index(data_root)
     cache_root = (audio_cache_root.expanduser() if audio_cache_root is not None else data_root.expanduser() / "audio_cache")
+    discovered_video_count = sum(len(paths) for paths in video_index.values())
+    if discovered_video_count == 0:
+        raise FileNotFoundError(
+            f"No MP4 files were found under MELD data root: {data_root.expanduser()}. "
+            "Point --data-root to the directory that contains MELD video folders such as "
+            "`train_splits`, `dev_splits_complete`, or `output_repeated_splits_test`."
+        )
 
     items: list[dict[str, Any]] = []
     for split in MELD_SPLITS:
@@ -525,6 +541,20 @@ def _build_meld_manifest_items(
                 "speaker_source": "metadata",
             }
             items.append(item)
+    matched_video_count = sum(1 for item in items if item.get("video_path"))
+    if items and matched_video_count == 0:
+        expected_names = [
+            f"dia{item['dialogue_id']}_utt{item['utterance_id']}.mp4"
+            for item in items[:5]
+            if item.get("dialogue_id") and item.get("utterance_id")
+        ]
+        discovered_names = sorted(video_index.keys())[:5]
+        raise RuntimeError(
+            "MELD metadata was loaded, but none of the CSV rows matched a video file under "
+            f"{data_root.expanduser()}. Expected filenames like {expected_names or ['dia1_utt1.mp4']}; "
+            f"first discovered files were {discovered_names or ['<none>']}. "
+            "This usually means --data-root points at the wrong directory level."
+        )
     return items
 
 

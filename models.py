@@ -7,25 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class EmbeddingPlaceholderEncoder(nn.Module):
-    """仅提供 `out_dim` 元数据的占位编码器。
-
-    用途
-    - 当某个模态已经被预先缓存成 embedding，且训练/推理阶段只会直接消费
-      `*_emb` 时，没有必要再初始化对应的大模型编码器。
-    - 这个占位模块保留统一接口和维度信息，一旦误走到真实前向，会给出明确报错。
-    """
-
-    def __init__(self, out_dim: int, name: str):
-        super().__init__()
-        self.out_dim = int(out_dim)
-        self.name = str(name)
-
-    def forward(self, *_args, **_kwargs) -> torch.Tensor:
-        raise RuntimeError(f"{self.name}_encoder_placeholder_used_without_cached_embedding")
-
-
 class FlowVideoEncoder(nn.Module):
     """基于光流序列的轻量 3D CNN 编码器。
 
@@ -470,10 +451,8 @@ class FusionClassifier(nn.Module):
         num_classes: int = 7,
         video_dim: int = 256,
         audio_dim: Optional[int] = None,
-        rgb_dim: Optional[int] = None,
         prosody_dim: int = 64,
         text_model: str = "xlm-roberta-large",
-        text_dim: Optional[int] = None,
         freeze_text: bool = True,
         hidden: int = 512,
         dropout: float = 0.1,
@@ -492,9 +471,6 @@ class FusionClassifier(nn.Module):
         gate_temperature: float = 1.0,
         gate_scale: float = 1.0,
         delta_scale: float = 1.0,
-        skip_audio_encoder_init: bool = False,
-        skip_text_encoder_init: bool = False,
-        skip_rgb_encoder_init: bool = False,
     ):
         """多模态融合分类器（视频 + 语音 wav2vec2 + 韵律 + 文本 mBERT）。
 
@@ -539,33 +515,19 @@ class FusionClassifier(nn.Module):
         self._freeze_flow = bool(freeze_flow)
         self._freeze_rgb = bool(freeze_rgb)
         if self.video_backbone == "videomae":
-            if bool(skip_rgb_encoder_init):
-                if rgb_dim is None:
-                    raise RuntimeError("skip_rgb_encoder_init requires rgb_dim")
-                self.video = EmbeddingPlaceholderEncoder(out_dim=int(rgb_dim), name="rgb_video")
-            else:
-                self.video = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
+            self.video = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
             self.video_flow = None
             self.video_rgb = None
         elif self.video_backbone == "dual":
             self.video = None
             self.video_flow = FlowVideoEncoder(out_dim=video_dim)
-            if bool(skip_rgb_encoder_init):
-                if rgb_dim is None:
-                    raise RuntimeError("skip_rgb_encoder_init requires rgb_dim")
-                self.video_rgb = EmbeddingPlaceholderEncoder(out_dim=int(rgb_dim), name="rgb_video")
-            else:
-                self.video_rgb = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
+            self.video_rgb = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
         else:
             self.video = FlowVideoEncoder(out_dim=video_dim)
             self.video_flow = None
             self.video_rgb = None
 
-        if bool(skip_audio_encoder_init):
-            if audio_dim is None:
-                raise RuntimeError("skip_audio_encoder_init requires audio_dim")
-            self.audio = EmbeddingPlaceholderEncoder(out_dim=int(audio_dim), name="audio")
-        elif str(audio_model) == "wav2vec2_base":
+        if str(audio_model) == "wav2vec2_base":
             self.audio = Wav2Vec2Encoder(freeze=freeze_audio)
         else:
             self.audio = HFAudioEncoder(
@@ -575,13 +537,7 @@ class FusionClassifier(nn.Module):
                 use_safetensors=True,
             )
         self.prosody = ProsodyMLP(in_dim=10, out_dim=prosody_dim)
-        if bool(skip_text_encoder_init):
-            resolved_text_dim = int(text_dim) if text_dim is not None else None
-            if resolved_text_dim is None:
-                raise RuntimeError("skip_text_encoder_init requires text_dim")
-            self.text = EmbeddingPlaceholderEncoder(out_dim=resolved_text_dim, name="text")
-        else:
-            self.text = MbertTextEncoder(model_name=text_model, freeze=freeze_text)
+        self.text = MbertTextEncoder(model_name=text_model, freeze=freeze_text)
 
         if self.video is not None and self.video_backbone != "videomae" and freeze_flow:
             for p in self.video.parameters():
@@ -697,10 +653,6 @@ class FusionClassifier(nn.Module):
         return_intensity: bool = False,
         rgb: Optional[torch.Tensor] = None,
         audio_lens: Optional[torch.Tensor] = None,
-        audio_emb: Optional[torch.Tensor] = None,
-        flow_emb: Optional[torch.Tensor] = None,
-        rgb_emb: Optional[torch.Tensor] = None,
-        text_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """前向传播：融合多模态并输出分类 logits（可选强度回归）。
 
@@ -710,70 +662,39 @@ class FusionClassifier(nn.Module):
             prosody: 韵律特征输入，形状 (B, 10)（默认与 `ProsodyMLP(in_dim=10)` 对齐）。
             text_inputs: tokenizer 输出字典；若为 None，则用零向量代替文本模态。
             return_intensity: 是否同时返回强度回归结果。
-            flow_emb: 预缓存的光流视频 embedding，形状 (B, D_flow)。
-            rgb_emb: 预缓存的 RGB 视频 embedding，形状 (B, D_rgb)。
-            text_emb: 预缓存的文本 embedding，形状 (B, D_text)。
-
-        Returns:
-            - 当 `return_intensity=False`：返回 `logits`，形状 (B, num_classes)。
-            - 当 `return_intensity=True`：返回 `(logits, pred_intensity)`
-              - `pred_intensity`: 形状 (B,) 的连续标量。
-
-        Raises:
-            RuntimeError: 当请求强度输出但未启用 `intensity_head` 时抛出。
         """
         if self.video_backbone == "videomae":
-            if rgb_emb is not None:
-                v = rgb_emb.to(dtype=torch.float32)
-            else:
-                if rgb is None:
-                    raise ValueError("rgb_missing")
-                if self.video is None:
-                    raise RuntimeError("video_encoder_missing")
-                v = self.video(rgb)
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video is None:
+                raise RuntimeError("video_encoder_missing")
+            v = self.video(rgb)
         elif self.video_backbone == "dual":
-            if flow_emb is not None:
-                v_flow = flow_emb.to(dtype=torch.float32)
-            else:
-                if flow is None:
-                    raise ValueError("flow_missing")
-                if self.video_flow is None:
-                    raise RuntimeError("flow_encoder_missing")
-                v_flow = self.video_flow(flow)
-            if rgb_emb is not None:
-                v_rgb = rgb_emb.to(dtype=torch.float32)
-            else:
-                if rgb is None:
-                    raise ValueError("rgb_missing")
-                if self.video_rgb is None:
-                    raise RuntimeError("rgb_encoder_missing")
-                v_rgb = self.video_rgb(rgb)
+            if flow is None:
+                raise ValueError("flow_missing")
+            if self.video_flow is None:
+                raise RuntimeError("flow_encoder_missing")
+            v_flow = self.video_flow(flow)
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video_rgb is None:
+                raise RuntimeError("rgb_encoder_missing")
+            v_rgb = self.video_rgb(rgb)
             v = torch.cat([v_flow, v_rgb], dim=1)
         else:
-            if flow_emb is not None:
-                v = flow_emb.to(dtype=torch.float32)
-            else:
-                if flow is None:
-                    raise ValueError("flow_missing")
-                if self.video is None:
-                    raise RuntimeError("video_encoder_missing")
-                v = self.video(flow)
+            if flow is None:
+                raise ValueError("flow_missing")
+            if self.video is None:
+                raise RuntimeError("video_encoder_missing")
+            v = self.video(flow)
 
-        if audio_emb is not None:
-            a = audio_emb.to(dtype=v.dtype)
+        if audio_lens is not None:
+            try:
+                a = self.audio(wav, lengths=audio_lens)
+            except TypeError:
+                a = self.audio(wav)
         else:
-            if isinstance(self.audio, EmbeddingPlaceholderEncoder):
-                # 用于 no-audio / lazy-init 场景：没有缓存 embedding 时，直接把音频模态置零，
-                # 而不是错误调用占位编码器。
-                a = torch.zeros((v.shape[0], int(self.audio.out_dim)), device=v.device, dtype=v.dtype)
-            else:
-                if audio_lens is not None:
-                    try:
-                        a = self.audio(wav, lengths=audio_lens)
-                    except TypeError:
-                        a = self.audio(wav)
-                else:
-                    a = self.audio(wav)
+            a = self.audio(wav)
         p = self.prosody(prosody)
 
         # Modality dropout (non-text) for robustness
@@ -781,9 +702,7 @@ class FusionClassifier(nn.Module):
         a = self._maybe_drop_modality(a)
         p = self._maybe_drop_modality(p)
 
-        if text_emb is not None:
-            t = text_emb.to(device=v.device, dtype=v.dtype)
-        elif text_inputs is None:
+        if text_inputs is None:
             # 允许在无文本场景下运行：使用零向量作为文本模态占位。
             t = torch.zeros(
                 (v.shape[0], int(self.text.out_dim)),

@@ -1,8 +1,7 @@
 """Shared text-policy and prompt-group helpers.
 
 This module centralizes two pieces of logic that need to stay aligned across
-manifest building, feature-cache construction, training, inference, and
-scientific audits:
+manifest building, media preparation, training, inference, and audits:
 
 1. How text is masked/dropped under different evaluation policies.
 2. How prompt groups are derived so grouped CV can prevent prompt leakage.

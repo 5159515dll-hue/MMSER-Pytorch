@@ -35,18 +35,23 @@
 cd /root/private_data/MMSER-Pytorch
 git pull
 
-export LD_LIBRARY_PATH="/opt/dtk/cuda/cuda-12/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib:/usr/local/lib64:/opt/mpi/lib:/opt/hwloc/lib:/opt/dtk/dcc/gcvm/lib:/opt/dtk/hip/lib:/opt/dtk/llvm/lib:/opt/dtk/lib:/opt/dtk/lib64:/opt/hyhal/lib:/opt/hyhal/lib64:${LD_LIBRARY_PATH:-}"
-export ROCM_PATH=/opt/dtk
 export HF_ENDPOINT=https://hf-mirror.com
 
 # 第一次下载模型时不要开离线模式。
-unset HF_HUB_OFFLINE
-unset TRANSFORMERS_OFFLINE
+#unset HF_HUB_OFFLINE
+#unset TRANSFORMERS_OFFLINE
+
+INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh
+source .venv-server/bin/activate
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+
+# 先确认真正存放 MELD MP4 的目录层级。
+find ../MELD.Raw -type f -name '*.mp4' | head
 
 python3 build_split_manifest.py \
   --dataset-kind meld \
-  --data-root /root/private_data/MELD.Raw/MELD.Raw \
-  --metadata-root /root/private_data/MELD.metadata \
+  --data-root ../MELD.Raw \
+  --metadata-root ../MELD.metadata \
   --audio-cache-root outputs/datasets/meld/audio_cache \
   --output outputs/benchmarks/meld/splits/default_manifest.json
 
@@ -68,8 +73,10 @@ python3 download.py
 
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
+- `--data-root` 必须指向实际包含 `train_splits`、`dev_splits_complete` 或 `output_repeated_splits_test` 的目录。很多服务器应该填 `../MELD.Raw`，不要机械照抄成 `../MELD.Raw/MELD.Raw`。
+- 如果 `build_split_manifest.py` 打印 `usable_rows: 0`，说明 MP4 根目录填错了；先修正 `--data-root`，再重新生成 manifest。
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
-- 即使实验命令写的是 `--cache-mode none`，冻结编码器实验也会自动启用**进程内 RAM embedding cache**；这不是旧的磁盘 feature cache，不会写 `feature_cache_*` shard。
+- 训练/推理主线已经不再公开 `--pipeline` / `--cache-mode` 这类旧运行时参数；当前应该直接使用最短的 manifest/gpu_stream 命令。
 - 训练/推理开始后，控制台会额外打印 `gpu_stream_backends`、`gpu_stream_prepare_stats`，训练日志还会带 `train_prepare_s`、`val_prepare_s`，它们用于判断瓶颈是在 CPU ingress 还是模型前向。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
@@ -96,13 +103,13 @@ export TRANSFORMERS_OFFLINE=1
 
 因此，当前这四组正式实验的起点统一都是：
 
-- `python3 train.py --pipeline gpu_stream --cache-mode none ...`
+- `python3 train.py --split-manifest ...`
 
 推理统一都是：
 
-- `python3 batch_inference.py --pipeline gpu_stream --cache-mode none ...`
+- `python3 batch_inference.py --split-manifest ...`
 
-这里的 `cache-mode none` 要理解成：
+这里的主线运行方式要理解成：
 
 - 不再生成 raw/feature shard 这类**磁盘缓存**
 - 不是“禁止进程内 RAM 级复用”
@@ -173,14 +180,12 @@ export TRANSFORMERS_OFFLINE=1
 rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video
 
 python3 train.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video \
   --epochs 60 \
   --device auto \
   --amp-mode bf16 \
-  --batch-size 32 \
+  --batch-size 16 \
   --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
@@ -205,15 +210,13 @@ python3 train.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset val \
   --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video/checkpoints/best.pt \
   --output outputs/benchmarks/meld/run_gpu_practical_no_video/inference_val.jsonl \
   --device auto \
   --amp-mode bf16 \
-  --batch-size 64 \
+  --batch-size 16 \
   --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
@@ -230,15 +233,13 @@ python3 batch_inference.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset test \
   --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video/checkpoints/best.pt \
   --output outputs/benchmarks/meld/run_gpu_practical_no_video/inference_test.jsonl \
   --device auto \
   --amp-mode bf16 \
-  --batch-size 64 \
+  --batch-size 16 \
   --num-workers auto \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
@@ -265,7 +266,6 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 - `accuracy_on_ok`
 - `macro_f1_on_ok`
 - `pipeline` 是否为 `gpu_stream`
-- `cache_mode` 是否为 `none`
 
 ### 总结
 
@@ -331,8 +331,6 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen
 
 python3 train.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen \
   --epochs 30 \
@@ -363,8 +361,6 @@ python3 train.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset val \
   --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/checkpoints/best.pt \
@@ -389,8 +385,6 @@ python3 batch_inference.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset test \
   --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/checkpoints/best.pt \
@@ -486,8 +480,6 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text
 
 python3 train.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text \
   --epochs 20 \
@@ -515,8 +507,6 @@ python3 train.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset val \
   --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/checkpoints/best.pt \
@@ -541,8 +531,6 @@ python3 batch_inference.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset test \
   --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/checkpoints/best.pt \
@@ -638,8 +626,6 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion
 
 python3 train.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion \
   --epochs 20 \
@@ -669,8 +655,6 @@ python3 train.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset val \
   --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/checkpoints/best.pt \
@@ -697,8 +681,6 @@ python3 batch_inference.py \
 
 ```bash
 python3 batch_inference.py \
-  --pipeline gpu_stream \
-  --cache-mode none \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
   --subset test \
   --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/checkpoints/best.pt \
