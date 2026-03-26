@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+
+SCRIPT_SOURCED=0
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  SCRIPT_SOURCED=1
+fi
+
+if [ "$SCRIPT_SOURCED" != "1" ]; then
+  set -Eeuo pipefail
+fi
 
 # One-click environment bootstrap for Ubuntu compute servers.
 # Behavior:
@@ -19,12 +27,7 @@ RUN_SMOKE_TESTS="${RUN_SMOKE_TESTS:-1}"
 ENABLE_PYPI_FALLBACK="${ENABLE_PYPI_FALLBACK:-1}"
 PYPI_FALLBACK_INDEX_URL="${PYPI_FALLBACK_INDEX_URL:-https://pypi.org/simple}"
 CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-$REPO_ROOT/.conda-server}"
-SETUP_STATE_VERSION="${SETUP_STATE_VERSION:-conda-v1}"
-SCRIPT_SOURCED=0
-
-if [ "${BASH_SOURCE[0]}" != "$0" ]; then
-  SCRIPT_SOURCED=1
-fi
+SETUP_STATE_VERSION="${SETUP_STATE_VERSION:-conda-v2}"
 
 log() {
   printf '[setup] %s\n' "$*"
@@ -54,6 +57,30 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+resolve_conda_bin() {
+  local requested candidate
+
+  requested="${CONDA_BIN:-conda}"
+  if command -v "$requested" >/dev/null 2>&1; then
+    command -v "$requested"
+    return 0
+  fi
+
+  for candidate in \
+    /opt/conda/bin/conda \
+    /root/miniconda3/bin/conda \
+    /usr/local/miniconda3/bin/conda \
+    /usr/local/anaconda3/bin/conda
+  do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 pip_install() {
   if python -m pip install "$@"; then
     return 0
@@ -70,8 +97,10 @@ pip_install() {
 init_conda_shell() {
   local conda_path conda_base conda_sh conda_hook
 
-  conda_path="$(command -v "$CONDA_BIN" || true)"
+  conda_path="$(resolve_conda_bin || true)"
   [ -n "$conda_path" ] || die "Missing required command: $CONDA_BIN"
+  CONDA_BIN="$conda_path"
+  export CONDA_BIN
 
   conda_hook="$("$conda_path" shell.bash hook 2>/dev/null || true)"
   if [ -n "$conda_hook" ]; then
@@ -238,7 +267,9 @@ run_python_check() {
 }
 
 require_cmd "$BASE_PYTHON_BIN"
-require_cmd "$CONDA_BIN"
+CONDA_BIN="$(resolve_conda_bin || true)"
+[ -n "$CONDA_BIN" ] || die "Missing required command: conda"
+export CONDA_BIN
 
 DEFAULT_CONDA_PYTHON_VERSION="$("$BASE_PYTHON_BIN" - <<'PY'
 import sys
