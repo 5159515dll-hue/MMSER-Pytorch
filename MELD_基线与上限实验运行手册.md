@@ -82,6 +82,7 @@ python3 download.py
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
 - 训练/推理主线已经不再公开 `--pipeline` / `--cache-mode` 这类旧运行时参数；当前应该直接使用最短的 manifest/gpu_stream 命令。
 - 训练/推理开始后，控制台会额外打印 `gpu_stream_backends`、`gpu_stream_prepare_stats`，训练日志还会带 `train_prepare_s`、`val_prepare_s`，它们用于判断瓶颈是在 CPU ingress 还是模型前向。
+- `--num-workers auto` 不是硬性要求，而是默认推荐值。如果像 `K100_AI` 这类旧内核/特殊驱动服务器在首个 batch 附近出现 `Segmentation fault (core dumped)`，通常就是 worker 子进程和底层音频/视频库不兼容，此时应把该机器上的训练与推理统一固定成 `--num-workers 0`。
 - 再次进入同一台机器上的同一仓库时，仍然直接执行 `USE_GLOBAL_ENV=1 source setup_ubuntu_server.sh` 即可。依赖如果已经装好，脚本会自动跳过重复安装。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
@@ -177,7 +178,7 @@ export TRANSFORMERS_OFFLINE=1
 
 这是实验一的最终正确 GPU 命令。不要再为它额外执行 `build_feature_cache.py`。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
 
 训练：
 
@@ -191,7 +192,7 @@ python3 train.py \
   --device auto \
   --amp-mode bf16 \
   --batch-size 16 \
-  --num-workers auto \
+  --num-workers 0 \
   --video-backbone flow \
   --audio-model microsoft/wavlm-large \
   --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
@@ -328,7 +329,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 
 这是实验二的最终正确 GPU 命令。不要再为它生成 `feature_cache_tri_*` 一类目录。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
 
 训练：
 
@@ -477,7 +478,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 
 这是实验三的最终正确 GPU 命令。它直接从原始媒体流式训练，不需要任何中间 shard。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
 
 训练：
 
@@ -623,7 +624,7 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 
 这是实验四的最终正确 GPU 命令。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
 训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，因此默认应使用 `--num-workers auto`。只有在特定服务器上出现 `cv2/decord` worker 崩溃时，再手工回退到 `--num-workers 0`。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
 
 训练：
 
