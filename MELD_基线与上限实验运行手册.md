@@ -41,8 +41,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 #unset HF_HUB_OFFLINE
 #unset TRANSFORMERS_OFFLINE
 
-INSTALL_LEGACY_EXTRAS=0 bash setup_ubuntu_server.sh
-source .venv-server/bin/activate
+INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 
 # 先确认真正存放 MELD MP4 的目录层级。
@@ -73,6 +72,8 @@ python3 download.py
 
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
+- `filter_meld_manifest.py` 只做本地 manifest 过滤，不会下载任何模型或远程资源。
+- `download.py` 默认把 Hugging Face 模型快照下载到仓库本地的 `.hf-cache/hub/`。同一台机器第二次运行时，会直接复用本地缓存，不会重复下载同一个快照。
 - `--data-root` 必须指向实际包含 `train_splits`、`dev_splits_complete` 或 `output_repeated_splits_test` 的目录。很多服务器应该填 `../MELD.Raw`，不要机械照抄成 `../MELD.Raw/MELD.Raw`。
 - 如果 `build_split_manifest.py` 打印 `usable_rows: 0`，说明 MP4 根目录填错了；先修正 `--data-root`，再重新生成 manifest。
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
