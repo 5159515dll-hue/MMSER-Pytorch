@@ -58,12 +58,31 @@ pip_install() {
   "$PYTHON_BIN" -m pip install --index-url "$PYPI_FALLBACK_INDEX_URL" "$@"
 }
 
+create_server_venv() {
+  local python_bin="$1"
+  local venv_dir="$2"
+
+  if "$python_bin" -m venv --system-site-packages "$venv_dir"; then
+    return 0
+  fi
+
+  warn "python -m venv failed; attempting virtualenv fallback"
+  rm -rf "$venv_dir"
+
+  if ! "$python_bin" -m virtualenv --help >/dev/null 2>&1; then
+    log "Installing virtualenv into the current Python environment"
+    "$python_bin" -m pip install --user virtualenv
+  fi
+
+  "$python_bin" -m virtualenv --system-site-packages "$venv_dir"
+}
+
 require_cmd "$PYTHON_BIN"
 
 if [ "$USE_VENV" = "1" ] && [ "$BOOTSTRAPPED_VENV" != "1" ]; then
   if [ ! -x "$VENV_DIR/bin/python" ]; then
     log "Creating isolated virtualenv at $VENV_DIR (inherits system PyTorch via --system-site-packages)"
-    "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
+    create_server_venv "$PYTHON_BIN" "$VENV_DIR"
   fi
   BASE_SITE_PATHS="$("$BASE_PYTHON_BIN" - <<'PY'
 import os
