@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
+from safetensors import safe_open
+from transformers import AutoConfig, AutoTokenizer
 
 
 DEFAULT_MODELS: list[tuple[str, str | None]] = [
@@ -13,6 +16,8 @@ DEFAULT_MODELS: list[tuple[str, str | None]] = [
     ("MCG-NJU/videomae-large", None),
     ("microsoft/wavlm-large", "e4e472c491084b2c6fb9736099130aa805159c62"),
 ]
+
+TEXT_MODEL_REPOS = {"FacebookAI/xlm-roberta-large"}
 
 
 def _default_cache_dir() -> Path:
@@ -48,6 +53,43 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _verify_safetensors_file(path: Path) -> None:
+    with safe_open(str(path), framework="pt") as handle:
+        # Force safetensors to parse the file header and key index.
+        _ = list(handle.keys())
+
+
+def _verify_snapshot_weights(snapshot_path: Path) -> None:
+    single_file = snapshot_path / "model.safetensors"
+    shard_index = snapshot_path / "model.safetensors.index.json"
+
+    if single_file.is_file():
+        _verify_safetensors_file(single_file)
+        return
+
+    if shard_index.is_file():
+        payload = json.loads(shard_index.read_text(encoding="utf-8"))
+        weight_map = payload.get("weight_map", {})
+        shard_names = sorted(set(str(v) for v in weight_map.values()))
+        if not shard_names:
+            raise RuntimeError(f"empty weight_map in {shard_index}")
+        for shard_name in shard_names:
+            shard_path = snapshot_path / shard_name
+            if not shard_path.is_file():
+                raise RuntimeError(f"missing shard file: {shard_path}")
+            _verify_safetensors_file(shard_path)
+        return
+
+    raise RuntimeError(f"no safetensors weights found in {snapshot_path}")
+
+
+def _verify_cached_snapshot(repo_id: str, revision: str | None, snapshot_path: Path) -> None:
+    AutoConfig.from_pretrained(str(snapshot_path), revision=revision, local_files_only=True)
+    _verify_snapshot_weights(snapshot_path)
+    if repo_id in TEXT_MODEL_REPOS:
+        AutoTokenizer.from_pretrained(str(snapshot_path), revision=revision, local_files_only=True)
+
+
 def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir.expanduser()
@@ -65,10 +107,13 @@ def main() -> None:
                     local_dir_use_symlinks=False,
                     local_files_only=True,
                 )
-                print(f"cached: {repo_id} -> {path}")
+                _verify_cached_snapshot(repo_id=repo_id, revision=revision, snapshot_path=Path(path))
+                print(f"cached+verified: {repo_id} -> {path}")
                 continue
             except LocalEntryNotFoundError:
                 pass
+            except Exception as exc:
+                print(f"cache-invalid: {repo_id} -> {type(exc).__name__}: {exc}")
 
         print(f"downloading: {repo_id} revision={revision} cache_dir={cache_dir}")
         path = snapshot_download(
@@ -80,6 +125,7 @@ def main() -> None:
             resume_download=(not bool(args.force)),
             force_download=bool(args.force),
         )
+        _verify_cached_snapshot(repo_id=repo_id, revision=revision, snapshot_path=Path(path))
         print(f"done: {repo_id} -> {path}")
 
 
