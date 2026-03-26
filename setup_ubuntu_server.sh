@@ -123,7 +123,7 @@ ensure_conda_env() {
 
   if [ ! -x "$CONDA_ENV_PREFIX/bin/python" ]; then
     log "Creating conda env at $CONDA_ENV_PREFIX"
-    conda create -y -p "$CONDA_ENV_PREFIX" "python=$CONDA_PYTHON_VERSION" pip
+    "$CONDA_BIN" create -y -p "$CONDA_ENV_PREFIX" "python=$CONDA_PYTHON_VERSION" pip
   fi
 }
 
