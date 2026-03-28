@@ -31,6 +31,7 @@
 
 请直接查看仓库根目录文档：
 - `README.md`
+- `PAPER_GRADE_PROTOCOL.md`
 - `MELD_基线与上限实验运行手册.md`
 
 当前正确流程是：

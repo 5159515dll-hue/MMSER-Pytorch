@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import math
 from typing import Any
 
 
@@ -67,6 +68,211 @@ def classification_summary(y_true: list[int], y_pred: list[int], label_names: li
         "support": support,
         "pred_counts": dict(sorted(pred_counts.items())),
     }
+
+
+def mean_and_sample_std(values: list[float]) -> tuple[float, float]:
+    """Return the sample mean and sample standard deviation."""
+
+    if not values:
+        return 0.0, 0.0
+    n = len(values)
+    mean = float(sum(float(v) for v in values) / n)
+    if n <= 1:
+        return mean, 0.0
+    var = sum((float(v) - mean) ** 2 for v in values) / (n - 1)
+    return mean, float(math.sqrt(max(0.0, var)))
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    max_iter = 200
+    eps = 3.0e-14
+    fpmin = 1.0e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(
+        math.lgamma(a + b)
+        - math.lgamma(a)
+        - math.lgamma(b)
+        + a * math.log(x)
+        + b * math.log(1.0 - x)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return float(bt * _betacf(a, b, x) / a)
+    return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
+
+
+def student_t_cdf(t_value: float, degrees_of_freedom: int) -> float:
+    """Evaluate the Student's t CDF with a pure-Python implementation."""
+
+    df = int(degrees_of_freedom)
+    if df <= 0:
+        raise ValueError("degrees_of_freedom must be positive")
+    t = float(t_value)
+    if t == 0.0:
+        return 0.5
+    x = df / (df + t * t)
+    ibeta = _regularized_incomplete_beta(df / 2.0, 0.5, x)
+    if t > 0.0:
+        return float(1.0 - 0.5 * ibeta)
+    return float(0.5 * ibeta)
+
+
+def student_t_ppf(probability: float, degrees_of_freedom: int) -> float:
+    """Inverse CDF for Student's t via monotonic binary search."""
+
+    p = float(probability)
+    df = int(degrees_of_freedom)
+    if not 0.0 < p < 1.0:
+        raise ValueError("probability must be in (0, 1)")
+    if p == 0.5:
+        return 0.0
+    if p < 0.5:
+        return -student_t_ppf(1.0 - p, df)
+    lo = 0.0
+    hi = 1.0
+    while student_t_cdf(hi, df) < p:
+        hi *= 2.0
+        if hi > 1.0e6:
+            break
+    for _ in range(120):
+        mid = (lo + hi) / 2.0
+        if student_t_cdf(mid, df) < p:
+            lo = mid
+        else:
+            hi = mid
+    return float((lo + hi) / 2.0)
+
+
+def mean_confidence_interval_t(values: list[float], confidence: float = 0.95) -> dict[str, float | None]:
+    """Compute a t-based confidence interval for the sample mean."""
+
+    n = len(values)
+    mean, sample_std = mean_and_sample_std(values)
+    if n == 0:
+        return {"mean": 0.0, "std": 0.0, "low": None, "high": None, "n": 0}
+    if n == 1:
+        return {"mean": mean, "std": 0.0, "low": mean, "high": mean, "n": 1}
+    alpha = 1.0 - float(confidence)
+    critical = student_t_ppf(1.0 - alpha / 2.0, n - 1)
+    half_width = critical * (sample_std / math.sqrt(n))
+    return {
+        "mean": mean,
+        "std": sample_std,
+        "low": float(mean - half_width),
+        "high": float(mean + half_width),
+        "n": int(n),
+    }
+
+
+def paired_t_test(left: list[float], right: list[float], confidence: float = 0.95) -> dict[str, float | int | None]:
+    """Paired t-test and CI for right-minus-left differences."""
+
+    if len(left) != len(right):
+        raise ValueError("paired_t_test requires equal-length inputs")
+    diffs = [float(r) - float(l) for l, r in zip(left, right)]
+    n = len(diffs)
+    mean_diff, sample_std = mean_and_sample_std(diffs)
+    positive_gain_count = int(sum(1 for d in diffs if d > 0.0))
+    non_negative_gain_count = int(sum(1 for d in diffs if d >= 0.0))
+    if n == 0:
+        return {
+            "n": 0,
+            "mean_diff": 0.0,
+            "std_diff": 0.0,
+            "t_statistic": None,
+            "p_value": None,
+            "ci_low": None,
+            "ci_high": None,
+            "positive_gain_count": positive_gain_count,
+            "non_negative_gain_count": non_negative_gain_count,
+        }
+    if n == 1 or sample_std == 0.0:
+        p_value = 0.0 if mean_diff != 0.0 else 1.0
+        return {
+            "n": int(n),
+            "mean_diff": float(mean_diff),
+            "std_diff": float(sample_std),
+            "t_statistic": None if n == 1 else float("inf") if mean_diff != 0.0 else 0.0,
+            "p_value": float(p_value),
+            "ci_low": float(mean_diff),
+            "ci_high": float(mean_diff),
+            "positive_gain_count": positive_gain_count,
+            "non_negative_gain_count": non_negative_gain_count,
+        }
+    standard_error = sample_std / math.sqrt(n)
+    t_statistic = mean_diff / standard_error
+    tail_prob = max(0.0, 1.0 - student_t_cdf(abs(t_statistic), n - 1))
+    alpha = 1.0 - float(confidence)
+    critical = student_t_ppf(1.0 - alpha / 2.0, n - 1)
+    half_width = critical * standard_error
+    return {
+        "n": int(n),
+        "mean_diff": float(mean_diff),
+        "std_diff": float(sample_std),
+        "t_statistic": float(t_statistic),
+        "p_value": float(min(1.0, max(0.0, 2.0 * tail_prob))),
+        "ci_low": float(mean_diff - half_width),
+        "ci_high": float(mean_diff + half_width),
+        "positive_gain_count": positive_gain_count,
+        "non_negative_gain_count": non_negative_gain_count,
+    }
+
+
+def holm_bonferroni_adjust(p_values: list[float | None]) -> list[float | None]:
+    """Apply Holm-Bonferroni correction while preserving original order."""
+
+    indexed = [(idx, float(p)) for idx, p in enumerate(p_values) if p is not None]
+    if not indexed:
+        return [None for _ in p_values]
+    sorted_pairs = sorted(indexed, key=lambda pair: pair[1])
+    adjusted: list[float | None] = [None for _ in p_values]
+    running_max = 0.0
+    total = len(sorted_pairs)
+    for rank, (original_idx, p_value) in enumerate(sorted_pairs):
+        factor = total - rank
+        candidate = min(1.0, max(0.0, factor * p_value))
+        running_max = max(running_max, candidate)
+        adjusted[original_idx] = running_max
+    return adjusted
 
 
 def speaker_majority_baseline(

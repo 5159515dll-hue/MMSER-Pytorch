@@ -1,24 +1,225 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import torch
 
+PAPER_PROTOCOL_VERSION = "paper_grade_v1"
+PAPER_MULTI_SEED = [13, 17, 23, 42, 3407]
 
-def set_seed(seed: int) -> None:
-    """Fix Python / NumPy / PyTorch RNG state."""
+
+def _safe_module_version(name: str) -> str | None:
+    try:
+        return str(importlib.metadata.version(name))
+    except Exception:
+        return None
+
+
+def _safe_git_output(args: list[str], *, cwd: Path | None = None) -> str | None:
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd is not None else None,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    text = str(proc.stdout or "").strip()
+    return text or None
+
+
+def set_seed(seed: int, *, deterministic: bool = True) -> dict[str, Any]:
+    """Fix Python / NumPy / PyTorch RNG state and return the active policy."""
 
     import random
     import numpy as np
 
+    seed_int = int(seed)
+    os.environ.setdefault("PYTHONHASHSEED", str(seed_int))
     random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    cudnn_enabled = bool(getattr(cudnn_backend, "enabled", False)) if cudnn_backend is not None else False
+    deterministic_enabled = False
+    warn_only = None
+    if deterministic:
+        use_det = getattr(torch, "use_deterministic_algorithms", None)
+        if callable(use_det):
+            try:
+                use_det(True)
+                deterministic_enabled = True
+            except TypeError:
+                use_det(True, warn_only=False)
+                deterministic_enabled = True
+        if cudnn_backend is not None:
+            try:
+                cudnn_backend.deterministic = True
+                cudnn_backend.benchmark = False
+            except Exception:
+                pass
+    else:
+        is_det_enabled = getattr(torch, "are_deterministic_algorithms_enabled", None)
+        if callable(is_det_enabled):
+            deterministic_enabled = bool(is_det_enabled())
+    is_det_enabled = getattr(torch, "are_deterministic_algorithms_enabled", None)
+    if callable(is_det_enabled):
+        deterministic_enabled = bool(is_det_enabled())
+    is_warn_only_enabled = getattr(torch, "is_deterministic_algorithms_warn_only_enabled", None)
+    if callable(is_warn_only_enabled):
+        warn_only = bool(is_warn_only_enabled())
+    return {
+        "seed": seed_int,
+        "deterministic_requested": bool(deterministic),
+        "deterministic_algorithms_enabled": bool(deterministic_enabled),
+        "deterministic_warn_only": warn_only,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        "cudnn_enabled": bool(cudnn_enabled),
+        "cudnn_deterministic": bool(getattr(cudnn_backend, "deterministic", False)) if cudnn_backend is not None else None,
+        "cudnn_benchmark": bool(getattr(cudnn_backend, "benchmark", False)) if cudnn_backend is not None else None,
+    }
+
+
+def make_torch_generator(seed: int) -> torch.Generator:
+    """Build a deterministic torch Generator for DataLoader shuffles."""
+
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def make_dataloader_worker_init_fn(base_seed: int) -> Any:
+    """Build a worker init fn that deterministically seeds each worker."""
+
+    seed_int = int(base_seed)
+
+    def _seed_worker(worker_id: int) -> None:
+        import random
+        import numpy as np
+
+        worker_seed = seed_int + int(worker_id)
+        random.seed(worker_seed)
+        np.random.seed(worker_seed % (2**32))
+        torch.manual_seed(worker_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(worker_seed)
+
+    return _seed_worker
+
+
+def build_run_contract(
+    *,
+    split_manifest: Path,
+    manifest_sha256: str,
+    dataset_kind: str,
+    task_mode: str,
+    speaker_id: str | None,
+    text_policy: str,
+    label_names: list[str],
+    validity_summary: dict[str, Any],
+    ablation: str,
+    zero_video: bool,
+    zero_audio: bool,
+    zero_text: bool,
+    use_intensity: bool,
+    video_backbone: str,
+    sample_rate: int,
+    max_audio_sec: float,
+    num_frames: int,
+) -> dict[str, Any]:
+    """Build the immutable experiment contract used by training and inference."""
+
+    return {
+        "protocol_version": PAPER_PROTOCOL_VERSION,
+        "split_manifest": str(split_manifest),
+        "manifest_sha256": str(manifest_sha256),
+        "dataset_kind": str(dataset_kind),
+        "task_mode": str(task_mode),
+        "speaker_id": str(speaker_id).strip().upper() if speaker_id is not None and str(speaker_id).strip() else None,
+        "text_policy": str(text_policy),
+        "label_names": list(label_names),
+        "claim_scope": str(validity_summary.get("claim_scope", "")),
+        "scientific_validity": bool(validity_summary.get("scientific_validity", False)),
+        "ablation": str(ablation),
+        "zero_video": bool(zero_video),
+        "zero_audio": bool(zero_audio),
+        "zero_text": bool(zero_text),
+        "use_intensity": bool(use_intensity),
+        "video_backbone": str(video_backbone),
+        "sample_rate": int(sample_rate),
+        "max_audio_sec": float(max_audio_sec),
+        "num_frames": int(num_frames),
+    }
+
+
+def build_run_provenance(
+    *,
+    runtime_profile: dict[str, Any],
+    deterministic_policy: dict[str, Any],
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
+    """Collect a compact provenance record for later reproduction."""
+
+    root = repo_root.expanduser() if repo_root is not None else Path(__file__).resolve().parent
+    git_commit = _safe_git_output(["git", "rev-parse", "HEAD"], cwd=root)
+    git_short_commit = _safe_git_output(["git", "rev-parse", "--short", "HEAD"], cwd=root)
+    git_dirty = _safe_git_output(["git", "status", "--porcelain"], cwd=root)
+    cudnn_version = None
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    if cudnn_backend is not None:
+        version_fn = getattr(cudnn_backend, "version", None)
+        if callable(version_fn):
+            try:
+                cudnn_version = version_fn()
+            except Exception:
+                cudnn_version = None
+    return {
+        "protocol_version": PAPER_PROTOCOL_VERSION,
+        "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "torch_version": getattr(torch, "__version__", None),
+        "torch_cuda_version": getattr(getattr(torch, "version", None), "cuda", None),
+        "cudnn_version": cudnn_version,
+        "torchaudio_version": _safe_module_version("torchaudio"),
+        "transformers_version": _safe_module_version("transformers"),
+        "decord_version": _safe_module_version("decord"),
+        "git_commit": git_commit,
+        "git_short_commit": git_short_commit,
+        "git_is_dirty": bool(git_dirty),
+        "runtime_profile": dict(runtime_profile),
+        "deterministic_policy": dict(deterministic_policy),
+    }
+
+
+def build_paper_grade(
+    *,
+    validity_summary: dict[str, Any],
+    ineligibility_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    """Summarize whether a run satisfies the paper-grade protocol."""
+
+    reasons = [str(reason) for reason in (ineligibility_reasons or []) if str(reason).strip()]
+    return {
+        "protocol_version": PAPER_PROTOCOL_VERSION,
+        "eligible": len(reasons) == 0,
+        "ineligibility_reasons": reasons,
+        "scientific_validity": bool(validity_summary.get("scientific_validity", False)),
+        "claim_scope": str(validity_summary.get("claim_scope", "")),
+    }
 
 
 def autocast_context(device: torch.device, amp_mode: str) -> contextlib.AbstractContextManager[Any]:
@@ -202,6 +403,19 @@ def save_metrics_and_plots(out_dir: Path, metrics: dict[str, Any]) -> None:
     plt.savefig(out_dir / "macro_f1_curve.png", dpi=160)
     plt.close()
 
+    lr_history = metrics.get("lr", [])
+    if lr_history:
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(epochs[: len(lr_history)], lr_history, label="lr")
+        plt.xlabel("epoch")
+        plt.ylabel("learning_rate")
+        plt.title("Learning Rate vs Epoch")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "lr_curve.png", dpi=160)
+        plt.close()
+
     train_recall_history = metrics.get("train_per_class_recall", [])
     val_recall_history = metrics.get("val_per_class_recall", [])
     if train_recall_history or val_recall_history:
@@ -268,6 +482,9 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     best = metrics.get("best", {})
     validity = metrics.get("validity", {})
+    stop = metrics.get("stop", {})
+    paper_grade = metrics.get("paper_grade", {})
+    provenance = metrics.get("provenance", {})
     speaker_majority = metrics.get("speaker_majority_baseline", {})
     speaker_only = metrics.get("speaker_only_baseline", {})
     meta = metrics.get("meta", {})
@@ -275,18 +492,33 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
     lines = [
         "# Run Summary",
         "",
+        f"- protocol_version: `{paper_grade.get('protocol_version', meta.get('paper_protocol_version'))}`",
+        f"- paper_grade_eligible: `{paper_grade.get('eligible')}`",
+        f"- ineligibility_reasons: `{paper_grade.get('ineligibility_reasons', [])}`",
         f"- task_mode: `{validity.get('task_mode', 'confounded_7way')}`",
         f"- speaker_id: `{validity.get('speaker_id')}`",
         f"- text_policy: `{meta.get('text_policy', 'full')}`",
         f"- scientific_validity: `{validity.get('scientific_validity')}`",
         f"- claim_scope: `{validity.get('claim_scope')}`",
         f"- recommended_interpretation: {validity.get('recommended_interpretation', '')}",
+        f"- git_commit: `{provenance.get('git_short_commit')}`",
         "",
         "## Best Validation",
         "",
         f"- epoch: `{best.get('epoch')}`",
         f"- accuracy: `{best_val.get('accuracy')}`",
         f"- macro_f1: `{best_val.get('macro_f1')}`",
+        f"- loss: `{best.get('best_val_loss')}`",
+        f"- checkpoint_reason: `{best.get('checkpoint_reason')}`",
+        f"- best_monitor_value: `{best.get('best_monitor_value')}`",
+        f"- significant_best_monitor_value: `{best.get('significant_best_monitor_value')}`",
+        "",
+        "## Stop",
+        "",
+        f"- stop_reason: `{stop.get('reason')}`",
+        f"- stop_epoch: `{stop.get('epoch')}`",
+        f"- epochs_without_improvement: `{stop.get('epochs_without_improvement')}`",
+        f"- lr_drop_epochs: `{stop.get('lr_drop_epochs')}`",
         "",
         "## Baselines",
         "",
@@ -302,6 +534,6 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
         "- `checkpoints/last.pt`",
         "- `inference_val.jsonl`",
         "- `inference_val.metrics.json`",
-        "- training curves and confusion matrix PNGs",
+        "- training curves, lr curve, and confusion matrix PNGs",
     ]
     (out_dir / "results_summary.md").write_text("\n".join(lines).strip() + "\n", encoding="utf-8")

@@ -9,6 +9,19 @@
 
 主线训练和推理由 [train.py](/Users/dailulu/projects/MMSER-Pytorch/train.py) 和 [batch_inference.py](/Users/dailulu/projects/MMSER-Pytorch/batch_inference.py) 进入，具体实现收敛在 [gpu_stream_train.py](/Users/dailulu/projects/MMSER-Pytorch/gpu_stream_train.py) 和 [gpu_stream_infer.py](/Users/dailulu/projects/MMSER-Pytorch/gpu_stream_infer.py)。`motion_prosody/` 只保留给 `legacy/baseline_v1/` 的最小导入兼容层。
 
+如果你要把实验结果写进论文、答辩或正式对外表格，请先看：
+
+- [PAPER_GRADE_PROTOCOL.md](/Users/dailulu/projects/MMSER-Pytorch/PAPER_GRADE_PROTOCOL.md)
+- [MELD_基线与上限实验运行手册.md](/Users/dailulu/projects/MMSER-Pytorch/MELD_%E5%9F%BA%E7%BA%BF%E4%B8%8E%E4%B8%8A%E9%99%90%E5%AE%9E%E9%AA%8C%E8%BF%90%E8%A1%8C%E6%89%8B%E5%86%8C.md)
+
+当前主线的正式论文级结果只接受：
+
+- 同一 `manifest_sha256`
+- `checkpoints/best.pt` 的验证/测试评测
+- `paper_grade.eligible=true` 的训练、推理与多 seed 汇总产物
+
+对于 `legacy/baseline_v1/` 或任何 `scientific_validity=false` 的结果，只能按 archival / confounded benchmark 解释，不能写成跨说话人情绪泛化证据。
+
 以下脚本已经退出主线支持面，只保留迁移提示：
 
 - `predecode_dataset.py`

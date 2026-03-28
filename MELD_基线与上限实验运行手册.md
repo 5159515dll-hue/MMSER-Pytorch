@@ -2,6 +2,8 @@
 
 本文档整理 `MMSER-Pytorch` 在 `MELD` 数据集上的四组 **GPU 流式实验** 命令与解释。
 
+正式写论文、报告或对外表格前，请先通读根目录的 [PAPER_GRADE_PROTOCOL.md](/Users/dailulu/projects/MMSER-Pytorch/PAPER_GRADE_PROTOCOL.md)。本手册只描述 MELD 主线命令，不替代仓库级的论文口径约束。
+
 这版手册只保留当前主线实现对应的 GPU 路线：
 
 - 训练与推理统一走 `gpu_stream`
@@ -92,6 +94,35 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
+## 统一的停止与报告协议
+
+从这一版开始，四组 MELD GPU 实验不再采用“单次 run 里连续 5 轮没涨就停”的经验式口径，而统一采用下面这套更稳妥的协议：
+
+- headline 结果一律来自 `5` 个固定随机种子：`13 17 23 42 3407`
+- 每个 seed 都独立训练一次，只允许用验证集选择 `checkpoints/best.pt`
+- 测试集只在该 seed 训练结束后跑一次，不能参与早停、调参或挑 checkpoint
+- 主监控指标固定为 `val_f1`
+- “真正提升”定义为：当前 `val_f1 > 历史最好 val_f1 + 0.002`
+- 如果当前 `val_f1` 与历史最好值的差距不超过 `0.002`，则允许用更低的 `val_loss` 替换 checkpoint，但这种替换**不会**重置早停 patience
+- 学习率调度固定为 `ReduceLROnPlateau`：监控 `val_loss`，`factor=0.5`，`patience=4`，`min_lr=1e-6`
+- 早停必须同时满足三条：
+  - 已达到该实验的 `min_epochs`
+  - 已经发生至少 `2` 次 LR 降档
+  - `val_f1` 连续 `stop_patience` 轮没有超过历史最好值 `+ 0.002`
+
+这套口径的核心目标不是“尽快停”，而是尽量避免因为验证集抖动、短期尖峰或单次随机波动，把结果做得不可信。
+
+统一说明：
+
+- `batch_inference.py` 的 checkpoint 统一使用 `checkpoints/best.pt`
+- 正式实验里不要使用 `--allow-incompatible-checkpoint`；它只用于调试，且会让输出自动失去论文级资格
+- 推理统计摘要统一写成 `inference_val.metrics.json` 和 `inference_test.metrics.json`
+- 训练、推理和聚合产物里都应检查 `paper_grade.eligible=true`
+- 正式 headline 结果必须保证 train / val / test 共享同一 `manifest_sha256`
+- 单个 seed 的最好结果只能作为明细，不应直接作为论文表格 headline
+- 正式对外汇报时，应使用多 seed 汇总结果里的 `mean ± std`、`95% CI` 和相邻实验之间的配对显著性检验
+- 如果某次 run 的 `paper_grade.eligible=false`，即使数值更高，也不能放进正式论文表
+
 ## MELD GPU 主实验以后不要再用的旧命令
 
 下面这些命令属于旧的 CPU 缓存式 MELD 路线。对于本文这四组 GPU 主实验，后续都不要再用：
@@ -177,102 +208,126 @@ export TRANSFORMERS_OFFLINE=1
 
 ### 命令
 
-这是实验一的最终正确 GPU 命令。不要再为它额外执行 `build_feature_cache.py`。
-训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
+这是实验一的正式论文级运行口径。不要再为它额外执行 `build_feature_cache.py`。
+训练、`val` 推理、`test` 推理分别按下面三个 loop 执行；每个 loop 会把 `5` 个 seed 全部跑完。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
 训练：
 
 ```bash
-rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video
+SEEDS="13 17 23 42 3407"
 
-python3 train.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video \
-  --epochs 60 \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 16 \
-  --num-workers auto \
-  --video-backbone flow \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --fusion-mode gated_text \
-  --freeze-audio \
-  --freeze-flow \
-  --freeze-text \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --ablation no-video \
-  --sample-rate 16000 \
-  --max-audio-sec 6 \
-  --monitor val_f1 \
-  --early-stop-patience 10 \
-  --lr 1e-3 \
-  --benchmark-tag meld_gpu_practical_no_video
+for seed in $SEEDS; do
+  rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}
+
+  python3 train.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
+    --epochs 80 \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone flow \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --fusion-mode gated_text \
+    --freeze-audio \
+    --freeze-flow \
+    --freeze-text \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --ablation no-video \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --monitor val_f1 \
+    --early-stop-patience 12 \
+    --early-stop-min-epochs 20 \
+    --early-stop-min-delta 0.002 \
+    --early-stop-after-lr-drops 2 \
+    --lr-scheduler plateau \
+    --lr-plateau-patience 4 \
+    --lr-plateau-factor 0.5 \
+    --lr-min 1e-6 \
+    --lr 1e-3 \
+    --seed ${seed} \
+    --benchmark-tag meld_gpu_practical_no_video_seed${seed}
+done
 ```
 
 验证集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset val \
-  --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_practical_no_video/inference_val.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 16 \
-  --num-workers auto \
-  --video-backbone flow \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --ablation no-video \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset val \
+    --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_val.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone flow \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --ablation no-video \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_practical_no_video_seed${seed}
+done
 ```
 
 测试集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset test \
-  --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_practical_no_video/inference_test.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 16 \
-  --num-workers auto \
-  --video-backbone flow \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --ablation no-video \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset test \
+    --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_test.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone flow \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --ablation no-video \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_practical_no_video_seed${seed}
+done
 ```
 
 ### 结果如何看
 
 ```bash
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inference_val.metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inference_test.metrics.json
+python3 aggregate_multi_seed_results.py \
+  --group practical=outputs/benchmarks/meld/run_gpu_practical_no_video_seed* \
+  --output-dir outputs/benchmarks/meld/reports/practical_5seed
+
+python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/multi_seed_summary.json
+python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_significance.json
 ```
 
 重点看：
 
-- `outputs/benchmarks/meld/run_gpu_practical_no_video/inference_test.metrics.json`
-- `accuracy_on_ok`
-- `macro_f1_on_ok`
-- `pipeline` 是否为 `gpu_stream`
+- `multi_seed_summary.json` 里的 `test_macro_f1.mean/std/95% CI`
+- 每个 seed 的 `metrics.json` 里 `stop.reason`、`stop.lr_drop_epochs` 和 `best.best_val_loss`
+- 这一组主要作为后续三组的统计比较基线
 
 ### 总结
 
@@ -328,103 +383,127 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_practical_no_video/inferenc
 
 ### 命令
 
-这是实验二的最终正确 GPU 命令。不要再为它生成 `feature_cache_tri_*` 一类目录。
-训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
+这是实验二的正式论文级运行口径。不要再为它生成 `feature_cache_tri_*` 一类目录。
+训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
 训练：
 
 ```bash
-rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen
+SEEDS="13 17 23 42 3407"
 
-python3 train.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen \
-  --epochs 30 \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 8 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --fusion-mode gated_text \
-  --freeze-audio \
-  --freeze-rgb \
-  --freeze-text \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6 \
-  --monitor val_f1 \
-  --early-stop-patience 6 \
-  --benchmark-tag meld_gpu_tri_rgb_audio_text_frozen
+for seed in $SEEDS; do
+  rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}
+
+  python3 train.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
+    --epochs 50 \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 8 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --fusion-mode gated_text \
+    --freeze-audio \
+    --freeze-rgb \
+    --freeze-text \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --monitor val_f1 \
+    --early-stop-patience 10 \
+    --early-stop-min-epochs 15 \
+    --early-stop-min-delta 0.002 \
+    --early-stop-after-lr-drops 2 \
+    --lr-scheduler plateau \
+    --lr-plateau-patience 4 \
+    --lr-plateau-factor 0.5 \
+    --lr-min 1e-6 \
+    --seed ${seed} \
+    --benchmark-tag meld_gpu_tri_rgb_audio_text_frozen_seed${seed}
+done
 ```
 
 验证集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset val \
-  --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/inference_val.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 16 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset val \
+    --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_val.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_tri_rgb_audio_text_frozen_seed${seed}
+done
 ```
 
 测试集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset test \
-  --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/inference_test.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 16 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset test \
+    --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_test.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_tri_rgb_audio_text_frozen_seed${seed}
+done
 ```
 
 ### 结果如何看
 
 ```bash
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/inference_val.metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/inference_test.metrics.json
+python3 aggregate_multi_seed_results.py \
+  --group tri_frozen=outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed* \
+  --output-dir outputs/benchmarks/meld/reports/tri_frozen_5seed
+
+python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed_summary.json
 ```
 
 重点看：
 
-- 相比实验一，`test macro_f1` 是否提升
-- `per_class_recall` 是否更均衡
-- `pipeline` 是否为 `gpu_stream`
+- 相比实验一，`test macro_f1 mean` 是否提升
+- `95% CI` 是否与实验一分开
+- 每个 seed 的提升方向是否大体一致
 
 ### 总结
 
@@ -477,99 +556,124 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen/i
 
 ### 命令
 
-这是实验三的最终正确 GPU 命令。它直接从原始媒体流式训练，不需要任何中间 shard。
-训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
+这是实验三的正式论文级运行口径。它直接从原始媒体流式训练，不需要任何中间 shard。
+训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
 训练：
 
 ```bash
-rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text
+SEEDS="13 17 23 42 3407"
 
-python3 train.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text \
-  --epochs 20 \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 2 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --fusion-mode gated_text \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6 \
-  --monitor val_f1 \
-  --early-stop-patience 5 \
-  --benchmark-tag meld_gpu_upper_rgb_audio_text
+for seed in $SEEDS; do
+  rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}
+
+  python3 train.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
+    --epochs 40 \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 2 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --fusion-mode gated_text \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --monitor val_f1 \
+    --early-stop-patience 12 \
+    --early-stop-min-epochs 12 \
+    --early-stop-min-delta 0.002 \
+    --early-stop-after-lr-drops 2 \
+    --lr-scheduler plateau \
+    --lr-plateau-patience 4 \
+    --lr-plateau-factor 0.5 \
+    --lr-min 1e-6 \
+    --seed ${seed} \
+    --benchmark-tag meld_gpu_upper_rgb_audio_text_seed${seed}
+done
 ```
 
 验证集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset val \
-  --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/inference_val.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 8 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset val \
+    --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_val.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 8 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_upper_rgb_audio_text_seed${seed}
+done
 ```
 
 测试集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset test \
-  --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/inference_test.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 8 \
-  --num-workers auto \
-  --video-backbone videomae \
-  --num-frames 16 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset test \
+    --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_test.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 8 \
+    --num-workers auto \
+    --video-backbone videomae \
+    --num-frames 16 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_upper_rgb_audio_text_seed${seed}
+done
 ```
 
 ### 结果如何看
 
 ```bash
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/inference_val.metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/inference_test.metrics.json
+python3 aggregate_multi_seed_results.py \
+  --group upper_rgb=outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed* \
+  --output-dir outputs/benchmarks/meld/reports/upper_rgb_5seed
+
+python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_summary.json
 ```
 
 重点看：
 
-- 相比实验二，`test macro_f1` 是否继续提升
-- 是否值得继续把 GPU 动态分支也纳入
+- 相比实验二，`test macro_f1 mean` 是否继续提升
+- `95% CI` 与实验二是否有明显分离
+- 各 seed 的提升方向是否一致到足以支持“值得继续上 dual 分支”的判断
 
 ### 总结
 
@@ -623,106 +727,130 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text/infere
 
 ### 命令
 
-这是实验四的最终正确 GPU 命令。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
-训练、`val` 推理、`test` 推理请分三次执行。每次只复制一个代码块，等上一条命令完全结束、shell 提示符返回后，再执行下一条。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应统一固定使用 `--num-workers 0`。
+这是实验四的正式论文级运行口径。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
+训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
 训练：
 
 ```bash
-rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion
+SEEDS="13 17 23 42 3407"
 
-python3 train.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion \
-  --epochs 20 \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 1 \
-  --num-workers auto \
-  --video-backbone dual \
-  --flow-backend torch_motion \
-  --num-frames 32 \
-  --flow-size 112 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --fusion-mode gated_text \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6 \
-  --monitor val_f1 \
-  --early-stop-patience 5 \
-  --benchmark-tag meld_gpu_upper_dual_torch_motion
+for seed in $SEEDS; do
+  rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}
+
+  python3 train.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
+    --epochs 40 \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 16 \
+    --num-workers auto \
+    --video-backbone dual \
+    --flow-backend torch_motion \
+    --num-frames 32 \
+    --flow-size 112 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --fusion-mode gated_text \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --monitor val_f1 \
+    --early-stop-patience 12 \
+    --early-stop-min-epochs 12 \
+    --early-stop-min-delta 0.002 \
+    --early-stop-after-lr-drops 2 \
+    --lr-scheduler plateau \
+    --lr-plateau-patience 4 \
+    --lr-plateau-factor 0.5 \
+    --lr-min 1e-6 \
+    --seed ${seed} \
+    --benchmark-tag meld_gpu_upper_dual_torch_motion_seed${seed}
+done
 ```
 
 验证集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset val \
-  --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inference_val.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 4 \
-  --num-workers auto \
-  --video-backbone dual \
-  --flow-backend torch_motion \
-  --num-frames 32 \
-  --flow-size 112 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset val \
+    --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_val.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 4 \
+    --num-workers auto \
+    --video-backbone dual \
+    --flow-backend torch_motion \
+    --num-frames 32 \
+    --flow-size 112 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_upper_dual_torch_motion_seed${seed}
+done
 ```
 
 测试集推理：
 
 ```bash
-python3 batch_inference.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --subset test \
-  --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/checkpoints/best.pt \
-  --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inference_test.jsonl \
-  --device auto \
-  --amp-mode bf16 \
-  --batch-size 4 \
-  --num-workers auto \
-  --video-backbone dual \
-  --flow-backend torch_motion \
-  --num-frames 32 \
-  --flow-size 112 \
-  --rgb-size 224 \
-  --audio-model microsoft/wavlm-large \
-  --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-  --text-model FacebookAI/xlm-roberta-large \
-  --task-mode confounded_7way \
-  --text-policy full \
-  --sample-rate 16000 \
-  --max-audio-sec 6
+SEEDS="13 17 23 42 3407"
+
+for seed in $SEEDS; do
+  python3 batch_inference.py \
+    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --subset test \
+    --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
+    --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_test.jsonl \
+    --device auto \
+    --amp-mode bf16 \
+    --batch-size 4 \
+    --num-workers auto \
+    --video-backbone dual \
+    --flow-backend torch_motion \
+    --num-frames 32 \
+    --flow-size 112 \
+    --rgb-size 224 \
+    --audio-model microsoft/wavlm-large \
+    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
+    --text-model FacebookAI/xlm-roberta-large \
+    --task-mode confounded_7way \
+    --text-policy full \
+    --sample-rate 16000 \
+    --max-audio-sec 6 \
+    --benchmark-tag meld_gpu_upper_dual_torch_motion_seed${seed}
+done
 ```
 
 ### 结果如何看
 
 ```bash
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inference_val.metrics.json
-python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inference_test.metrics.json
+python3 aggregate_multi_seed_results.py \
+  --group dual_upper=outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed* \
+  --output-dir outputs/benchmarks/meld/reports/dual_upper_5seed
+
+python3 -m json.tool outputs/benchmarks/meld/reports/dual_upper_5seed/multi_seed_summary.json
 ```
 
 重点看：
 
-- `test macro_f1` 是否超过实验三
-- `per_class_recall` 是否更均衡
-- GPU 动态分支是否带来实际增益
+- `test macro_f1 mean` 是否超过实验三
+- `95% CI` 与实验三是否分离
+- 相邻对比里是否满足 “均值为正 + p<0.05 + 至少 4/5 个 seed 为正增益”
 
 ### 总结
 
@@ -750,6 +878,28 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inf
 - 实验四证明：
   当前 GPU 动态分支相对于 RGB-only 上限是否还能带来收益，是不是值得保留 `dual` 设计。
 
+## 四组结果的正式统计汇总
+
+当四组实验都把 `5` 个 seed 的 train / val / test 跑完以后，统一执行下面这个汇总命令：
+
+```bash
+python3 aggregate_multi_seed_results.py \
+  --group practical=outputs/benchmarks/meld/run_gpu_practical_no_video_seed* \
+  --group tri_frozen=outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed* \
+  --group upper_rgb=outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed* \
+  --group dual_upper=outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed* \
+  --output-dir outputs/benchmarks/meld/reports/full_comparison_5seed
+
+python3 -m json.tool outputs/benchmarks/meld/reports/full_comparison_5seed/multi_seed_summary.json
+python3 -m json.tool outputs/benchmarks/meld/reports/full_comparison_5seed/pairwise_significance.json
+```
+
+正式对外报告时，优先使用：
+
+- `multi_seed_summary.json`
+- `pairwise_significance.json`
+- `multi_seed_summary.md`
+
 ## 结果比较顺序
 
 真正最关键的不是某一组单点最高分，而是下面三条增益链条是否成立：
@@ -758,6 +908,18 @@ python3 -m json.tool outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion/inf
   说明 RGB 模态有实际贡献
 - `实验三 > 实验二`
   说明放开 RGB/A/T 编码器有实际贡献
+- `实验四 > 实验三`
+  说明 GPU 动态分支相对于 RGB-only 上限有实际贡献
+
+只有当下面三条同时成立时，才建议在论文或报告里写成“显著提升”：
+
+- `test macro_f1` 的 `mean` 为正增益
+- `pairwise_significance.json` 里的 `p_value < 0.05`
+- 至少 `4/5` 个共享 seed 呈现正增益
+
+如果均值更高但不满足这三条，就只能写成：
+
+- “数值上更高，但尚未获得统计显著性支持”
 - `实验四 > 实验三`
   说明当前 GPU 动态分支有实际贡献
 

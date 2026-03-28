@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -29,6 +30,11 @@ autocast_context: Any = None
 ccc: Any = None
 prepare_manifest_items_for_task: Any = None
 print_manifest_label_hist: Any = None
+build_paper_grade: Any = None
+build_run_contract: Any = None
+build_run_provenance: Any = None
+make_dataloader_worker_init_fn: Any = None
+make_torch_generator: Any = None
 resolve_ablation_flags: Any = None
 save_metrics_and_plots: Any = None
 set_seed: Any = None
@@ -68,6 +74,7 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from hf_compat import ensure_transformers_torch_compat
+from training_control import EarlyStopConfig, EarlyStopController
 
 
 def _lazy_runtime_imports() -> None:
@@ -76,6 +83,7 @@ def _lazy_runtime_imports() -> None:
     global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
     global autocast_context, ccc, prepare_manifest_items_for_task, print_manifest_label_hist
+    global build_paper_grade, build_run_contract, build_run_provenance, make_dataloader_worker_init_fn, make_torch_generator
     global resolve_ablation_flags, save_metrics_and_plots, set_seed, to_jsonable
     global write_best_val_inference_outputs, write_results_summary
     global build_validity_summary, filter_manifest_items_for_task, load_split_manifest
@@ -101,7 +109,12 @@ def _lazy_runtime_imports() -> None:
     from gpu_stream import GpuStreamConfig as _GpuStreamConfig, GpuStreamPreprocessor as _GpuStreamPreprocessor
     from mainline_utils import (
         autocast_context as _autocast_context,
+        build_paper_grade as _build_paper_grade,
+        build_run_contract as _build_run_contract,
+        build_run_provenance as _build_run_provenance,
         ccc as _ccc,
+        make_dataloader_worker_init_fn as _make_dataloader_worker_init_fn,
+        make_torch_generator as _make_torch_generator,
         prepare_manifest_items_for_task as _prepare_manifest_items_for_task,
         print_manifest_label_hist as _print_manifest_label_hist,
         resolve_ablation_flags as _resolve_ablation_flags,
@@ -151,7 +164,12 @@ def _lazy_runtime_imports() -> None:
     GpuStreamConfig = _GpuStreamConfig
     GpuStreamPreprocessor = _GpuStreamPreprocessor
     autocast_context = _autocast_context
+    build_paper_grade = _build_paper_grade
+    build_run_contract = _build_run_contract
+    build_run_provenance = _build_run_provenance
     ccc = _ccc
+    make_dataloader_worker_init_fn = _make_dataloader_worker_init_fn
+    make_torch_generator = _make_torch_generator
     prepare_manifest_items_for_task = _prepare_manifest_items_for_task
     print_manifest_label_hist = _print_manifest_label_hist
     resolve_ablation_flags = _resolve_ablation_flags
@@ -194,7 +212,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--monitor", type=str, default="val_f1", choices=["val_acc", "val_f1"])
-    p.add_argument("--early-stop-patience", type=int, default=4)
+    p.add_argument("--early-stop-patience", type=int, default=10)
+    p.add_argument("--early-stop-min-epochs", type=int, default=10)
+    p.add_argument("--early-stop-min-delta", type=float, default=0.002)
+    p.add_argument("--early-stop-after-lr-drops", type=int, default=2)
+    p.add_argument("--lr-scheduler", type=str, default="plateau", choices=["none", "plateau"])
+    p.add_argument("--lr-plateau-patience", type=int, default=4)
+    p.add_argument("--lr-plateau-factor", type=float, default=0.5)
+    p.add_argument("--lr-min", type=float, default=1e-6)
     p.add_argument("--output-dir", type=Path, default=Path("outputs/motion_prosody"))
     p.add_argument("--benchmark-tag", type=str, default="default")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -285,6 +310,22 @@ def _validate_compat_args(args: argparse.Namespace) -> None:
             raise RuntimeError(f"--{name.replace('_', '-')} is retired in gpu_stream-only training.")
     if bool(args.persistent_workers) or bool(args.pin_memory) or bool(args.amp):
         raise RuntimeError("Legacy performance toggles are retired; mainline training now resolves them automatically.")
+    if int(args.early_stop_patience) < 0:
+        raise RuntimeError("--early-stop-patience must be >= 0.")
+    if int(args.early_stop_min_epochs) < 0:
+        raise RuntimeError("--early-stop-min-epochs must be >= 0.")
+    if float(args.early_stop_min_delta) < 0.0:
+        raise RuntimeError("--early-stop-min-delta must be >= 0.")
+    if int(args.early_stop_after_lr_drops) < 0:
+        raise RuntimeError("--early-stop-after-lr-drops must be >= 0.")
+    if str(args.lr_scheduler) == "none" and int(args.early_stop_after_lr_drops) > 0:
+        raise RuntimeError("--early-stop-after-lr-drops requires --lr-scheduler plateau.")
+    if int(args.lr_plateau_patience) < 0:
+        raise RuntimeError("--lr-plateau-patience must be >= 0.")
+    if not 0.0 < float(args.lr_plateau_factor) < 1.0:
+        raise RuntimeError("--lr-plateau-factor must be in (0, 1).")
+    if float(args.lr_min) < 0.0:
+        raise RuntimeError("--lr-min must be >= 0.")
 
 
 def _load_tokenizer(model_name: str) -> Any:
@@ -294,6 +335,42 @@ def _load_tokenizer(model_name: str) -> Any:
     except Exception as e:
         raise RuntimeError("transformers is required for text-enabled training.") from e
     return AutoTokenizer.from_pretrained(str(model_name))
+
+
+def _current_lr(optimizer: Any) -> float:
+    param_groups = getattr(optimizer, "param_groups", [])
+    if not param_groups:
+        return 0.0
+    return float(param_groups[0].get("lr", 0.0))
+
+
+class NumericStabilityError(RuntimeError):
+    """Raised when a training batch or epoch produces non-finite values."""
+
+
+def _assert_finite_tensor(name: str, value: Any, *, phase: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, torch.Tensor):
+        if bool(torch.isfinite(value).all().item()):
+            return
+        raise NumericStabilityError(f"{phase}: non-finite tensor detected in {name}")
+    scalar = float(value)
+    if math.isfinite(scalar):
+        return
+    raise NumericStabilityError(f"{phase}: non-finite scalar detected in {name}: {scalar}")
+
+
+def _assert_finite_stats(name: str, stats: dict[str, Any]) -> None:
+    for key in ("loss", "accuracy", "macro_f1", "prepare_sec", "mse", "mae", "ccc"):
+        if key not in stats:
+            continue
+        value = stats.get(key, None)
+        if value is None:
+            continue
+        scalar = float(value)
+        if not math.isfinite(scalar):
+            raise NumericStabilityError(f"{name}: non-finite summary metric {key}={scalar}")
 
 
 def _run_phase(
@@ -394,6 +471,8 @@ def _run_phase(
                     audio_lens=audio_lens,
                 )
 
+            _assert_finite_tensor("logits", logits, phase=phase)
+            _assert_finite_tensor("pred_intensity", pred_intensity, phase=phase)
             loss = loss_fn(logits, labels)
             if bool(args.use_intensity):
                 intensity = batch["intensity"].to(torch.float32)
@@ -406,6 +485,7 @@ def _run_phase(
                     else:
                         reg_loss = torch.square(pred_f - gt_f).mean()
                     loss = loss + float(args.intensity_weight) * reg_loss
+            _assert_finite_tensor("loss", loss, phase=phase)
 
         if is_train:
             assert optimizer is not None
@@ -477,7 +557,7 @@ def _run_phase(
         mae = float(diff.abs().mean().item())
         ccc_value = ccc(rp, rt)
 
-    return {
+    stats = {
         "loss": float(loss_sum / max(1, total)),
         "accuracy": float(correct / max(1, total)),
         "macro_f1": float(summary.get("macro_f1", 0.0)),
@@ -489,6 +569,8 @@ def _run_phase(
         "mae": mae,
         "ccc": ccc_value,
     }
+    _assert_finite_stats(phase, stats)
+    return stats
 
 
 def main() -> None:
@@ -509,7 +591,7 @@ def main() -> None:
     args.zero_audio = bool(zero_audio)
     args.zero_text = bool(zero_text)
 
-    set_seed(int(args.seed))
+    deterministic_policy = set_seed(int(args.seed))
     profile = detect_runtime(args.device)
     device = select_device(args.device)
     resolved_amp_mode = resolve_amp_mode(str(args.amp_mode), profile)
@@ -528,6 +610,35 @@ def main() -> None:
     task_speaker_id = str(args.speaker_id).strip().upper() or None
     label_names = resolve_task_label_names(task_mode, task_speaker_id)
     validity_summary = build_validity_summary(manifest_summary, task_mode, task_speaker_id)
+    paper_grade_reasons: list[str] = []
+    if not bool(deterministic_policy.get("deterministic_algorithms_enabled", False)):
+        paper_grade_reasons.append("deterministic_algorithms_disabled")
+    if bool(deterministic_policy.get("cudnn_enabled", False)) and bool(deterministic_policy.get("cudnn_benchmark", False)):
+        paper_grade_reasons.append("cudnn_benchmark_enabled")
+    run_contract = build_run_contract(
+        split_manifest=split_manifest_path,
+        manifest_sha256=manifest_hash,
+        dataset_kind=dataset_kind,
+        task_mode=task_mode,
+        speaker_id=task_speaker_id,
+        text_policy=str(args.text_policy),
+        label_names=list(label_names),
+        validity_summary=validity_summary,
+        ablation=str(args.ablation),
+        zero_video=bool(args.zero_video),
+        zero_audio=bool(args.zero_audio),
+        zero_text=bool(args.zero_text),
+        use_intensity=bool(args.use_intensity),
+        video_backbone=str(args.video_backbone),
+        sample_rate=int(args.sample_rate),
+        max_audio_sec=float(args.max_audio_sec),
+        num_frames=int(args.num_frames),
+    )
+    run_provenance = build_run_provenance(
+        runtime_profile=profile.to_jsonable(),
+        deterministic_policy=deterministic_policy,
+        repo_root=Path(__file__).resolve().parent,
+    )
 
     train_items = prepare_manifest_items_for_task(
         filter_manifest_items_for_task(select_manifest_items(manifest, "train"), task_mode, task_speaker_id),
@@ -603,8 +714,22 @@ def main() -> None:
         if prefetch_factor is not None:
             dl_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
-    train_loader = DataLoader(train_ds, batch_size=int(resolved_batch_size), shuffle=True, **dl_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=int(resolved_batch_size), shuffle=False, **dl_kwargs)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(resolved_batch_size),
+        shuffle=True,
+        worker_init_fn=make_dataloader_worker_init_fn(int(args.seed)),
+        generator=make_torch_generator(int(args.seed)),
+        **dl_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=int(resolved_batch_size),
+        shuffle=False,
+        worker_init_fn=make_dataloader_worker_init_fn(int(args.seed) + 1000),
+        generator=make_torch_generator(int(args.seed) + 1000),
+        **dl_kwargs,
+    )
 
     model = FusionClassifier(
         num_classes=len(label_names),
@@ -629,6 +754,15 @@ def main() -> None:
     setattr(model, "_label_names", list(label_names))
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    scheduler = None
+    if str(args.lr_scheduler) == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=float(args.lr_plateau_factor),
+            patience=int(args.lr_plateau_patience),
+            min_lr=float(args.lr_min),
+        )
     loss_fn = torch.nn.CrossEntropyLoss()
 
     stream_preprocessor = GpuStreamPreprocessor(
@@ -668,6 +802,7 @@ def main() -> None:
                 "pin_memory": bool(device.type == "cuda"),
                 "pipeline": "gpu_stream",
                 "amp_mode": resolved_amp_mode,
+                "lr_scheduler": str(args.lr_scheduler),
             },
             ensure_ascii=False,
             indent=2,
@@ -685,6 +820,7 @@ def main() -> None:
         "val_loss": [],
         "val_acc": [],
         "val_f1": [],
+        "lr": [],
         "train_per_class_recall": [],
         "val_per_class_recall": [],
     }
@@ -702,53 +838,77 @@ def main() -> None:
             }
         )
 
+    early_stop = EarlyStopController(
+        EarlyStopConfig(
+            monitor_name=str(args.monitor),
+            monitor_mode="max",
+            patience=int(args.early_stop_patience),
+            min_epochs=int(args.early_stop_min_epochs),
+            min_delta=float(args.early_stop_min_delta),
+            tie_break_name="val_loss",
+            tie_break_mode="min",
+            after_lr_drops=int(args.early_stop_after_lr_drops),
+        )
+    )
     best_epoch = 0
     best_acc = 0.0
     best_f1 = 0.0
-    best_monitor_value = float("-inf")
+    best_val_loss = 0.0
+    best_monitor_value = 0.0
+    significant_best_monitor_value = float("-inf")
+    best_checkpoint_reason = ""
     best_val_summary: dict[str, Any] = {}
     best_train_summary: dict[str, Any] = {}
     best_val_records: list[dict[str, Any]] = []
-    epochs_without_improvement = 0
     final_epoch = 0
+    stop_reason = ""
+    run_status = "completed"
 
     for epoch in range(1, int(args.epochs) + 1):
         final_epoch = int(epoch)
-        train_stats = _run_phase(
-            phase=f"Epoch {epoch}/{args.epochs} [train]",
-            model=model,
-            loader=train_loader,
-            preprocessor=stream_preprocessor,
-            tokenizer=tokenizer,
-            args=args,
-            device=device,
-            amp_mode=resolved_amp_mode,
-            loss_fn=loss_fn,
-            optimizer=opt,
-            scaler=scaler,
-            prosody_cfg=prosody_cfg,
-            aug_cfg=aug_cfg,
-        )
-        val_stats = _run_phase(
-            phase=f"Epoch {epoch}/{args.epochs} [val]",
-            model=model,
-            loader=val_loader,
-            preprocessor=stream_preprocessor,
-            tokenizer=tokenizer,
-            args=args,
-            device=device,
-            amp_mode=resolved_amp_mode,
-            loss_fn=loss_fn,
-            optimizer=None,
-            scaler=None,
-            prosody_cfg=prosody_cfg,
-            aug_cfg=aug_cfg,
-        )
+        epoch_lr = _current_lr(opt)
+        try:
+            train_stats = _run_phase(
+                phase=f"Epoch {epoch}/{args.epochs} [train]",
+                model=model,
+                loader=train_loader,
+                preprocessor=stream_preprocessor,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                amp_mode=resolved_amp_mode,
+                loss_fn=loss_fn,
+                optimizer=opt,
+                scaler=scaler,
+                prosody_cfg=prosody_cfg,
+                aug_cfg=aug_cfg,
+            )
+            val_stats = _run_phase(
+                phase=f"Epoch {epoch}/{args.epochs} [val]",
+                model=model,
+                loader=val_loader,
+                preprocessor=stream_preprocessor,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                amp_mode=resolved_amp_mode,
+                loss_fn=loss_fn,
+                optimizer=None,
+                scaler=None,
+                prosody_cfg=prosody_cfg,
+                aug_cfg=aug_cfg,
+            )
+        except NumericStabilityError as exc:
+            run_status = "failed_numeric"
+            stop_reason = f"failed_numeric: {exc}"
+            paper_grade_reasons.append("numeric_failure")
+            print(f"Stopping training due to numeric instability: {exc}", flush=True)
+            break
 
         print(
             "Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
             "val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} "
-            "train_prepare_s={train_prepare:.2f} val_prepare_s={val_prepare:.2f}".format(
+            "lr={lr:.2e} train_prepare_s={train_prepare:.2f} val_prepare_s={val_prepare:.2f}".format(
                 epoch=epoch,
                 train_loss=train_stats["loss"],
                 train_acc=train_stats["accuracy"],
@@ -756,6 +916,7 @@ def main() -> None:
                 val_loss=val_stats["loss"],
                 val_acc=val_stats["accuracy"],
                 val_f1=val_stats["macro_f1"],
+                lr=epoch_lr,
                 train_prepare=train_stats["prepare_sec"],
                 val_prepare=val_stats["prepare_sec"],
             ),
@@ -783,6 +944,7 @@ def main() -> None:
         history["val_loss"].append(float(val_stats["loss"]))
         history["val_acc"].append(float(val_stats["accuracy"]))
         history["val_f1"].append(float(val_stats["macro_f1"]))
+        history["lr"].append(float(epoch_lr))
         history["train_per_class_recall"].append(dict(train_stats["class_summary"].get("per_class_recall", {})))
         history["val_per_class_recall"].append(dict(val_stats["class_summary"].get("per_class_recall", {})))
         if bool(args.use_intensity):
@@ -796,16 +958,24 @@ def main() -> None:
             history["val_intensity_n"].append(float(val_stats["intensity_n"]))
 
         monitor_value = float(val_stats["macro_f1"] if str(args.monitor) == "val_f1" else val_stats["accuracy"])
-        improved = bool(best_epoch == 0 or monitor_value > best_monitor_value)
-        if improved:
+        decision = early_stop.observe(
+            epoch=epoch,
+            monitor_value=monitor_value,
+            tie_break_value=float(val_stats["loss"]),
+        )
+        if decision.should_save_checkpoint:
             best_epoch = int(epoch)
             best_acc = float(val_stats["accuracy"])
             best_f1 = float(val_stats["macro_f1"])
             best_monitor_value = float(monitor_value)
+            best_val_loss = float(val_stats["loss"])
+            best_checkpoint_reason = str(decision.checkpoint_reason or "")
+            significant_best_monitor_value = float(
+                early_stop.best_monitor_value if early_stop.best_monitor_value is not None else monitor_value
+            )
             best_train_summary = dict(train_stats["class_summary"])
             best_val_summary = dict(val_stats["class_summary"])
             best_val_records = list(val_stats["records"])
-            epochs_without_improvement = 0
             ckpt = {
                 "model": model.state_dict(),
                 "epoch": int(epoch),
@@ -813,6 +983,9 @@ def main() -> None:
                 "best_f1": float(best_f1),
                 "best_monitor_name": str(args.monitor),
                 "best_monitor_value": float(best_monitor_value),
+                "significant_best_monitor_value": float(significant_best_monitor_value),
+                "best_val_loss": float(best_val_loss),
+                "checkpoint_reason": str(best_checkpoint_reason),
                 "args": to_jsonable(vars(args)),
                 "label_names": list(label_names),
                 "task_mode": task_mode,
@@ -837,6 +1010,10 @@ def main() -> None:
                 "zero_audio": bool(args.zero_audio),
                 "zero_text": bool(args.zero_text),
                 "best_val_summary": best_val_summary,
+                "paper_contract": run_contract,
+                "provenance": run_provenance,
+                "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
+                "run_status": str(run_status),
             }
             torch.save(ckpt, out_dir / "checkpoints" / "best.pt")
 
@@ -855,6 +1032,9 @@ def main() -> None:
                 "skipped": 0,
                 "accuracy_on_ok": float(best_acc),
                 "macro_f1_on_ok": float(best_f1),
+                "loss_on_ok": float(best_val_loss),
+                "best_epoch": int(best_epoch),
+                "checkpoint_reason": str(best_checkpoint_reason),
                 "per_class_recall": best_val_summary.get("per_class_recall", {}),
                 "confusion_matrix": best_val_summary.get("confusion_matrix", []),
                 "support": best_val_summary.get("support", {}),
@@ -865,49 +1045,103 @@ def main() -> None:
                 "speaker_majority_baseline": speaker_baseline,
                 "speaker_only_baseline": speaker_only,
                 "pipeline": "gpu_stream",
+                "paper_contract": run_contract,
+                "provenance": run_provenance,
+                "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
+                "run_status": str(run_status),
             }
             write_best_val_inference_outputs(out_dir, records=best_val_records, metrics_summary=val_metrics_summary)
             print(f"Saved best checkpoint -> {out_dir / 'checkpoints' / 'best.pt'}", flush=True)
-        else:
-            epochs_without_improvement += 1
 
-        if int(args.early_stop_patience) > 0 and epochs_without_improvement >= int(args.early_stop_patience):
+        if scheduler is not None:
+            lr_before_step = _current_lr(opt)
+            scheduler.step(float(val_stats["loss"]))
+            lr_after_step = _current_lr(opt)
+            if lr_after_step + 1.0e-12 < lr_before_step:
+                early_stop.register_lr_drop(epoch)
+                print(
+                    f"LR reduced at epoch {epoch}: {lr_before_step:.2e} -> {lr_after_step:.2e}",
+                    flush=True,
+                )
+
+        should_stop, stop_reason_candidate = early_stop.evaluate_stop(epoch)
+        if should_stop:
+            stop_reason = str(stop_reason_candidate or "")
             print(
-                f"Early stopping at epoch {epoch}: no improvement on {args.monitor} for {epochs_without_improvement} epoch(s).",
+                f"Early stopping at epoch {epoch}: {stop_reason}",
                 flush=True,
             )
             break
 
-    last_ckpt = {
-        "model": model.state_dict(),
-        "epoch": int(final_epoch),
-        "best_acc": float(best_acc),
-        "best_f1": float(best_f1),
-        "best_monitor_name": str(args.monitor),
-        "best_monitor_value": float(best_monitor_value if best_monitor_value != float("-inf") else 0.0),
-        "args": to_jsonable(vars(args)),
-        "label_names": list(label_names),
-        "task_mode": task_mode,
-        "speaker_id": task_speaker_id,
-        "text_policy": str(args.text_policy),
-        "validity": validity_summary,
-        "resolved_runtime": {
-            "device": str(device),
-            "profile": profile.to_jsonable(),
-            "batch_size": int(resolved_batch_size),
-            "num_workers": int(resolved_num_workers),
-            "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
-            "amp_mode": resolved_amp_mode,
-            "pipeline": "gpu_stream",
-        },
-    }
-    torch.save(last_ckpt, out_dir / "checkpoints" / "last.pt")
+    if not stop_reason:
+        stop_reason = "max_epochs_reached"
+
+    paper_grade = build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons)
+    best_ckpt_path = out_dir / "checkpoints" / "best.pt"
+    if best_ckpt_path.is_file() and not bool(paper_grade.get("eligible", False)):
+        best_ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(best_ckpt, dict):
+            best_ckpt["paper_grade"] = paper_grade
+            best_ckpt["run_status"] = str(run_status)
+            torch.save(best_ckpt, best_ckpt_path)
+    best_val_metrics_path = out_dir / "inference_val.metrics.json"
+    if best_val_metrics_path.is_file() and not bool(paper_grade.get("eligible", False)):
+        best_val_metrics = json.loads(best_val_metrics_path.read_text(encoding="utf-8"))
+        if isinstance(best_val_metrics, dict):
+            best_val_metrics["paper_grade"] = paper_grade
+            best_val_metrics["run_status"] = str(run_status)
+            best_val_metrics_path.write_text(
+                json.dumps(best_val_metrics, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    if run_status != "failed_numeric":
+        last_ckpt = {
+            "model": model.state_dict(),
+            "epoch": int(final_epoch),
+            "best_acc": float(best_acc),
+            "best_f1": float(best_f1),
+            "best_monitor_name": str(args.monitor),
+            "best_monitor_value": float(best_monitor_value),
+            "significant_best_monitor_value": float(
+                significant_best_monitor_value if significant_best_monitor_value != float("-inf") else 0.0
+            ),
+            "best_val_loss": float(best_val_loss),
+            "checkpoint_reason": str(best_checkpoint_reason),
+            "args": to_jsonable(vars(args)),
+            "label_names": list(label_names),
+            "task_mode": task_mode,
+            "speaker_id": task_speaker_id,
+            "text_policy": str(args.text_policy),
+            "validity": validity_summary,
+            "resolved_runtime": {
+                "device": str(device),
+                "profile": profile.to_jsonable(),
+                "batch_size": int(resolved_batch_size),
+                "num_workers": int(resolved_num_workers),
+                "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+                "amp_mode": resolved_amp_mode,
+                "pipeline": "gpu_stream",
+            },
+            "stop": {
+                "epoch": int(final_epoch),
+                "reason": str(stop_reason),
+                "epochs_without_improvement": int(early_stop.epochs_without_improvement),
+                "lr_drop_epochs": list(early_stop.lr_drop_epochs),
+            },
+            "paper_contract": run_contract,
+            "provenance": run_provenance,
+            "paper_grade": paper_grade,
+            "run_status": str(run_status),
+        }
+        torch.save(last_ckpt, out_dir / "checkpoints" / "last.pt")
 
     metrics_payload: dict[str, Any] = dict(history)
     metrics_payload["meta"] = {
         "benchmark_tag": str(args.benchmark_tag),
         "split_manifest": str(split_manifest_path),
         "manifest_sha256": manifest_hash,
+        "dataset_kind": dataset_kind,
         "task_mode": task_mode,
         "speaker_id": task_speaker_id,
         "text_policy": str(args.text_policy),
@@ -925,19 +1159,37 @@ def main() -> None:
         "resolved_num_workers": int(resolved_num_workers),
         "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
         "amp_mode": resolved_amp_mode,
+        "lr_scheduler": str(args.lr_scheduler),
         "pipeline": "gpu_stream",
         "manifest_summary": manifest_summary,
+        "paper_protocol_version": str(run_contract.get("protocol_version")),
+        "deterministic_policy": deterministic_policy,
+        "paper_contract": run_contract,
     }
     metrics_payload["best"] = {
         "epoch": int(best_epoch),
         "best_acc": float(best_acc),
         "best_f1": float(best_f1),
+        "best_val_loss": float(best_val_loss),
         "best_monitor_name": str(args.monitor),
-        "best_monitor_value": float(best_monitor_value if best_monitor_value != float("-inf") else 0.0),
+        "best_monitor_value": float(best_monitor_value),
+        "significant_best_monitor_value": float(
+            significant_best_monitor_value if significant_best_monitor_value != float("-inf") else 0.0
+        ),
+        "checkpoint_reason": str(best_checkpoint_reason),
         "best_train_summary": best_train_summary,
         "best_val_summary": best_val_summary,
     }
+    metrics_payload["stop"] = {
+        "epoch": int(final_epoch),
+        "reason": str(stop_reason),
+        "epochs_without_improvement": int(early_stop.epochs_without_improvement),
+        "lr_drop_epochs": list(early_stop.lr_drop_epochs),
+    }
     metrics_payload["validity"] = validity_summary
+    metrics_payload["provenance"] = run_provenance
+    metrics_payload["paper_grade"] = paper_grade
+    metrics_payload["run_status"] = str(run_status)
     if speaker_baseline is not None:
         metrics_payload["speaker_majority_baseline"] = speaker_baseline
     if speaker_only is not None:
@@ -945,7 +1197,10 @@ def main() -> None:
 
     save_metrics_and_plots(out_dir, metrics_payload)
     write_results_summary(out_dir, metrics_payload)
-    print(f"Best val macro_f1={best_f1:.4f}, acc={best_acc:.4f}, epoch={best_epoch}", flush=True)
+    print(
+        f"Best val macro_f1={best_f1:.4f}, acc={best_acc:.4f}, epoch={best_epoch}, stop_reason={stop_reason}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

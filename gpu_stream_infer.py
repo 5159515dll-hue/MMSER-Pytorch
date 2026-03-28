@@ -20,9 +20,15 @@ collate_manifest_items: Any = None
 GpuStreamConfig: Any = None
 GpuStreamPreprocessor: Any = None
 autocast_context: Any = None
+build_paper_grade: Any = None
+build_run_contract: Any = None
+build_run_provenance: Any = None
 ccc: Any = None
+make_dataloader_worker_init_fn: Any = None
+make_torch_generator: Any = None
 prepare_manifest_items_for_task: Any = None
 resolve_ablation_flags: Any = None
+set_seed: Any = None
 EMOTIONS: Any = None
 build_validity_summary: Any = None
 filter_manifest_items_for_task: Any = None
@@ -61,7 +67,8 @@ def _lazy_runtime_imports() -> None:
     global torch, DataLoader, tqdm
     global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
-    global autocast_context, ccc, prepare_manifest_items_for_task, resolve_ablation_flags
+    global autocast_context, build_paper_grade, build_run_contract, build_run_provenance, ccc
+    global make_dataloader_worker_init_fn, make_torch_generator, prepare_manifest_items_for_task, resolve_ablation_flags, set_seed
     global EMOTIONS, build_validity_summary, filter_manifest_items_for_task, load_split_manifest
     global manifest_sha256, map_label_to_task_index, resolve_task_label_names, resolve_task_mode, select_manifest_items
     global classification_summary, speaker_majority_baseline, speaker_only_baseline
@@ -84,9 +91,15 @@ def _lazy_runtime_imports() -> None:
     from gpu_stream import GpuStreamConfig as _GpuStreamConfig, GpuStreamPreprocessor as _GpuStreamPreprocessor
     from mainline_utils import (
         autocast_context as _autocast_context,
+        build_paper_grade as _build_paper_grade,
+        build_run_contract as _build_run_contract,
+        build_run_provenance as _build_run_provenance,
         ccc as _ccc,
+        make_dataloader_worker_init_fn as _make_dataloader_worker_init_fn,
+        make_torch_generator as _make_torch_generator,
         prepare_manifest_items_for_task as _prepare_manifest_items_for_task,
         resolve_ablation_flags as _resolve_ablation_flags,
+        set_seed as _set_seed,
     )
     from manifest_utils import (
         EMOTIONS as _EMOTIONS,
@@ -125,9 +138,15 @@ def _lazy_runtime_imports() -> None:
     GpuStreamConfig = _GpuStreamConfig
     GpuStreamPreprocessor = _GpuStreamPreprocessor
     autocast_context = _autocast_context
+    build_paper_grade = _build_paper_grade
+    build_run_contract = _build_run_contract
+    build_run_provenance = _build_run_provenance
     ccc = _ccc
+    make_dataloader_worker_init_fn = _make_dataloader_worker_init_fn
+    make_torch_generator = _make_torch_generator
     prepare_manifest_items_for_task = _prepare_manifest_items_for_task
     resolve_ablation_flags = _resolve_ablation_flags
+    set_seed = _set_seed
     EMOTIONS = _EMOTIONS
     build_validity_summary = _build_validity_summary
     filter_manifest_items_for_task = _filter_manifest_items_for_task
@@ -166,14 +185,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ablation",
         type=str,
-        default="full",
+        default="",
         choices=["full", "text-only", "audio-only", "video-only", "no-text", "no-audio", "no-video"],
     )
-    p.add_argument("--num-frames", type=int, default=64)
+    p.add_argument("--num-frames", type=int, default=None)
     p.add_argument("--flow-size", type=int, default=112, help=argparse.SUPPRESS)
     p.add_argument("--rgb-size", type=int, default=224, help=argparse.SUPPRESS)
-    p.add_argument("--sample-rate", type=int, default=24000)
-    p.add_argument("--max-audio-sec", type=float, default=6.0)
+    p.add_argument("--sample-rate", type=int, default=None)
+    p.add_argument("--max-audio-sec", type=float, default=None)
     p.add_argument("--audio-backend", type=str, default="auto", choices=["auto", "torchaudio", "soundfile"], help=argparse.SUPPRESS)
     p.add_argument("--video-decode-backend", type=str, default="auto", choices=["auto", "decord", "cpu"], help=argparse.SUPPRESS)
     p.add_argument("--flow-backend", type=str, default="torch_motion", choices=["torch_motion", "legacy"], help=argparse.SUPPRESS)
@@ -192,6 +211,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--audio-model", type=str, default="", help=argparse.SUPPRESS)
     p.add_argument("--audio-model-revision", type=str, default="", help=argparse.SUPPRESS)
     p.add_argument("--video-model", type=str, default="", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--allow-incompatible-checkpoint",
+        action="store_true",
+        help="Allow evaluation with checkpoint/manifest/config mismatches. Outputs are marked paper-grade ineligible.",
+    )
 
     # Hidden compatibility args.
     p.add_argument("--zero-video", action="store_true", help=argparse.SUPPRESS)
@@ -230,6 +254,89 @@ def _validate_compat_args(args: argparse.Namespace) -> None:
         args.no_progress = True
 
 
+def _normalize_optional_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_optional_upper(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    return text or None
+
+
+def _raise_or_record_mismatch(
+    *,
+    field: str,
+    expected: Any,
+    actual: Any,
+    reasons: list[str],
+    allow_mismatch: bool,
+) -> None:
+    if expected == actual:
+        return
+    message = f"{field} mismatch: expected {expected!r}, got {actual!r}"
+    if not allow_mismatch:
+        raise RuntimeError(message)
+    print(f"WARNING: {message}", flush=True)
+    reasons.append(f"{field}_mismatch")
+
+
+def _checkpoint_run_contract(
+    ckpt: dict[str, Any],
+    *,
+    ckpt_args: dict[str, Any],
+    label_names: list[str],
+    validity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    contract = ckpt.get("paper_contract", {})
+    if isinstance(contract, dict) and contract:
+        return dict(contract)
+    split_manifest_raw = ckpt.get("split_manifest", "")
+    return build_run_contract(
+        split_manifest=Path(str(split_manifest_raw or ".")),
+        manifest_sha256=str(ckpt.get("manifest_sha256", "") or ""),
+        dataset_kind=str(ckpt.get("dataset_kind", "") or ""),
+        task_mode=str(ckpt.get("task_mode", ckpt_args.get("task_mode", "confounded_7way")) or "confounded_7way"),
+        speaker_id=_normalize_optional_upper(ckpt.get("speaker_id", ckpt_args.get("speaker_id", ""))),
+        text_policy=str(ckpt.get("text_policy", ckpt_args.get("text_policy", "full")) or "full"),
+        label_names=list(label_names),
+        validity_summary=validity or {},
+        ablation=str(ckpt.get("ablation", ckpt_args.get("ablation", "full")) or "full"),
+        zero_video=bool(ckpt.get("zero_video", ckpt_args.get("zero_video", False))),
+        zero_audio=bool(ckpt.get("zero_audio", ckpt_args.get("zero_audio", False))),
+        zero_text=bool(ckpt.get("zero_text", ckpt_args.get("zero_text", False))),
+        use_intensity=bool(ckpt_args.get("use_intensity", False)),
+        video_backbone=str(ckpt_args.get("video_backbone", "dual") or "dual"),
+        sample_rate=int(ckpt_args.get("sample_rate", 24000) or 24000),
+        max_audio_sec=float(ckpt_args.get("max_audio_sec", 6.0) or 6.0),
+        num_frames=int(ckpt_args.get("num_frames", 64) or 64),
+    )
+
+
+def _checkpoint_provenance(ckpt: dict[str, Any], *, deterministic_policy: dict[str, Any], profile: Any) -> dict[str, Any]:
+    provenance = ckpt.get("provenance", {})
+    if isinstance(provenance, dict) and provenance:
+        return dict(provenance)
+    runtime_profile = profile.to_jsonable() if hasattr(profile, "to_jsonable") else dict(profile or {})
+    return build_run_provenance(
+        runtime_profile=runtime_profile,
+        deterministic_policy=deterministic_policy,
+        repo_root=Path(__file__).resolve().parent,
+    )
+
+
+def _assert_finite_tensor(name: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, torch.Tensor):
+        if bool(torch.isfinite(value).all().item()):
+            return
+        raise RuntimeError(f"non-finite tensor detected in {name}")
+    scalar = float(value)
+    if scalar == scalar and scalar not in {float("inf"), float("-inf")}:
+        return
+    raise RuntimeError(f"non-finite scalar detected in {name}: {scalar}")
+
+
 def _load_tokenizer(model_name: str) -> Any:
     try:
         ensure_transformers_torch_compat()
@@ -244,13 +351,26 @@ def _load_model(
     *,
     device: torch.device,
     args: argparse.Namespace,
-) -> tuple[FusionClassifier, bool, list[str], str, str | None, str, dict[str, Any] | None]:
+) -> tuple[
+    FusionClassifier,
+    bool,
+    list[str],
+    str,
+    str | None,
+    str,
+    dict[str, Any] | None,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    list[str],
+]:
     _lazy_runtime_imports()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     label_names = [str(x) for x in ckpt.get("label_names", [])] if isinstance(ckpt, dict) and isinstance(ckpt.get("label_names"), list) else list(EMOTIONS)
     validity = ckpt.get("validity", None) if isinstance(ckpt, dict) and isinstance(ckpt.get("validity"), dict) else None
+    compatibility_reasons: list[str] = []
 
     text_model = str(ckpt_args.get("text_model", "") or "xlm-roberta-large")
     audio_model = str(ckpt_args.get("audio_model", "") or "microsoft/wavlm-large")
@@ -264,23 +384,73 @@ def _load_model(
     modality_dropout = float(ckpt_args.get("modality_dropout", 0.0) or 0.0)
     use_intensity = bool(ckpt_args.get("use_intensity", False))
     task_mode = str(ckpt_args.get("task_mode", "") or "confounded_7way")
-    task_speaker_id = str(ckpt_args.get("speaker_id", "") or "").strip().upper() or None
+    task_speaker_id = _normalize_optional_upper(ckpt_args.get("speaker_id", ""))
     text_policy = str(ckpt_args.get("text_policy", "") or "full")
 
-    if str(args.text_model).strip():
-        text_model = str(args.text_model).strip()
-    if str(args.audio_model).strip():
-        audio_model = str(args.audio_model).strip()
-    if str(args.audio_model_revision).strip():
-        audio_model_revision = str(args.audio_model_revision).strip()
-    if str(args.video_model).strip():
-        video_model = str(args.video_model).strip()
-    if str(args.task_mode).strip():
-        task_mode = str(args.task_mode).strip()
-    if str(args.speaker_id).strip():
-        task_speaker_id = str(args.speaker_id).strip().upper()
-    if str(args.text_policy).strip():
-        text_policy = str(args.text_policy).strip()
+    _raise_or_record_mismatch(
+        field="text_model",
+        expected=text_model,
+        actual=_normalize_optional_text(args.text_model) or text_model,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="audio_model",
+        expected=audio_model,
+        actual=_normalize_optional_text(args.audio_model) or audio_model,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="audio_model_revision",
+        expected=audio_model_revision,
+        actual=_normalize_optional_text(args.audio_model_revision) or audio_model_revision,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="video_model",
+        expected=video_model,
+        actual=_normalize_optional_text(args.video_model) or video_model,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="task_mode",
+        expected=task_mode,
+        actual=_normalize_optional_text(args.task_mode) or task_mode,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="speaker_id",
+        expected=task_speaker_id,
+        actual=_normalize_optional_upper(args.speaker_id) or task_speaker_id,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="text_policy",
+        expected=text_policy,
+        actual=_normalize_optional_text(args.text_policy) or text_policy,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+
+    if _normalize_optional_text(args.text_model):
+        text_model = _normalize_optional_text(args.text_model)
+    if _normalize_optional_text(args.audio_model):
+        audio_model = _normalize_optional_text(args.audio_model)
+    if _normalize_optional_text(args.audio_model_revision):
+        audio_model_revision = _normalize_optional_text(args.audio_model_revision)
+    if _normalize_optional_text(args.video_model):
+        video_model = _normalize_optional_text(args.video_model)
+    if _normalize_optional_text(args.task_mode):
+        task_mode = _normalize_optional_text(args.task_mode)
+    if _normalize_optional_upper(args.speaker_id) is not None:
+        task_speaker_id = _normalize_optional_upper(args.speaker_id)
+    if _normalize_optional_text(args.text_policy):
+        text_policy = _normalize_optional_text(args.text_policy)
 
     task_mode = resolve_task_mode(task_mode)
     text_policy = resolve_text_policy(text_policy)
@@ -288,6 +458,26 @@ def _load_model(
         label_names = resolve_task_label_names(task_mode, task_speaker_id)
     if validity is None or str(validity.get("task_mode", "")).strip().lower() != task_mode:
         validity = build_validity_summary({}, task_mode, task_speaker_id)
+    checkpoint_contract = _checkpoint_run_contract(
+        ckpt if isinstance(ckpt, dict) else {},
+        ckpt_args=ckpt_args if isinstance(ckpt_args, dict) else {},
+        label_names=label_names,
+        validity=validity,
+    )
+    checkpoint_paper_grade = ckpt.get("paper_grade", {}) if isinstance(ckpt, dict) and isinstance(ckpt.get("paper_grade"), dict) else {}
+    if not isinstance(checkpoint_paper_grade, dict) or not checkpoint_paper_grade:
+        checkpoint_paper_grade = build_paper_grade(
+            validity_summary=validity or {},
+            ineligibility_reasons=["missing_checkpoint_paper_grade"],
+        )
+    if not bool(checkpoint_paper_grade.get("eligible", False)):
+        _raise_or_record_mismatch(
+            field="checkpoint_paper_grade",
+            expected=True,
+            actual=bool(checkpoint_paper_grade.get("eligible", False)),
+            reasons=compatibility_reasons,
+            allow_mismatch=bool(args.allow_incompatible_checkpoint),
+        )
 
     model = FusionClassifier(
         num_classes=len(label_names),
@@ -309,15 +499,37 @@ def _load_model(
         modality_dropout=modality_dropout,
         intensity_head=bool(use_intensity),
     )
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"WARNING: missing checkpoint keys: {missing[:6]}" + (" ..." if len(missing) > 6 else ""), flush=True)
-    if unexpected:
-        print(f"WARNING: unexpected checkpoint keys: {unexpected[:6]}" + (" ..." if len(unexpected) > 6 else ""), flush=True)
+    if bool(args.allow_incompatible_checkpoint):
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"WARNING: missing checkpoint keys: {missing[:6]}" + (" ..." if len(missing) > 6 else ""), flush=True)
+            compatibility_reasons.append("checkpoint_missing_keys")
+        if unexpected:
+            print(f"WARNING: unexpected checkpoint keys: {unexpected[:6]}" + (" ..." if len(unexpected) > 6 else ""), flush=True)
+            compatibility_reasons.append("checkpoint_unexpected_keys")
+    else:
+        model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
     setattr(model, "_label_names", list(label_names))
-    return model, bool(use_intensity), label_names, task_mode, task_speaker_id, text_policy, validity
+    checkpoint_provenance = _checkpoint_provenance(
+        ckpt if isinstance(ckpt, dict) else {},
+        deterministic_policy={"seed": 0, "deterministic_requested": True},
+        profile={},
+    )
+    return (
+        model,
+        bool(use_intensity),
+        label_names,
+        task_mode,
+        task_speaker_id,
+        text_policy,
+        validity,
+        checkpoint_contract,
+        checkpoint_paper_grade,
+        checkpoint_provenance,
+        compatibility_reasons,
+    )
 
 
 def _truncate_text(text: str, max_len: int) -> str:
@@ -371,7 +583,10 @@ def _infer_batch(
         else:
             logits = logits_or_pair
             pred_intensity = None
+    _assert_finite_tensor("logits", logits)
+    _assert_finite_tensor("pred_intensity", pred_intensity)
     probs = torch.softmax(logits, dim=1)
+    _assert_finite_tensor("probabilities", probs)
     pred = logits.argmax(dim=1)
     pred_probs = probs.gather(1, pred.view(-1, 1)).squeeze(1).detach().cpu().tolist()
     labels_cpu = labels.detach().cpu().tolist()
@@ -408,16 +623,7 @@ def main() -> None:
     args = parse_args()
     _validate_compat_args(args)
     _lazy_runtime_imports()
-
-    zero_video, zero_audio, zero_text = resolve_ablation_flags(
-        ablation=str(args.ablation),
-        zero_video=bool(args.zero_video),
-        zero_audio=bool(args.zero_audio),
-        zero_text=bool(args.zero_text),
-    )
-    args.zero_video = bool(zero_video)
-    args.zero_audio = bool(zero_audio)
-    args.zero_text = bool(zero_text)
+    deterministic_policy = set_seed(0)
 
     split_manifest_path = args.split_manifest.expanduser()
     ckpt_path = args.checkpoint.expanduser()
@@ -426,26 +632,148 @@ def main() -> None:
         raise FileNotFoundError(f"Split manifest not found: {split_manifest_path}")
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    if ckpt_path.name != "best.pt" and not bool(args.allow_incompatible_checkpoint):
+        raise RuntimeError(f"checkpoint must point to best.pt for paper-grade evaluation, got: {ckpt_path.name}")
 
     profile = detect_runtime(str(args.device))
     device = select_device(str(args.device))
     resolved_amp_mode = resolve_amp_mode(str(args.amp_mode), profile)
     print(f"Using device: {device}", flush=True)
 
-    model, use_intensity, label_names, task_mode, task_speaker_id, text_policy, validity = _load_model(
+    (
+        model,
+        use_intensity,
+        label_names,
+        task_mode,
+        task_speaker_id,
+        text_policy,
+        validity,
+        checkpoint_contract,
+        checkpoint_paper_grade,
+        checkpoint_provenance,
+        compatibility_reasons,
+    ) = _load_model(
         ckpt_path,
         device=device,
         args=args,
     )
+    paper_grade_reasons = list(compatibility_reasons)
+    if bool(args.allow_incompatible_checkpoint):
+        paper_grade_reasons.append("allow_incompatible_checkpoint_enabled")
+    if ckpt_path.name != "best.pt":
+        paper_grade_reasons.append("checkpoint_name_mismatch")
+    args.ablation = _normalize_optional_text(args.ablation) or str(checkpoint_contract.get("ablation", "full") or "full")
+    args.sample_rate = int(args.sample_rate if args.sample_rate is not None else checkpoint_contract.get("sample_rate", 24000))
+    args.max_audio_sec = float(
+        args.max_audio_sec if args.max_audio_sec is not None else checkpoint_contract.get("max_audio_sec", 6.0)
+    )
+    args.num_frames = int(args.num_frames if args.num_frames is not None else checkpoint_contract.get("num_frames", 64))
+    _raise_or_record_mismatch(
+        field="ablation",
+        expected=checkpoint_contract.get("ablation"),
+        actual=str(args.ablation),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="sample_rate",
+        expected=int(checkpoint_contract.get("sample_rate", args.sample_rate)),
+        actual=int(args.sample_rate),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="max_audio_sec",
+        expected=float(checkpoint_contract.get("max_audio_sec", args.max_audio_sec)),
+        actual=float(args.max_audio_sec),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="num_frames",
+        expected=int(checkpoint_contract.get("num_frames", args.num_frames)),
+        actual=int(args.num_frames),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    zero_video, zero_audio, zero_text = resolve_ablation_flags(
+        ablation=str(args.ablation),
+        zero_video=bool(args.zero_video),
+        zero_audio=bool(args.zero_audio),
+        zero_text=bool(args.zero_text),
+    )
+    _raise_or_record_mismatch(
+        field="zero_video",
+        expected=bool(checkpoint_contract.get("zero_video", zero_video)),
+        actual=bool(zero_video),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="zero_audio",
+        expected=bool(checkpoint_contract.get("zero_audio", zero_audio)),
+        actual=bool(zero_audio),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="zero_text",
+        expected=bool(checkpoint_contract.get("zero_text", zero_text)),
+        actual=bool(zero_text),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    args.zero_video = bool(zero_video)
+    args.zero_audio = bool(zero_audio)
+    args.zero_text = bool(zero_text)
     if str(text_policy) == "drop":
         args.zero_text = True
+    inference_provenance = build_run_provenance(
+        runtime_profile=profile.to_jsonable(),
+        deterministic_policy=deterministic_policy,
+        repo_root=Path(__file__).resolve().parent,
+    )
 
     manifest = load_split_manifest(split_manifest_path)
     manifest_hash = manifest_sha256(split_manifest_path)
     manifest_summary = manifest.get("summary", {})
     dataset_kind = str(manifest.get("dataset_kind", "") or "")
-    if validity is None:
-        validity = build_validity_summary(manifest_summary, task_mode, task_speaker_id)
+    validity = build_validity_summary(manifest_summary, task_mode, task_speaker_id)
+    _raise_or_record_mismatch(
+        field="dataset_kind",
+        expected=str(checkpoint_contract.get("dataset_kind", dataset_kind)),
+        actual=dataset_kind,
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="manifest_sha256",
+        expected=str(checkpoint_contract.get("manifest_sha256", manifest_hash)),
+        actual=manifest_hash,
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="label_names",
+        expected=list(checkpoint_contract.get("label_names", label_names)),
+        actual=list(label_names),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="claim_scope",
+        expected=str(checkpoint_contract.get("claim_scope", validity.get("claim_scope", ""))),
+        actual=str(validity.get("claim_scope", "")),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="scientific_validity",
+        expected=bool(checkpoint_contract.get("scientific_validity", validity.get("scientific_validity", False))),
+        actual=bool(validity.get("scientific_validity", False)),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
 
     items = prepare_manifest_items_for_task(
         filter_manifest_items_for_task(select_manifest_items(manifest, args.subset), task_mode, task_speaker_id),
@@ -502,7 +830,14 @@ def main() -> None:
         dl_kwargs["persistent_workers"] = True
         if prefetch_factor is not None:
             dl_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
-    loader = DataLoader(ds, batch_size=int(resolved_batch_size), shuffle=False, **dl_kwargs)
+    loader = DataLoader(
+        ds,
+        batch_size=int(resolved_batch_size),
+        shuffle=False,
+        worker_init_fn=make_dataloader_worker_init_fn(0),
+        generator=make_torch_generator(0),
+        **dl_kwargs,
+    )
 
     preprocessor = GpuStreamPreprocessor(
         GpuStreamConfig(
@@ -529,6 +864,7 @@ def main() -> None:
     error_types: Counter[str] = Counter()
     records: list[dict[str, Any]] = []
     backend_logged = False
+    run_status = "completed"
 
     iterator = loader
     if not bool(args.no_progress):
@@ -607,6 +943,9 @@ def main() -> None:
                     print(f"    text={_truncate_text(str(rec.get('text', '')), int(args.text_max_len))}", flush=True)
 
     ok_records = [rec for rec in records if rec.get("status") == "ok"]
+    if error_count > 0:
+        run_status = "completed_with_item_errors"
+        paper_grade_reasons.append("inference_item_errors")
     y_true = [label_names.index(str(rec["label"])) for rec in ok_records]
     y_pred = [label_names.index(str(rec["pred"])) for rec in ok_records]
     class_summary = classification_summary(y_true, y_pred, label_names)
@@ -631,6 +970,8 @@ def main() -> None:
         eval_items = filter_manifest_items_for_task(select_manifest_items(manifest, args.subset), task_mode, task_speaker_id)
         speaker_baseline = speaker_majority_baseline(train_items, eval_items, label_names)
         speaker_only = speaker_only_baseline(train_items, eval_items, label_names)
+
+    paper_grade = build_paper_grade(validity_summary=validity, ineligibility_reasons=paper_grade_reasons)
 
     metrics_summary = {
         "split_manifest": str(split_manifest_path),
@@ -673,13 +1014,19 @@ def main() -> None:
         "manifest_summary": manifest_summary,
         "validity": validity,
         "error_types": dict(sorted(error_types.items())),
+        "paper_contract": checkpoint_contract,
+        "provenance": inference_provenance,
+        "checkpoint_paper_grade": checkpoint_paper_grade,
+        "checkpoint_provenance": checkpoint_provenance,
+        "paper_grade": paper_grade,
+        "run_status": str(run_status),
     }
     if speaker_baseline is not None:
         metrics_summary["speaker_majority_baseline"] = speaker_baseline
     if speaker_only is not None:
         metrics_summary["speaker_only_baseline"] = speaker_only
 
-    metrics_path = out_path.with_suffix(out_path.suffix + ".metrics.json")
+    metrics_path = out_path.parent / f"{out_path.stem}.metrics.json"
     metrics_path.write_text(json.dumps(metrics_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(metrics_summary, ensure_ascii=False, indent=2), flush=True)
 
