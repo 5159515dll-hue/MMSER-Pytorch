@@ -18,6 +18,7 @@
   - `paper_grade`
   - `provenance`
   - `validity`
+- `paper_contract` 必须锁住关键架构/预处理口径，包括 `video_backbone` 和当前 `flow_encoder_variant`；架构语义变化后，旧 checkpoint 不能与新主线混评。
 - 多 seed headline 结果必须使用固定 seed 集：`13 17 23 42 3407`。
 - 多 seed 汇总必须报告：
   - `mean ± std`

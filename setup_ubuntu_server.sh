@@ -461,7 +461,7 @@ PY
 fi
 
 log "Running import checks"
-run_python_check <<'PY'
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" run_python_check <<'PY'
 import cv2
 import huggingface_hub
 import imageio_ffmpeg
@@ -470,6 +470,9 @@ import pandas
 import psutil
 import sentencepiece
 import soundfile
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
 import transformers
 import tqdm
 import matplotlib

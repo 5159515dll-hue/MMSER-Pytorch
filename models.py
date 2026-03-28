@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hf_compat import ensure_transformers_torch_compat
+from mainline_utils import FLOW_VIDEO_ENCODER_VARIANT
 
 
 def _disable_hf_audio_spec_augment(model: nn.Module) -> None:
@@ -63,7 +64,9 @@ class FlowVideoEncoder(nn.Module):
             nn.Conv3d(3, 32, kernel_size=3, stride=(1, 2, 2), padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(1, 2, 2)),
+            # CUDA max-pool backward is not deterministic on torch 2.1.x, so
+            # the paper-grade flow branch uses average pooling instead.
+            nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)),
             nn.Conv3d(32, 64, kernel_size=3, stride=(2, 2, 2), padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
@@ -74,6 +77,7 @@ class FlowVideoEncoder(nn.Module):
         )
         self.proj = nn.Linear(128, out_dim)
         self.out_dim = int(out_dim)
+        self.encoder_variant = FLOW_VIDEO_ENCODER_VARIANT
 
     def forward(self, flow: torch.Tensor) -> torch.Tensor:
         """前向传播。

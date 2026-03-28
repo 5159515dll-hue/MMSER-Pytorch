@@ -81,6 +81,7 @@ python3 download.py
 - `download.py` 默认把 Hugging Face 模型快照下载到仓库本地的 `.hf-cache/hub/`。同一台机器第二次运行时，会先校验本地缓存的 `config`、`tokenizer` 和 `safetensors` 头是否完整；只有校验通过才直接复用，否则会重新下载损坏或不完整的快照。
 - 当前仓库已经在 `download.py`、`train.py`、`batch_inference.py` 以及相关 Hugging Face 入口里补了 `torch.utils._pytree` 兼容层，用来兼容只暴露 `_register_pytree_node` 的旧版全局 `torch`。如果你遇到 `register_pytree_node` 缺失报错，先 `git pull` 再重试，不要第一反应就重装整套全局 CUDA/PyTorch 环境。
 - 当前主线会显式关闭 `microsoft/wavlm-large` 这类 Hugging Face 音频编码器在训练态的内部 SpecAugment / time masking。原因有两个：一是它不属于本文档的正式实验变量；二是在部分 `torch + transformers + CUDA` 组合上，它会触发 `masked_spec_embed` 相关的 CUDA 索引断言。若你遇到这类报错，先 `git pull`，不要自行回退到旧代码。
+- 当前 `dual/flow` 分支的 `FlowVideoEncoder` 已改为确定性友好的空间 `AvgPool3d` 版本，不再使用会在 `torch.use_deterministic_algorithms(True)` 下直接报错的 `MaxPool3d` backward。论文级正式结果不要混用这次修改前训练出来的旧 `dual` checkpoint；第四组请在最新代码上从头重跑。
 - `--data-root` 必须指向实际包含 `train_splits`、`dev_splits_complete` 或 `output_repeated_splits_test` 的目录。很多服务器应该填 `../MELD.Raw`，不要机械照抄成 `../MELD.Raw/MELD.Raw`。
 - 如果 `build_split_manifest.py` 打印 `usable_rows: 0`，说明 MP4 根目录填错了；先修正 `--data-root`，再重新生成 manifest。
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。
@@ -730,7 +731,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_
 
 这是实验四的正式论文级运行口径。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
 训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
-当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
+当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。如果你的服务器在 worker 模式下于首个 batch 附近触发 `Segmentation fault (core dumped)`，应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
 训练：
 

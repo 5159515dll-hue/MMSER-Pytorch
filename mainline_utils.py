@@ -13,6 +13,8 @@ import torch
 
 PAPER_PROTOCOL_VERSION = "paper_grade_v1"
 PAPER_MULTI_SEED = [13, 17, 23, 42, 3407]
+LEGACY_FLOW_VIDEO_ENCODER_VARIANT = "flow3d_maxpool_v1"
+FLOW_VIDEO_ENCODER_VARIANT = "flow3d_avgpool_v2"
 
 
 def _safe_module_version(name: str) -> str | None:
@@ -137,6 +139,7 @@ def build_run_contract(
     zero_text: bool,
     use_intensity: bool,
     video_backbone: str,
+    flow_encoder_variant: str,
     sample_rate: int,
     max_audio_sec: float,
     num_frames: int,
@@ -160,6 +163,7 @@ def build_run_contract(
         "zero_text": bool(zero_text),
         "use_intensity": bool(use_intensity),
         "video_backbone": str(video_backbone),
+        "flow_encoder_variant": str(flow_encoder_variant),
         "sample_rate": int(sample_rate),
         "max_audio_sec": float(max_audio_sec),
         "num_frames": int(num_frames),

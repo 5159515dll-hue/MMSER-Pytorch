@@ -27,6 +27,7 @@ GROUP_INVARIANT_KEYS = (
     "zero_text",
     "use_intensity",
     "video_backbone",
+    "flow_encoder_variant",
 )
 COMPARISON_INVARIANT_KEYS = (
     "protocol_version",
@@ -38,6 +39,7 @@ COMPARISON_INVARIANT_KEYS = (
     "claim_scope",
     "scientific_validity",
     "deterministic_algorithms_enabled",
+    "flow_encoder_variant",
 )
 
 
@@ -119,6 +121,7 @@ def _contract_or_default(train_metrics: dict[str, Any], test_metrics: dict[str, 
         "zero_text": bool(contract.get("zero_text", test_metrics.get("zero_text", False))),
         "use_intensity": bool(contract.get("use_intensity", test_metrics.get("intensity_enabled", False))),
         "video_backbone": str(contract.get("video_backbone") or ""),
+        "flow_encoder_variant": str(contract.get("flow_encoder_variant") or ""),
         "label_names": list(contract.get("label_names", test_metrics.get("label_names", []))),
     }
 
@@ -189,7 +192,15 @@ def _validate_run_bundle(run: dict[str, Any]) -> list[str]:
         if not math.isfinite(value):
             reasons.append(f"non_finite_{key}")
     contract = run.get("contract", {})
-    for key in ("protocol_version", "manifest_sha256", "dataset_kind", "task_mode", "text_policy", "claim_scope"):
+    for key in (
+        "protocol_version",
+        "manifest_sha256",
+        "dataset_kind",
+        "task_mode",
+        "text_policy",
+        "claim_scope",
+        "flow_encoder_variant",
+    ):
         if not str(contract.get(key, "")).strip():
             reasons.append(f"missing_contract_{key}")
     return _merge_reasons(reasons, run.get("paper_grade_reasons", []))
@@ -411,6 +422,7 @@ def render_markdown_report(
                 f"- rejected_runs: `{len(group['rejected_runs'])}`",
                 f"- claim_scope: `{contract.get('claim_scope')}`",
                 f"- scientific_validity: `{contract.get('scientific_validity')}`",
+                f"- flow_encoder_variant: `{contract.get('flow_encoder_variant')}`",
                 f"- test macro_f1: `{macro['mean']:.4f} ± {macro['std']:.4f}`",
                 f"- test macro_f1 95% CI: `[{macro['low']:.4f}, {macro['high']:.4f}]`" if macro["low"] is not None and macro["high"] is not None else "- test macro_f1 95% CI: `n/a`",
                 f"- test accuracy: `{acc['mean']:.4f} ± {acc['std']:.4f}`",

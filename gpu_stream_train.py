@@ -33,6 +33,7 @@ print_manifest_label_hist: Any = None
 build_paper_grade: Any = None
 build_run_contract: Any = None
 build_run_provenance: Any = None
+FLOW_VIDEO_ENCODER_VARIANT: Any = None
 make_dataloader_worker_init_fn: Any = None
 make_torch_generator: Any = None
 resolve_ablation_flags: Any = None
@@ -83,7 +84,8 @@ def _lazy_runtime_imports() -> None:
     global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
     global autocast_context, ccc, prepare_manifest_items_for_task, print_manifest_label_hist
-    global build_paper_grade, build_run_contract, build_run_provenance, make_dataloader_worker_init_fn, make_torch_generator
+    global build_paper_grade, build_run_contract, build_run_provenance, FLOW_VIDEO_ENCODER_VARIANT
+    global make_dataloader_worker_init_fn, make_torch_generator
     global resolve_ablation_flags, save_metrics_and_plots, set_seed, to_jsonable
     global write_best_val_inference_outputs, write_results_summary
     global build_validity_summary, filter_manifest_items_for_task, load_split_manifest
@@ -113,6 +115,7 @@ def _lazy_runtime_imports() -> None:
         build_run_contract as _build_run_contract,
         build_run_provenance as _build_run_provenance,
         ccc as _ccc,
+        FLOW_VIDEO_ENCODER_VARIANT as _FLOW_VIDEO_ENCODER_VARIANT,
         make_dataloader_worker_init_fn as _make_dataloader_worker_init_fn,
         make_torch_generator as _make_torch_generator,
         prepare_manifest_items_for_task as _prepare_manifest_items_for_task,
@@ -167,6 +170,7 @@ def _lazy_runtime_imports() -> None:
     build_paper_grade = _build_paper_grade
     build_run_contract = _build_run_contract
     build_run_provenance = _build_run_provenance
+    FLOW_VIDEO_ENCODER_VARIANT = _FLOW_VIDEO_ENCODER_VARIANT
     ccc = _ccc
     make_dataloader_worker_init_fn = _make_dataloader_worker_init_fn
     make_torch_generator = _make_torch_generator
@@ -348,6 +352,10 @@ class NumericStabilityError(RuntimeError):
     """Raised when a training batch or epoch produces non-finite values."""
 
 
+class DeterminismCompatibilityError(RuntimeError):
+    """Raised when strict deterministic mode hits an unsupported CUDA op."""
+
+
 def _assert_finite_tensor(name: str, value: Any, *, phase: str) -> None:
     if value is None:
         return
@@ -371,6 +379,13 @@ def _assert_finite_stats(name: str, stats: dict[str, Any]) -> None:
         scalar = float(value)
         if not math.isfinite(scalar):
             raise NumericStabilityError(f"{name}: non-finite summary metric {key}={scalar}")
+
+
+def _wrap_runtime_error(exc: RuntimeError, *, phase: str) -> None:
+    message = str(exc)
+    if "does not have a deterministic implementation" in message:
+        raise DeterminismCompatibilityError(f"{phase}: {message}") from exc
+    raise exc
 
 
 def _run_phase(
@@ -490,13 +505,16 @@ def _run_phase(
         if is_train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
-            if scaler is not None and bool(scaler.is_enabled()):
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+            try:
+                if scaler is not None and bool(scaler.is_enabled()):
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+            except RuntimeError as exc:
+                _wrap_runtime_error(exc, phase=phase)
 
         pred = logits.argmax(dim=1)
         batch_size = int(labels.shape[0])
@@ -630,6 +648,7 @@ def main() -> None:
         zero_text=bool(args.zero_text),
         use_intensity=bool(args.use_intensity),
         video_backbone=str(args.video_backbone),
+        flow_encoder_variant=str(FLOW_VIDEO_ENCODER_VARIANT),
         sample_rate=int(args.sample_rate),
         max_audio_sec=float(args.max_audio_sec),
         num_frames=int(args.num_frames),
@@ -904,6 +923,12 @@ def main() -> None:
             paper_grade_reasons.append("numeric_failure")
             print(f"Stopping training due to numeric instability: {exc}", flush=True)
             break
+        except DeterminismCompatibilityError as exc:
+            run_status = "failed_determinism"
+            stop_reason = f"failed_determinism: {exc}"
+            paper_grade_reasons.append("determinism_unsupported_op")
+            print(f"Stopping training due to deterministic-op incompatibility: {exc}", flush=True)
+            break
 
         print(
             "Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
@@ -1095,7 +1120,7 @@ def main() -> None:
                 encoding="utf-8",
             )
 
-    if run_status != "failed_numeric":
+    if run_status not in {"failed_numeric", "failed_determinism"}:
         last_ckpt = {
             "model": model.state_dict(),
             "epoch": int(final_epoch),

@@ -24,6 +24,8 @@ build_paper_grade: Any = None
 build_run_contract: Any = None
 build_run_provenance: Any = None
 ccc: Any = None
+FLOW_VIDEO_ENCODER_VARIANT: Any = None
+LEGACY_FLOW_VIDEO_ENCODER_VARIANT: Any = None
 make_dataloader_worker_init_fn: Any = None
 make_torch_generator: Any = None
 prepare_manifest_items_for_task: Any = None
@@ -68,6 +70,7 @@ def _lazy_runtime_imports() -> None:
     global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
     global autocast_context, build_paper_grade, build_run_contract, build_run_provenance, ccc
+    global FLOW_VIDEO_ENCODER_VARIANT, LEGACY_FLOW_VIDEO_ENCODER_VARIANT
     global make_dataloader_worker_init_fn, make_torch_generator, prepare_manifest_items_for_task, resolve_ablation_flags, set_seed
     global EMOTIONS, build_validity_summary, filter_manifest_items_for_task, load_split_manifest
     global manifest_sha256, map_label_to_task_index, resolve_task_label_names, resolve_task_mode, select_manifest_items
@@ -95,6 +98,8 @@ def _lazy_runtime_imports() -> None:
         build_run_contract as _build_run_contract,
         build_run_provenance as _build_run_provenance,
         ccc as _ccc,
+        FLOW_VIDEO_ENCODER_VARIANT as _FLOW_VIDEO_ENCODER_VARIANT,
+        LEGACY_FLOW_VIDEO_ENCODER_VARIANT as _LEGACY_FLOW_VIDEO_ENCODER_VARIANT,
         make_dataloader_worker_init_fn as _make_dataloader_worker_init_fn,
         make_torch_generator as _make_torch_generator,
         prepare_manifest_items_for_task as _prepare_manifest_items_for_task,
@@ -142,6 +147,8 @@ def _lazy_runtime_imports() -> None:
     build_run_contract = _build_run_contract
     build_run_provenance = _build_run_provenance
     ccc = _ccc
+    FLOW_VIDEO_ENCODER_VARIANT = _FLOW_VIDEO_ENCODER_VARIANT
+    LEGACY_FLOW_VIDEO_ENCODER_VARIANT = _LEGACY_FLOW_VIDEO_ENCODER_VARIANT
     make_dataloader_worker_init_fn = _make_dataloader_worker_init_fn
     make_torch_generator = _make_torch_generator
     prepare_manifest_items_for_task = _prepare_manifest_items_for_task
@@ -289,7 +296,9 @@ def _checkpoint_run_contract(
 ) -> dict[str, Any]:
     contract = ckpt.get("paper_contract", {})
     if isinstance(contract, dict) and contract:
-        return dict(contract)
+        normalized = dict(contract)
+        normalized.setdefault("flow_encoder_variant", LEGACY_FLOW_VIDEO_ENCODER_VARIANT)
+        return normalized
     split_manifest_raw = ckpt.get("split_manifest", "")
     return build_run_contract(
         split_manifest=Path(str(split_manifest_raw or ".")),
@@ -306,6 +315,7 @@ def _checkpoint_run_contract(
         zero_text=bool(ckpt.get("zero_text", ckpt_args.get("zero_text", False))),
         use_intensity=bool(ckpt_args.get("use_intensity", False)),
         video_backbone=str(ckpt_args.get("video_backbone", "dual") or "dual"),
+        flow_encoder_variant=LEGACY_FLOW_VIDEO_ENCODER_VARIANT,
         sample_rate=int(ckpt_args.get("sample_rate", 24000) or 24000),
         max_audio_sec=float(ckpt_args.get("max_audio_sec", 6.0) or 6.0),
         num_frames=int(ckpt_args.get("num_frames", 64) or 64),
@@ -662,6 +672,13 @@ def main() -> None:
         paper_grade_reasons.append("allow_incompatible_checkpoint_enabled")
     if ckpt_path.name != "best.pt":
         paper_grade_reasons.append("checkpoint_name_mismatch")
+    _raise_or_record_mismatch(
+        field="flow_encoder_variant",
+        expected=str(checkpoint_contract.get("flow_encoder_variant", LEGACY_FLOW_VIDEO_ENCODER_VARIANT)),
+        actual=str(FLOW_VIDEO_ENCODER_VARIANT),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
     args.ablation = _normalize_optional_text(args.ablation) or str(checkpoint_contract.get("ablation", "full") or "full")
     args.sample_rate = int(args.sample_rate if args.sample_rate is not None else checkpoint_contract.get("sample_rate", 24000))
     args.max_audio_sec = float(
