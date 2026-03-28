@@ -9,6 +9,29 @@ import torch.nn.functional as F
 
 from hf_compat import ensure_transformers_torch_compat
 
+
+def _disable_hf_audio_spec_augment(model: nn.Module) -> None:
+    """Disable HF self-supervised masking for downstream audio finetuning.
+
+    WavLM/Wav2Vec2 style encoders may keep their pretraining-time SpecAugment
+    enabled in `train()` mode via config fields such as `apply_spec_augment`
+    and `mask_time_prob`. For downstream supervised emotion recognition this
+    masking is not part of the paper protocol, adds extra randomness, and on
+    some torch/transformers/CUDA combinations can trigger a CUDA indexing
+    assertion inside `masked_spec_embed`.
+    """
+
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    if hasattr(config, "apply_spec_augment"):
+        config.apply_spec_augment = False
+    if hasattr(config, "mask_time_prob"):
+        config.mask_time_prob = 0.0
+    if hasattr(config, "mask_feature_prob"):
+        config.mask_feature_prob = 0.0
+
+
 class FlowVideoEncoder(nn.Module):
     """基于光流序列的轻量 3D CNN 编码器。
 
@@ -284,6 +307,7 @@ class HFAudioEncoder(nn.Module):
                 "If the default branch only provides pytorch_model.bin, pass "
                 "--audio-model-revision pointing at a revision that contains model.safetensors."
             ) from e
+        _disable_hf_audio_spec_augment(self.model)
         hidden_size = int(getattr(self.model.config, "hidden_size", 768))
         # 前向里对时序 hidden state 做了 mean+std 池化并拼接，因此最终音频维度是 2 * hidden_size。
         self.out_dim = 2 * hidden_size
