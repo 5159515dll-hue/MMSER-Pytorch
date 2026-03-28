@@ -75,6 +75,7 @@ def _ensure_project_root_on_path() -> None:
 _ensure_project_root_on_path()
 
 from hf_compat import ensure_transformers_torch_compat
+from hf_loading import resolve_hf_pretrained_source
 from training_control import EarlyStopConfig, EarlyStopController
 
 
@@ -338,7 +339,8 @@ def _load_tokenizer(model_name: str) -> Any:
         from transformers import AutoTokenizer
     except Exception as e:
         raise RuntimeError("transformers is required for text-enabled training.") from e
-    return AutoTokenizer.from_pretrained(str(model_name))
+    source, load_kwargs = resolve_hf_pretrained_source(str(model_name))
+    return AutoTokenizer.from_pretrained(source, **load_kwargs)
 
 
 def _current_lr(optimizer: Any) -> float:

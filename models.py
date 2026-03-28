@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hf_compat import ensure_transformers_torch_compat
+from hf_loading import resolve_hf_pretrained_source
 from mainline_utils import FLOW_VIDEO_ENCODER_VARIANT
 
 
@@ -118,7 +119,8 @@ class VideoMAEEncoder(nn.Module):
             ) from e
 
         self.model_name = str(model_name)
-        self.model = AutoModel.from_pretrained(self.model_name)
+        load_source, load_kwargs = resolve_hf_pretrained_source(self.model_name)
+        self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
         self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
         self.expected_num_frames = int(getattr(self.model.config, "num_frames", 16))
         image_size = getattr(self.model.config, "image_size", 224)
@@ -298,10 +300,10 @@ class HFAudioEncoder(nn.Module):
         self.revision = str(revision).strip() if revision is not None and str(revision).strip() else None
         self.use_safetensors = bool(use_safetensors)
         load_kwargs: dict[str, object] = {"use_safetensors": self.use_safetensors}
-        if self.revision is not None:
-            load_kwargs["revision"] = self.revision
+        load_source, source_kwargs = resolve_hf_pretrained_source(self.model_name, revision=self.revision)
+        load_kwargs.update(source_kwargs)
         try:
-            self.model = AutoModel.from_pretrained(self.model_name, **load_kwargs)
+            self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
         except Exception as e:  # pragma: no cover
             revision_hint = self.revision if self.revision is not None else "<default>"
             raise RuntimeError(
@@ -444,7 +446,8 @@ class MbertTextEncoder(nn.Module):
             ) from e
 
         self.model_name = str(model_name)
-        self.model = AutoModel.from_pretrained(self.model_name)
+        load_source, load_kwargs = resolve_hf_pretrained_source(self.model_name)
+        self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
         self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
 
         if freeze:
