@@ -50,7 +50,7 @@ class FlowVideoEncoder(nn.Module):
         - `video_emb`: 形状为 (B, out_dim)
 
         备注
-        - 网络结构包含下采样与 `AdaptiveAvgPool3d`，因此能适配不同的 (T, H, W) 输入尺寸。
+        - 网络结构只使用卷积下采样，最后通过全局均值聚合得到固定维度表示，从而避免 CUDA 3D pooling backward 的确定性限制。
     """
 
     def __init__(self, out_dim: int = 256):
@@ -64,16 +64,17 @@ class FlowVideoEncoder(nn.Module):
             nn.Conv3d(3, 32, kernel_size=3, stride=(1, 2, 2), padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            # CUDA max-pool backward is not deterministic on torch 2.1.x, so
-            # the paper-grade flow branch uses average pooling instead.
-            nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)),
+            # The paper-grade flow branch avoids 3D pooling kernels because
+            # their CUDA backward path is not deterministic on torch 2.1.x.
+            nn.Conv3d(32, 32, kernel_size=3, stride=(1, 2, 2), padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
             nn.Conv3d(32, 64, kernel_size=3, stride=(2, 2, 2), padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
             nn.Conv3d(64, 128, kernel_size=3, stride=(2, 2, 2), padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((1, 1, 1)),
         )
         self.proj = nn.Linear(128, out_dim)
         self.out_dim = int(out_dim)
@@ -89,8 +90,7 @@ class FlowVideoEncoder(nn.Module):
             视频嵌入，形状 (B, out_dim)。
         """
         x = self.net(flow)
-        # AdaptiveAvgPool3d((1,1,1)) 后为 (B, C, 1, 1, 1)，展平成 (B, C)
-        x = x.flatten(1)
+        x = x.mean(dim=(2, 3, 4))
         return self.proj(x)
 
 

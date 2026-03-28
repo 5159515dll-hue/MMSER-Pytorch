@@ -41,7 +41,7 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
             "zero_text": False,
             "use_intensity": False,
             "video_backbone": "dual",
-            "flow_encoder_variant": "flow3d_avgpool_v2",
+            "flow_encoder_variant": "flow3d_strideconv_mean_v3",
             "label_names": ["a", "b"],
         }
         train_metrics = {

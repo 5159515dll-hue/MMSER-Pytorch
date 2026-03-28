@@ -14,7 +14,7 @@ import torch
 PAPER_PROTOCOL_VERSION = "paper_grade_v1"
 PAPER_MULTI_SEED = [13, 17, 23, 42, 3407]
 LEGACY_FLOW_VIDEO_ENCODER_VARIANT = "flow3d_maxpool_v1"
-FLOW_VIDEO_ENCODER_VARIANT = "flow3d_avgpool_v2"
+FLOW_VIDEO_ENCODER_VARIANT = "flow3d_strideconv_mean_v3"
 
 
 def _safe_module_version(name: str) -> str | None:
