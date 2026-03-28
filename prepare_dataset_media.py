@@ -1,3 +1,9 @@
+"""准备主线运行所需的媒体 sidecar。
+
+当前主线在 MELD 上依赖音频 sidecar，因此训练前需要把视频里的音轨提取成
+ wav 文件。这个脚本只负责这一步准备工作，不负责训练本身。
+"""
+
 from __future__ import annotations
 
 import argparse

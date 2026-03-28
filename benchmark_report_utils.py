@@ -28,6 +28,8 @@ GROUP_INVARIANT_KEYS = (
     "use_intensity",
     "video_backbone",
     "flow_encoder_variant",
+    "input_cache_used",
+    "input_cache_protocol",
 )
 COMPARISON_INVARIANT_KEYS = (
     "protocol_version",
@@ -96,6 +98,12 @@ def _contract_or_default(train_metrics: dict[str, Any], test_metrics: dict[str, 
         contract = test_metrics.get("paper_contract", {})
     if not isinstance(contract, dict):
         contract = {}
+    train_input_cache_contract = train_metrics.get("meta", {}).get("input_cache_contract", {})
+    if not isinstance(train_input_cache_contract, dict):
+        train_input_cache_contract = {}
+    test_input_cache_contract = test_metrics.get("input_cache_contract", {})
+    if not isinstance(test_input_cache_contract, dict):
+        test_input_cache_contract = {}
     return {
         "protocol_version": str(
             contract.get("protocol_version")
@@ -122,6 +130,12 @@ def _contract_or_default(train_metrics: dict[str, Any], test_metrics: dict[str, 
         "use_intensity": bool(contract.get("use_intensity", test_metrics.get("intensity_enabled", False))),
         "video_backbone": str(contract.get("video_backbone") or ""),
         "flow_encoder_variant": str(contract.get("flow_encoder_variant") or ""),
+        "input_cache_used": bool(train_metrics.get("meta", {}).get("input_cache") or test_metrics.get("input_cache")),
+        "input_cache_protocol": str(
+            train_input_cache_contract.get("protocol_version")
+            or test_input_cache_contract.get("protocol_version")
+            or ""
+        ),
         "label_names": list(contract.get("label_names", test_metrics.get("label_names", []))),
     }
 
@@ -203,6 +217,8 @@ def _validate_run_bundle(run: dict[str, Any]) -> list[str]:
     ):
         if not str(contract.get(key, "")).strip():
             reasons.append(f"missing_contract_{key}")
+    if bool(contract.get("input_cache_used", False)) and not str(contract.get("input_cache_protocol", "")).strip():
+        reasons.append("missing_contract_input_cache_protocol")
     return _merge_reasons(reasons, run.get("paper_grade_reasons", []))
 
 
@@ -423,6 +439,8 @@ def render_markdown_report(
                 f"- claim_scope: `{contract.get('claim_scope')}`",
                 f"- scientific_validity: `{contract.get('scientific_validity')}`",
                 f"- flow_encoder_variant: `{contract.get('flow_encoder_variant')}`",
+                f"- input_cache_used: `{contract.get('input_cache_used')}`",
+                f"- input_cache_protocol: `{contract.get('input_cache_protocol')}`",
                 f"- test macro_f1: `{macro['mean']:.4f} ± {macro['std']:.4f}`",
                 f"- test macro_f1 95% CI: `[{macro['low']:.4f}, {macro['high']:.4f}]`" if macro["low"] is not None and macro["high"] is not None else "- test macro_f1 95% CI: `n/a`",
                 f"- test accuracy: `{acc['mean']:.4f} ± {acc['std']:.4f}`",

@@ -1,3 +1,9 @@
+"""Hugging Face 本地快照解析工具。
+
+主线训练/推理会优先读取仓库本地 `.hf-cache/hub` 里的已验证快照，避免每次
+ `from_pretrained()` 都先向远端发请求。这里负责把“模型名”解析成真正的加载源。
+"""
+
 from __future__ import annotations
 
 import os
@@ -6,6 +12,8 @@ from typing import Any
 
 
 def default_hf_cache_dir() -> Path:
+    """返回主线默认使用的 Hugging Face 缓存目录。"""
+
     hf_hub_cache = os.environ.get("HF_HUB_CACHE", "").strip()
     if hf_hub_cache:
         return Path(hf_hub_cache).expanduser()
@@ -18,6 +26,8 @@ def default_hf_cache_dir() -> Path:
 
 
 def hf_offline_requested() -> bool:
+    """判断当前环境是否显式要求离线加载 Hugging Face 资源。"""
+
     for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         value = str(os.environ.get(key, "")).strip().lower()
         if value in {"1", "true", "yes", "on"}:
@@ -26,6 +36,8 @@ def hf_offline_requested() -> bool:
 
 
 def resolve_local_hf_snapshot(repo_id: str, revision: str | None = None) -> Path | None:
+    """在本地 HF 缓存中查找某个 repo/revision 对应的快照目录。"""
+
     repo_text = str(repo_id).strip()
     if not repo_text:
         return None
@@ -55,6 +67,8 @@ def resolve_local_hf_snapshot(repo_id: str, revision: str | None = None) -> Path
 
 
 def resolve_hf_pretrained_source(model_name: str, *, revision: str | None = None) -> tuple[str, dict[str, Any]]:
+    """把 Hugging Face 模型名解析成 `from_pretrained()` 可直接使用的来源。"""
+
     model_text = str(model_name).strip()
     if not model_text:
         raise ValueError("model_name must not be empty")

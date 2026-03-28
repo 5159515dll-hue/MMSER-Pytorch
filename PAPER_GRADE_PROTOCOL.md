@@ -15,11 +15,15 @@
 - 训练与推理产物里的 `paper_grade.eligible` 必须都是 `true`。
 - 训练与推理产物必须写出：
   - `paper_contract`
+  - `input_cache_contract`（如果使用了 `--input-cache`）
   - `paper_grade`
   - `provenance`
   - `validity`
 - `paper_contract` 必须锁住关键架构/预处理口径，包括 `video_backbone` 和当前 `flow_encoder_variant`；架构语义变化后，旧 checkpoint 不能与新主线混评。
+- 如果使用 `--input-cache`，缓存契约必须与当前 `manifest_sha256`、`dataset_kind`、`sample_rate`、`max_audio_sec`、`num_frames`、`text_model`、`max_text_len` 完全兼容；否则训练/推理应直接失败，而不是静默降级。
+- 允许的缓存只有当前主线 `build_mainline_input_cache.py` 生成的输入缓存；它只能缓存波形、采样帧和 token，不能缓存 prosody、flow 或 encoder embedding。
 - 多 seed headline 结果必须使用固定 seed 集：`13 17 23 42 3407`。
+- 同一组多 seed 正式实验必须统一缓存路径策略：要么全部不使用 `--input-cache`，要么全部使用同一套兼容的 `input_cache_contract`；不能混跑。
 - 多 seed 汇总必须报告：
   - `mean ± std`
   - `95% CI`
@@ -30,6 +34,8 @@
 
 - 使用 `--allow-incompatible-checkpoint`
 - 推理时更换 manifest、task、speaker、text policy、ablation 或关键预处理参数而不与 checkpoint 完全一致
+- 使用旧 `build_feature_cache.py` / `validate_cached_shards.py` / `--feature-cache` / `--cached-dataset`
+- 使用任何缓存过的 prosody、legacy flow、audio embedding、text embedding 作为当前主线正式结果输入
 - checkpoint 非严格兼容加载
 - 训练或推理出现非有限值、样本级错误或缺 seed
 - 多 seed 汇总中混入不同 manifest、不同 claim scope、不同 deterministic policy 或重复/缺失 seed

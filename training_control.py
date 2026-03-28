@@ -1,3 +1,9 @@
+"""训练停止控制器。
+
+这个模块把“什么时候算提升”“什么时候只算 tie-break”“什么时候允许早停”
+从训练主循环里抽离出来，让训练逻辑更容易理解和复用。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -5,6 +11,8 @@ import math
 
 
 def _is_better(value: float, best: float | None, *, mode: str) -> bool:
+    """按 `max/min` 规则比较当前值是否优于历史值。"""
+
     if best is None:
         return True
     if mode == "max":
@@ -16,6 +24,8 @@ def _is_better(value: float, best: float | None, *, mode: str) -> bool:
 
 @dataclass(frozen=True)
 class EarlyStopConfig:
+    """早停控制器的静态配置。"""
+
     monitor_name: str
     monitor_mode: str = "max"
     patience: int = 0
@@ -28,6 +38,8 @@ class EarlyStopConfig:
 
 @dataclass(frozen=True)
 class EpochDecision:
+    """单个 epoch 观察后的决策结果。"""
+
     should_save_checkpoint: bool
     checkpoint_reason: str | None
     significant_improvement: bool
@@ -37,6 +49,8 @@ class EpochDecision:
 
 @dataclass
 class EarlyStopController:
+    """维护训练过程中的“最佳 epoch”与“是否早停”状态。"""
+
     config: EarlyStopConfig
     best_monitor_value: float | None = None
     selected_epoch: int = 0
@@ -49,6 +63,8 @@ class EarlyStopController:
     stop_reason: str | None = None
 
     def _is_significant_improvement(self, value: float) -> bool:
+        """判断当前 monitor 是否真正超过 `min_delta` 门槛。"""
+
         if self.best_monitor_value is None:
             return True
         if self.config.monitor_mode == "max":
@@ -58,16 +74,22 @@ class EarlyStopController:
         raise ValueError(f"unsupported monitor mode: {self.config.monitor_mode}")
 
     def _within_delta_of_best(self, value: float) -> bool:
+        """判断当前值是否仍落在“接近最佳值”的 tie-break 区间内。"""
+
         if self.best_monitor_value is None:
             return True
         return abs(float(value) - float(self.best_monitor_value)) <= float(self.config.min_delta)
 
     def register_lr_drop(self, epoch: int) -> None:
+        """记录学习率发生降档的 epoch。"""
+
         epoch_int = int(epoch)
         if epoch_int not in self.lr_drop_epochs:
             self.lr_drop_epochs.append(epoch_int)
 
     def evaluate_stop(self, epoch: int) -> tuple[bool, str | None]:
+        """在当前 epoch 结束后判断是否允许触发早停。"""
+
         epoch_int = int(epoch)
         if int(self.config.patience) <= 0:
             return False, None
@@ -85,6 +107,14 @@ class EarlyStopController:
         return True, stop_reason
 
     def observe(self, *, epoch: int, monitor_value: float, tie_break_value: float) -> EpochDecision:
+        """喂入一个 epoch 的观测值，并更新“是否保存/是否停止”状态。
+
+        这里把两层逻辑拆开处理：
+        - 先看 monitor 是否有显著提升；如果有，就刷新“真正最佳”
+        - 如果没有显著提升，但仍处在 `min_delta` 邻域内，就允许用 tie-break
+          指标（通常是更低的 val_loss）决定是否更新 checkpoint
+        """
+
         epoch_int = int(epoch)
         monitor_f = float(monitor_value)
         tie_break_f = float(tie_break_value)

@@ -1,3 +1,11 @@
+"""Manifest 驱动的主线训练入口。
+
+这个文件负责把命令行参数、manifest 数据集、gpu_stream 预处理器、
+多模态模型、优化器和 early stop 控制器串起来，形成完整的训练流程。
+阅读顺序建议从 `main()` 开始，再回看 `_run_phase()` 理解单个 epoch
+里一个 batch 是如何完成“取数据 -> 预处理 -> 前向 -> 反向 -> 统计”的。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +30,7 @@ augment_wav: Any = None
 normalize_wav: Any = None
 ManifestIngressConfig: Any = None
 StreamingManifestDataset: Any = None
+CachedManifestDataset: Any = None
 cache_manifest_text_tokens: Any = None
 collate_manifest_items: Any = None
 GpuStreamConfig: Any = None
@@ -63,9 +72,19 @@ resolve_prefetch_factor: Any = None
 resolve_worker_count: Any = None
 select_device: Any = None
 resolve_text_policy: Any = None
+build_input_cache_contract: Any = None
+load_input_cache_meta: Any = None
+validate_input_cache_contract: Any = None
 
 
 def _ensure_project_root_on_path() -> None:
+    """确保仓库根目录在 `sys.path` 中。
+
+    训练入口经常会被用户从不同工作目录触发。这里把当前文件所在目录
+    放到导入搜索路径前面，保证 `hf_compat.py`、`models.py` 等根目录模块
+    都能被稳定导入。
+    """
+
     project_root = Path(__file__).resolve().parent
     project_root_str = str(project_root)
     if project_root_str not in sys.path:
@@ -80,9 +99,16 @@ from training_control import EarlyStopConfig, EarlyStopController
 
 
 def _lazy_runtime_imports() -> None:
+    """按需导入训练阶段真正需要的大模块。
+
+    这样做有两个目的：
+    1. `train.py --help` 这类轻量命令不需要提前加载整套 torch/transformers。
+    2. 避免模块导入阶段就触发较重的 CUDA / Hugging Face 初始化。
+    """
+
     global torch, DataLoader, tqdm
     global AudioAugConfig, augment_wav, normalize_wav
-    global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
+    global ManifestIngressConfig, StreamingManifestDataset, CachedManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
     global autocast_context, ccc, prepare_manifest_items_for_task, print_manifest_label_hist
     global build_paper_grade, build_run_contract, build_run_provenance, FLOW_VIDEO_ENCODER_VARIANT
@@ -95,6 +121,9 @@ def _lazy_runtime_imports() -> None:
     global FusionClassifier, ProsodyConfig, extract_prosody_features_gpu
     global detect_runtime, resolve_amp_mode, resolve_batch_size, resolve_prefetch_factor, resolve_worker_count, select_device
     global resolve_text_policy
+    global build_input_cache_contract, load_input_cache_meta, validate_input_cache_contract
+    # 这里用 `torch is not None` 作为“是否已经完成整批导入”的哨兵值，
+    # 防止在一个进程里重复执行整套导入和全局绑定。
     if torch is not None:
         return
 
@@ -106,6 +135,7 @@ def _lazy_runtime_imports() -> None:
     from data import (
         ManifestIngressConfig as _ManifestIngressConfig,
         StreamingManifestDataset as _StreamingManifestDataset,
+        CachedManifestDataset as _CachedManifestDataset,
         cache_manifest_text_tokens as _cache_manifest_text_tokens,
         collate_manifest_items as _collate_manifest_items,
     )
@@ -154,6 +184,11 @@ def _lazy_runtime_imports() -> None:
         select_device as _select_device,
     )
     from text_policy_utils import resolve_text_policy as _resolve_text_policy
+    from input_cache import (
+        build_input_cache_contract as _build_input_cache_contract,
+        load_input_cache_meta as _load_input_cache_meta,
+        validate_input_cache_contract as _validate_input_cache_contract,
+    )
 
     torch = _torch
     DataLoader = _DataLoader
@@ -163,6 +198,7 @@ def _lazy_runtime_imports() -> None:
     normalize_wav = _normalize_wav
     ManifestIngressConfig = _ManifestIngressConfig
     StreamingManifestDataset = _StreamingManifestDataset
+    CachedManifestDataset = _CachedManifestDataset
     cache_manifest_text_tokens = _cache_manifest_text_tokens
     collate_manifest_items = _collate_manifest_items
     GpuStreamConfig = _GpuStreamConfig
@@ -204,9 +240,20 @@ def _lazy_runtime_imports() -> None:
     resolve_worker_count = _resolve_worker_count
     select_device = _select_device
     resolve_text_policy = _resolve_text_policy
+    build_input_cache_contract = _build_input_cache_contract
+    load_input_cache_meta = _load_input_cache_meta
+    validate_input_cache_contract = _validate_input_cache_contract
 
 
 def parse_args() -> argparse.Namespace:
+    """定义并解析训练 CLI 参数。
+
+    参数分三类：
+    - 任务/数据口径：例如 `task_mode`、`speaker_id`、`text_policy`
+    - 训练控制：例如 epoch、学习率、early stop、AMP
+    - 兼容参数：旧脚本可能还会传入的隐藏参数，这些参数会在后面统一校验
+    """
+
     p = argparse.ArgumentParser(description="Train the manifest-driven gpu_stream mainline")
     p.add_argument("--split-manifest", type=Path, required=True)
     p.add_argument("--task-mode", type=str, default="confounded_7way", choices=list(TASK_MODE_CHOICES))
@@ -227,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-min", type=float, default=1e-6)
     p.add_argument("--output-dir", type=Path, default=Path("outputs/motion_prosody"))
     p.add_argument("--benchmark-tag", type=str, default="default")
+    p.add_argument("--input-cache", type=Path, default=None, help="Optional mainline input cache directory built by build_mainline_input_cache.py")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--freeze-audio", action="store_true")
     p.add_argument("--freeze-video", action="store_true")
@@ -294,6 +342,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_compat_args(args: argparse.Namespace) -> None:
+    """拒绝已经退役的旧参数组合。
+
+    主线现在只接受 manifest + gpu_stream 路径。这里专门把旧版缓存数据集、
+    pipeline 开关、手工性能开关等参数拦下来，避免用户以为这些参数还生效，
+    从而导致“实际执行的实验”和“命令行看起来描述的实验”不一致。
+    """
+
     if args.cached_dataset is not None or args.feature_cache is not None:
         raise RuntimeError(
             "Mainline training no longer supports --cached-dataset or --feature-cache. "
@@ -334,6 +389,13 @@ def _validate_compat_args(args: argparse.Namespace) -> None:
 
 
 def _load_tokenizer(model_name: str) -> Any:
+    """加载文本 tokenizer。
+
+    这里先调用 `ensure_transformers_torch_compat()`，是为了在旧版 torch
+    全局环境里补齐 `transformers` 依赖的 pytree API，再走真正的
+    `AutoTokenizer.from_pretrained(...)`。
+    """
+
     try:
         ensure_transformers_torch_compat()
         from transformers import AutoTokenizer
@@ -344,6 +406,8 @@ def _load_tokenizer(model_name: str) -> Any:
 
 
 def _current_lr(optimizer: Any) -> float:
+    """读取优化器第一个参数组的当前学习率。"""
+
     param_groups = getattr(optimizer, "param_groups", [])
     if not param_groups:
         return 0.0
@@ -359,6 +423,12 @@ class DeterminismCompatibilityError(RuntimeError):
 
 
 def _assert_finite_tensor(name: str, value: Any, *, phase: str) -> None:
+    """在训练过程中强制拦截 NaN/Inf。
+
+    论文级协议要求一旦出现非有限值就立刻失败，而不是继续把异常 run
+    当成有效结果写盘。因此 logits、loss、回归输出等关键张量都会经过这里。
+    """
+
     if value is None:
         return
     if isinstance(value, torch.Tensor):
@@ -372,6 +442,8 @@ def _assert_finite_tensor(name: str, value: Any, *, phase: str) -> None:
 
 
 def _assert_finite_stats(name: str, stats: dict[str, Any]) -> None:
+    """检查一个 epoch 汇总指标是否仍然是有限值。"""
+
     for key in ("loss", "accuracy", "macro_f1", "prepare_sec", "mse", "mae", "ccc"):
         if key not in stats:
             continue
@@ -384,6 +456,12 @@ def _assert_finite_stats(name: str, stats: dict[str, Any]) -> None:
 
 
 def _wrap_runtime_error(exc: RuntimeError, *, phase: str) -> None:
+    """把底层 RuntimeError 重新分类成更明确的主线异常。
+
+    目前最重要的分支是“严格 deterministic 模式遇到不支持的 CUDA 算子”。
+    这样主循环可以把它记成 `failed_determinism`，而不是笼统的普通报错。
+    """
+
     message = str(exc)
     if "does not have a deterministic implementation" in message:
         raise DeterminismCompatibilityError(f"{phase}: {message}") from exc
@@ -406,6 +484,16 @@ def _run_phase(
     prosody_cfg: ProsodyConfig,
     aug_cfg: AudioAugConfig,
 ) -> dict[str, Any]:
+    """执行一个训练或验证 phase，并返回该 phase 的汇总统计。
+
+    这个函数是训练主线里最值得阅读的部分。它完成的事情依次是：
+    1. 通过 `GpuStreamPreprocessor` 把原始 manifest item 变成张量 batch
+    2. 在训练态可选地做音频增强与韵律重算
+    3. 执行模型前向，得到分类 logits 和可选强度回归输出
+    4. 计算损失，并在训练态执行反向传播和优化器更新
+    5. 累积分类/回归指标，以及验证阶段逐样本记录
+    """
+
     _lazy_runtime_imports()
     is_train = optimizer is not None
     model.train(is_train)
@@ -422,12 +510,15 @@ def _run_phase(
     records: list[dict[str, Any]] = []
     backend_logged = False
 
+    # 训练和验证都复用同一个 phase 实现；是否显示进度条只取决于 tqdm 是否可用。
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, desc=phase, unit="batch", dynamic_ncols=True)
 
     for batch_items in iterator:
         prep_started = time.perf_counter()
+        # `prepare_batch` 负责把 list[manifest item] 变成模型消费的整批张量，
+        # 其中会统一补齐文本 token、音频长度、prosody、flow/rgb 等字段。
         batch = preprocessor.prepare_batch(
             batch_items,
             tokenizer=tokenizer,
@@ -436,6 +527,7 @@ def _run_phase(
         )
         prepare_sec += float(time.perf_counter() - prep_started)
 
+        # 每个 phase 只打印一次后端摘要，避免日志被每个 batch 淹没。
         if not backend_logged:
             print(
                 json.dumps(
@@ -458,6 +550,8 @@ def _run_phase(
         text_inputs = batch.get("text_inputs", None)
         labels = batch["labels"]
 
+        # 训练态的音频增强只影响当前 batch；如果增强改变了波形，
+        # 且用户允许，就要重新提取 prosody，保证韵律特征与增强后的音频一致。
         if is_train and bool(args.audio_aug) and (not bool(args.zero_audio)):
             wav = normalize_wav(wav, target_rms=0.1)
             wav = augment_wav(wav, aug_cfg)
@@ -465,6 +559,7 @@ def _run_phase(
             if bool(args.recompute_prosody_on_aug):
                 prosody = extract_prosody_features_gpu(wav, prosody_cfg, lengths=audio_lens).to(torch.float32)
 
+        # 训练时需要保留计算图，验证时显式关闭梯度，减少显存和计算开销。
         grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
         with grad_ctx, autocast_context(device, amp_mode):
             if bool(args.use_intensity):
@@ -490,10 +585,12 @@ def _run_phase(
 
             _assert_finite_tensor("logits", logits, phase=phase)
             _assert_finite_tensor("pred_intensity", pred_intensity, phase=phase)
+            # 主任务始终是情绪分类；强度回归如果启用，只是在分类损失上追加一项。
             loss = loss_fn(logits, labels)
             if bool(args.use_intensity):
                 intensity = batch["intensity"].to(torch.float32)
                 intensity_mask = batch["intensity_mask"]
+                # 有些样本可能没有强度标注，所以这里只在 mask 为真的子集上计算回归损失。
                 if bool(intensity_mask.any().item()):
                     pred_f = pred_intensity.to(torch.float32)[intensity_mask]
                     gt_f = intensity[intensity_mask]
@@ -508,6 +605,7 @@ def _run_phase(
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
             try:
+                # fp16 时优先走 GradScaler；bf16/off 则直接 backward。
                 if scaler is not None and bool(scaler.is_enabled()):
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -539,6 +637,8 @@ def _run_phase(
                     reg_pred.append(float(pred_intensity_cpu[idx].item()))
 
         if not is_train:
+            # 验证阶段会把每个样本的预测结果记下来，
+            # 后续最佳 epoch 的 `inference_val.jsonl` 就来自这里。
             probs = torch.softmax(logits, dim=1)
             pred_probs = probs.gather(1, pred.view(-1, 1)).squeeze(1).detach().cpu().tolist()
             gt_intensity = batch["intensity"].detach().cpu().to(torch.float32)
@@ -563,12 +663,14 @@ def _run_phase(
                         rec["pred_intensity"] = None
                 records.append(rec)
 
+    # 循环结束后统一从逐样本标签恢复出宏 F1、混淆矩阵等分类摘要。
     summary = classification_summary(y_true, y_pred, label_names)
 
     mse = 0.0
     mae = 0.0
     ccc_value = 0.0
     intensity_n = int(len(reg_true))
+    # 强度指标和分类指标分开统计，避免没有强度标签的样本污染结果。
     if reg_true and reg_pred:
         rt = torch.tensor(reg_true, dtype=torch.float32)
         rp = torch.tensor(reg_pred, dtype=torch.float32)
@@ -594,36 +696,51 @@ def _run_phase(
 
 
 def main() -> None:
+    """主训练入口。
+
+    整体流程：
+    1. 解析并校验参数
+    2. 固定随机性策略，解析 manifest 与任务口径
+    3. 构建训练/验证数据集、tokenizer、DataLoader
+    4. 构建模型、优化器、调度器、预处理器
+    5. 循环执行 train/val phase，按验证集规则选 `best.pt`
+    6. 写出 `last.pt`、metrics、图表和结果摘要
+    """
+
     args = parse_args()
     _validate_compat_args(args)
     _lazy_runtime_imports()
 
+    # 先把文本策略和 ablation 统一解析成当前主线认可的“最终零化开关”，
+    # 这样后面的 dataset / model / inference 记录才能保持一致。
     args.text_policy = resolve_text_policy(args.text_policy)
-    zero_video, zero_audio, zero_text = resolve_ablation_flags(
-        ablation=str(args.ablation),
-        zero_video=bool(args.zero_video),
+    zero_video, zero_audio, zero_text = resolve_ablation_flags(  # 函数内部会根据 text_policy 强制 zero_text
+        ablation=str(args.ablation),    # 但这里的 zero_* 仍然以命令行参数为准，保持用户输入和最终协议的一致性。
+        zero_video=bool(args.zero_video),   # 这样用户即使传了 --zero-video，但选了 text-only，也会被主线改成不 zero 视频，避免协议和实际执行不一致。
         zero_audio=bool(args.zero_audio),
         zero_text=bool(args.zero_text),
     )
-    if str(args.text_policy) == "drop":
+    if str(args.text_policy) == "drop": # 当文本策略是 drop 时，强制 zero_text=True，无论用户命令行输入如何，确保协议一致性。
         zero_text = True
-    args.zero_video = bool(zero_video)
+    args.zero_video = bool(zero_video)  # 这里把最终的 zero_* 结果写回 args，确保后续代码和协议里都用这个统一的版本，而不是用户原始输入的版本。
     args.zero_audio = bool(zero_audio)
     args.zero_text = bool(zero_text)
 
-    deterministic_policy = set_seed(int(args.seed))
-    profile = detect_runtime(args.device)
+    # 训练一开始就固定随机种子和 deterministic policy，
+    # 其结果会写入 provenance，后续推理/聚合也会用来验证协议一致性。
+    deterministic_policy = set_seed(int(args.seed)) # 返回当前的 deterministic policy 设定，包含 torch 和 cudnn 的相关开关状态，供后续记录和验证使用。
+    profile = detect_runtime(args.device)   # 返回当前的 runtime profile，包含设备类型、torch 版本、cuda 版本、cudnn 版本等信息，供后续记录和验证使用。
     device = select_device(args.device)
-    resolved_amp_mode = resolve_amp_mode(str(args.amp_mode), profile)
+    resolved_amp_mode = resolve_amp_mode(str(args.amp_mode), profile)   # 返回实际使用的 AMP 模式，供后续训练流程和协议记录使用。
     print(f"Using device: {device}", flush=True)
     print(f"Runtime profile: {json.dumps(profile.to_jsonable(), ensure_ascii=False)}", flush=True)
 
-    split_manifest_path = args.split_manifest.expanduser()
-    if not split_manifest_path.exists():
+    split_manifest_path = args.split_manifest.expanduser()  # 用户输入的 manifest 路径，支持 ~ 之类的 shell 风格路径，先展开成绝对路径再使用。
+    if not split_manifest_path.exists():    # 如果展开后的路径不存在，就立刻报错，避免后续加载时出现模糊的文件不存在错误。
         raise FileNotFoundError(f"Split manifest not found: {split_manifest_path}")
-    manifest = load_split_manifest(split_manifest_path)
-    manifest_hash = manifest_sha256(split_manifest_path)
-    manifest_summary = manifest.get("summary", {})
+    manifest = load_split_manifest(split_manifest_path) # 加载 manifest 内容，得到一个 dict 结构，包含 train/val 划分和每个样本的元信息。
+    manifest_hash = manifest_sha256(split_manifest_path)    # 计算 manifest 文件的 sha256 哈希值，作为该 manifest 的唯一标识，供后续协议记录和验证使用。
+    manifest_summary = manifest.get("summary", {})  # 从 manifest 中提取 summary 字段，里面可能包含一些预计算的统计信息，例如原始数据的标签分布、时长分布等，供后续协议记录和验证使用。
     dataset_kind = str(manifest.get("dataset_kind", "") or "")
 
     task_mode = resolve_task_mode(args.task_mode)
@@ -635,6 +752,8 @@ def main() -> None:
         paper_grade_reasons.append("deterministic_algorithms_disabled")
     if bool(deterministic_policy.get("cudnn_enabled", False)) and bool(deterministic_policy.get("cudnn_benchmark", False)):
         paper_grade_reasons.append("cudnn_benchmark_enabled")
+    # `paper_contract` 是训练与推理共享的“不可变实验契约”，
+    # 之后的推理会拿 checkpoint 里的这份契约和当前命令/manifest 做逐项比对。
     run_contract = build_run_contract(
         split_manifest=split_manifest_path,
         manifest_sha256=manifest_hash,
@@ -661,6 +780,7 @@ def main() -> None:
         repo_root=Path(__file__).resolve().parent,
     )
 
+    # 这里先按 subset 取样本，再根据任务模式映射成当前任务自己的标签索引。
     train_items = prepare_manifest_items_for_task(
         filter_manifest_items_for_task(select_manifest_items(manifest, "train"), task_mode, task_speaker_id),
         task_mode=task_mode,
@@ -697,15 +817,59 @@ def main() -> None:
         zero_video=bool(args.zero_video),
         video_backbone=str(args.video_backbone),
     )
-    train_ds = StreamingManifestDataset(train_items, ingress=ingress_cfg)
-    val_ds = StreamingManifestDataset(val_items, ingress=ingress_cfg)
+    need_audio = not bool(args.zero_audio)
+    need_video = (not bool(args.zero_video)) and str(args.video_backbone) in {"flow", "videomae", "dual"}
+    need_text = not bool(args.zero_text)
+    input_cache_contract = None
+    input_cache_dir = args.input_cache.expanduser() if args.input_cache is not None else None
+    if input_cache_dir is not None:
+        cache_meta = load_input_cache_meta(input_cache_dir)
+        input_cache_contract = build_input_cache_contract(cache_meta)
+        cache_mismatch_reasons = validate_input_cache_contract(
+            input_cache_contract,
+            manifest_sha256=manifest_hash,
+            dataset_kind=dataset_kind,
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            num_frames=int(args.num_frames),
+            text_model=str(args.text_model),
+            max_text_len=int(args.max_text_len),
+            need_audio=bool(need_audio),
+            need_video=bool(need_video),
+            need_text=bool(need_text),
+            text_policy=str(args.text_policy),
+        )
+        if cache_mismatch_reasons:
+            raise RuntimeError(
+                "Input cache contract mismatch: " + ", ".join(str(reason) for reason in cache_mismatch_reasons)
+            )
+        train_ds = CachedManifestDataset(
+            train_items,
+            ingress=ingress_cfg,
+            cache_dir=input_cache_dir,
+            text_policy=str(args.text_policy),
+            runtime_profile=profile,
+        )
+        val_ds = CachedManifestDataset(
+            val_items,
+            ingress=ingress_cfg,
+            cache_dir=input_cache_dir,
+            text_policy=str(args.text_policy),
+            runtime_profile=profile,
+        )
+    else:
+        train_ds = StreamingManifestDataset(train_items, ingress=ingress_cfg)
+        val_ds = StreamingManifestDataset(val_items, ingress=ingress_cfg)
 
+    # 文本不被 zero 掉时，提前把整份 manifest 文本分词缓存好，
+    # 避免每个 batch 都重复调用 tokenizer。
     tokenizer = None
-    if not bool(args.zero_text):
+    if not bool(args.zero_text) and input_cache_contract is None:
         tokenizer = _load_tokenizer(str(args.text_model))
         cache_manifest_text_tokens(train_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
         cache_manifest_text_tokens(val_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
 
+    # batch size / worker 数都走自动解析，避免用户在不同机器上手工调很多次。
     resolved_batch_size = resolve_batch_size(
         args.batch_size,
         phase="train",
@@ -721,7 +885,8 @@ def main() -> None:
         args.num_workers,
         phase="train",
         profile=profile,
-        dataset_in_memory=False,
+        dataset_in_memory=bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+        cache_backed=bool(input_cache_contract is not None),
         total_items=len(train_items) + len(val_items),
     )
     prefetch_factor = resolve_prefetch_factor("auto", num_workers=int(resolved_num_workers))
@@ -735,6 +900,7 @@ def main() -> None:
         if prefetch_factor is not None:
             dl_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
+    # train/val 分别使用不同的 generator seed，避免两者的随机流完全相同。
     train_loader = DataLoader(
         train_ds,
         batch_size=int(resolved_batch_size),
@@ -752,6 +918,8 @@ def main() -> None:
         **dl_kwargs,
     )
 
+    # 模型初始化完全由命令行与 paper contract 决定，
+    # 这里不会根据数据内容偷偷改动结构。
     model = FusionClassifier(
         num_classes=len(label_names),
         freeze_audio=bool(args.freeze_audio),
@@ -824,6 +992,8 @@ def main() -> None:
                 "pipeline": "gpu_stream",
                 "amp_mode": resolved_amp_mode,
                 "lr_scheduler": str(args.lr_scheduler),
+                "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+                "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
             },
             ensure_ascii=False,
             indent=2,
@@ -834,6 +1004,7 @@ def main() -> None:
     out_dir = args.output_dir.expanduser()
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
+    # `history` 既服务于后续画图，也会成为 metrics.json 的原始时间序列部分。
     history: dict[str, Any] = {
         "train_loss": [],
         "train_acc": [],
@@ -859,6 +1030,10 @@ def main() -> None:
             }
         )
 
+    # 早停控制器内部同时维护：
+    # - “显著提升”的最佳 monitor 值
+    # - tie-break 触发的 checkpoint 保存
+    # - LR 降档次数是否已经满足允许早停的前提
     early_stop = EarlyStopController(
         EarlyStopConfig(
             monitor_name=str(args.monitor),
@@ -920,12 +1095,15 @@ def main() -> None:
                 aug_cfg=aug_cfg,
             )
         except NumericStabilityError as exc:
+            # 数值失稳直接把当前 run 标成失败，不能继续写成论文级结果。
             run_status = "failed_numeric"
             stop_reason = f"failed_numeric: {exc}"
             paper_grade_reasons.append("numeric_failure")
             print(f"Stopping training due to numeric instability: {exc}", flush=True)
             break
         except DeterminismCompatibilityError as exc:
+            # 如果当前 torch/CUDA 组合不支持某个 deterministic backward，
+            # 也要立刻停下，因为这意味着“当前实验协议无法按既定复现规则执行”。
             run_status = "failed_determinism"
             stop_reason = f"failed_determinism: {exc}"
             paper_grade_reasons.append("determinism_unsupported_op")
@@ -984,6 +1162,7 @@ def main() -> None:
             history["val_ccc"].append(float(val_stats["ccc"]))
             history["val_intensity_n"].append(float(val_stats["intensity_n"]))
 
+        # 模型选择永远只看验证集指标，不看测试集。
         monitor_value = float(val_stats["macro_f1"] if str(args.monitor) == "val_f1" else val_stats["accuracy"])
         decision = early_stop.observe(
             epoch=epoch,
@@ -991,6 +1170,8 @@ def main() -> None:
             tie_break_value=float(val_stats["loss"]),
         )
         if decision.should_save_checkpoint:
+            # 这里只保存“当前被验证集选中的最好模型”。
+            # 之后无论跑 val 还是 test 推理，读取的都应该是同一个 `best.pt`。
             best_epoch = int(epoch)
             best_acc = float(val_stats["accuracy"])
             best_f1 = float(val_stats["macro_f1"])
@@ -1027,6 +1208,8 @@ def main() -> None:
                     "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
                     "amp_mode": resolved_amp_mode,
                     "pipeline": "gpu_stream",
+                    "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+                    "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
                 },
                 "benchmark_tag": str(args.benchmark_tag),
                 "dataset_kind": dataset_kind,
@@ -1038,12 +1221,15 @@ def main() -> None:
                 "zero_text": bool(args.zero_text),
                 "best_val_summary": best_val_summary,
                 "paper_contract": run_contract,
+                "input_cache_contract": input_cache_contract,
                 "provenance": run_provenance,
                 "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
                 "run_status": str(run_status),
             }
             torch.save(ckpt, out_dir / "checkpoints" / "best.pt")
 
+            # 同步把该最佳 epoch 的验证集逐样本结果写成标准推理产物，
+            # 这样训练结束后不需要再额外跑一次 val 推理才能复核最佳模型。
             val_metrics_summary = {
                 "split_manifest": str(split_manifest_path),
                 "subset": "val",
@@ -1073,6 +1259,7 @@ def main() -> None:
                 "speaker_only_baseline": speaker_only,
                 "pipeline": "gpu_stream",
                 "paper_contract": run_contract,
+                "input_cache_contract": input_cache_contract,
                 "provenance": run_provenance,
                 "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
                 "run_status": str(run_status),
@@ -1080,6 +1267,7 @@ def main() -> None:
             write_best_val_inference_outputs(out_dir, records=best_val_records, metrics_summary=val_metrics_summary)
             print(f"Saved best checkpoint -> {out_dir / 'checkpoints' / 'best.pt'}", flush=True)
 
+        # Plateau 调度器看的是验证损失；一旦发生降档，要通知 early stop 控制器。
         if scheduler is not None:
             lr_before_step = _current_lr(opt)
             scheduler.step(float(val_stats["loss"]))
@@ -1100,6 +1288,7 @@ def main() -> None:
             )
             break
 
+    # 如果不是异常中断也不是 early stop，就说明训练跑到了最大 epoch。
     if not stop_reason:
         stop_reason = "max_epochs_reached"
 
@@ -1122,6 +1311,7 @@ def main() -> None:
                 encoding="utf-8",
             )
 
+    # 只有在 run 没有因为数值/确定性失败中断时，才有意义写 `last.pt`。
     if run_status not in {"failed_numeric", "failed_determinism"}:
         last_ckpt = {
             "model": model.state_dict(),
@@ -1149,6 +1339,8 @@ def main() -> None:
                 "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
                 "amp_mode": resolved_amp_mode,
                 "pipeline": "gpu_stream",
+                "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+                "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
             },
             "stop": {
                 "epoch": int(final_epoch),
@@ -1157,12 +1349,17 @@ def main() -> None:
                 "lr_drop_epochs": list(early_stop.lr_drop_epochs),
             },
             "paper_contract": run_contract,
+            "input_cache_contract": input_cache_contract,
             "provenance": run_provenance,
             "paper_grade": paper_grade,
             "run_status": str(run_status),
         }
         torch.save(last_ckpt, out_dir / "checkpoints" / "last.pt")
 
+    # 最终 metrics payload 由三层组成：
+    # - history: 每轮时间序列
+    # - meta/best/stop: 解释怎么训练、如何选最优、为什么停止
+    # - validity/provenance/paper_grade: 论文级可信性元数据
     metrics_payload: dict[str, Any] = dict(history)
     metrics_payload["meta"] = {
         "benchmark_tag": str(args.benchmark_tag),
@@ -1188,6 +1385,9 @@ def main() -> None:
         "amp_mode": resolved_amp_mode,
         "lr_scheduler": str(args.lr_scheduler),
         "pipeline": "gpu_stream",
+        "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+        "input_cache_contract": input_cache_contract,
+        "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
         "manifest_summary": manifest_summary,
         "paper_protocol_version": str(run_contract.get("protocol_version")),
         "deterministic_policy": deterministic_policy,

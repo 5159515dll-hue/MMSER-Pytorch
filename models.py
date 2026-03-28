@@ -1,3 +1,9 @@
+"""主线多模态模型定义。
+
+这里集中放置视频、音频、文本、韵律编码器以及最终融合分类器。
+训练和推理主函数都会通过这里把多路输入变成统一的情绪预测输出。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

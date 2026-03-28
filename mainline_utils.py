@@ -1,3 +1,9 @@
+"""主线训练/推理共享工具。
+
+这个模块承载随机种子、paper-grade 元数据、结果落盘、自动混合精度上下文等
+跨文件复用逻辑。它本身不执行训练，但训练与推理的很多关键步骤都依赖这里。
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -18,6 +24,8 @@ FLOW_VIDEO_ENCODER_VARIANT = "flow3d_strideconv_mean_v3"
 
 
 def _safe_module_version(name: str) -> str | None:
+    """安全读取一个已安装 Python 包的版本号。"""
+
     try:
         return str(importlib.metadata.version(name))
     except Exception:
@@ -25,6 +33,8 @@ def _safe_module_version(name: str) -> str | None:
 
 
 def _safe_git_output(args: list[str], *, cwd: Path | None = None) -> str | None:
+    """安全执行只读 git 命令，并返回裁剪后的 stdout。"""
+
     try:
         proc = subprocess.run(
             args,
@@ -53,6 +63,8 @@ def set_seed(seed: int, *, deterministic: bool = True) -> dict[str, Any]:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
     if deterministic:
+        # 对 CUDA 来说，仅仅设置 seed 还不够；
+        # 还要告诉 cuBLAS / cuDNN 尽量走确定性路径。
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     cudnn_backend = getattr(torch.backends, "cudnn", None)
     cudnn_enabled = bool(getattr(cudnn_backend, "enabled", False)) if cudnn_backend is not None else False
@@ -493,6 +505,7 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
     speaker_only = metrics.get("speaker_only_baseline", {})
     meta = metrics.get("meta", {})
     best_val = best.get("best_val_summary", {})
+    input_cache_contract = meta.get("input_cache_contract", {}) if isinstance(meta.get("input_cache_contract"), dict) else {}
     lines = [
         "# Run Summary",
         "",
@@ -502,6 +515,10 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
         f"- task_mode: `{validity.get('task_mode', 'confounded_7way')}`",
         f"- speaker_id: `{validity.get('speaker_id')}`",
         f"- text_policy: `{meta.get('text_policy', 'full')}`",
+        f"- input_cache: `{meta.get('input_cache')}`",
+        f"- input_cache_in_memory: `{meta.get('input_cache_in_memory')}`",
+        f"- input_cache_protocol: `{input_cache_contract.get('protocol_version') if input_cache_contract else None}`",
+        f"- input_cache_manifest_sha256: `{input_cache_contract.get('manifest_sha256') if input_cache_contract else None}`",
         f"- scientific_validity: `{validity.get('scientific_validity')}`",
         f"- claim_scope: `{validity.get('claim_scope')}`",
         f"- recommended_interpretation: {validity.get('recommended_interpretation', '')}",

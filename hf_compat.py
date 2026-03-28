@@ -1,3 +1,9 @@
+"""补齐旧版 torch 与新版 transformers 之间的兼容层。
+
+部分服务器上的全局 torch 只暴露 `_register_pytree_node`，而新版 transformers
+期望存在 `register_pytree_node`。这里负责在导入 transformers 之前补齐接口。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Callable

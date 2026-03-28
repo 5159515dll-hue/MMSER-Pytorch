@@ -1,3 +1,9 @@
+"""过滤 MELD manifest 中缺失媒体的样本。
+
+当某些视频或音频 sidecar 缺失时，主线训练不应把它们继续带入数据集。
+这个脚本会删除无效样本，并重算过滤后的摘要和哈希。
+"""
+
 from __future__ import annotations
 
 import argparse

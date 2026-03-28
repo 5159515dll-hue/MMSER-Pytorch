@@ -9,7 +9,16 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from input_cache import (
+    build_input_cache_contract,
+    count_selected_cache_bytes,
+    index_entries_by_key,
+    load_input_cache_index,
+    load_input_cache_meta,
+    manifest_item_cache_key,
+)
 from predecode_motion_audio import load_audio
+from runtime_adapt import RuntimeProfile, should_keep_dataset_in_memory
 from text_policy_utils import select_text_for_policy
 from video_motion import _read_video_frames_cv2
 
@@ -18,6 +27,12 @@ _DECORD_CPU = None
 
 
 def _maybe_import_decord_cpu() -> Any | None:
+    """按需导入 CPU 版 decord，并把结果缓存到模块级变量。
+
+    DataLoader worker 会频繁读取视频。这里用懒加载方式避免在没有 decord
+    或根本不需要视频解码时，让整个模块导入直接失败。
+    """
+
     global _DECORD_CPU_READY, _DECORD_CPU
     if _DECORD_CPU_READY:
         return _DECORD_CPU
@@ -33,6 +48,8 @@ def _maybe_import_decord_cpu() -> Any | None:
 
 
 def _select_indices(total: int, num_frames: int) -> list[int]:
+    """把任意长度的视频映射成固定数量的采样帧下标。"""
+
     if total <= 0:
         return [0] * max(1, int(num_frames))
     if total >= int(num_frames):
@@ -41,6 +58,12 @@ def _select_indices(total: int, num_frames: int) -> list[int]:
 
 
 def _load_sampled_video_frames_cpu(path: Path, *, num_frames: int, backend: str) -> tuple[torch.Tensor, str]:
+    """在 CPU 侧读取并采样视频帧。
+
+    返回值除了帧张量，还会携带实际命中的后端名字，方便训练/推理日志统计
+    当前到底是走了 `decord_cpu` 还是回退到 `cv2`。
+    """
+
     backend = str(backend or "auto").strip().lower()
     decord = _maybe_import_decord_cpu() if backend in {"auto", "decord"} else None
     if decord is not None:
@@ -76,47 +99,81 @@ class ManifestIngressConfig:
     video_backbone: str = "dual"
 
 
+def _manifest_item_to_base_output(item: dict[str, Any], idx: int) -> dict[str, Any]:
+    """把原始 manifest item 规范化成主线数据入口统一使用的样本头。"""
+
+    label_idx = item.get("label_idx", None)
+    if label_idx is None:
+        raise RuntimeError(f"Manifest item missing label_idx: {item.get('seq') or item.get('sample_id') or idx}")
+
+    intensity = item.get("intensity", None)
+    intensity_t = torch.tensor(float("nan"), dtype=torch.float32) if intensity is None else torch.tensor(float(intensity), dtype=torch.float32)
+    return {
+        "label": torch.tensor(int(label_idx), dtype=torch.long),
+        "stem": str(item.get("seq") or item.get("sample_id") or idx),
+        "text": str(item.get("text", item.get("mn", ""))),
+        "mn": str(item.get("mn", item.get("text", ""))),
+        "masked_text": str(item.get("masked_text", item.get("masked_mn", ""))),
+        "masked_mn": str(item.get("masked_mn", item.get("masked_text", ""))),
+        "speaker_id": str(item.get("speaker_id", "UNKNOWN")),
+        "text_cue_flag": bool(item.get("text_cue_flag", False)),
+        "cue_severity": str(item.get("cue_severity", "none")),
+        "prompt_group_id": str(item.get("prompt_group_id", "")),
+        "_global_label_en": str(item.get("label_en", item.get("_global_label_en", ""))),
+        "dataset_kind": str(item.get("dataset_kind", "")),
+        "intensity": intensity_t,
+        "video_path": str(item.get("video_path") or ""),
+        "audio_path": str(item.get("audio_path") or ""),
+    }
+
+
+def _attach_text_tokens(out: dict[str, Any], token_bundle: dict[str, Any]) -> None:
+    """把缓存好的 token 写回主线统一使用的 `_text_*` 字段。"""
+
+    out["_text_input_ids"] = token_bundle["input_ids"].to(torch.long)
+    out["_text_attention_mask"] = token_bundle["attention_mask"].to(torch.long)
+    if "token_type_ids" in token_bundle:
+        out["_text_token_type_ids"] = token_bundle["token_type_ids"].to(torch.long)
+
+
 class StreamingManifestDataset(Dataset):
     """Load audio sidecars and sampled video frames inside DataLoader workers."""
 
     def __init__(self, items: list[dict[str, Any]], *, ingress: ManifestIngressConfig):
+        """保存 manifest items 与 worker 侧媒体读取配置。"""
+
         super().__init__()
         self.items = [dict(item) for item in items]
         self.ingress = ingress
 
     def __len__(self) -> int:
+        """返回数据集大小。"""
+
         return len(self.items)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = dict(self.items[idx])
-        label_idx = item.get("label_idx", None)
-        if label_idx is None:
-            raise RuntimeError(f"Manifest item missing label_idx: {item.get('seq') or item.get('sample_id') or idx}")
+        """读取单个 manifest item，并在 worker 内补齐媒体张量。
 
-        intensity = item.get("intensity", None)
-        intensity_t = torch.tensor(float("nan"), dtype=torch.float32) if intensity is None else torch.tensor(float(intensity), dtype=torch.float32)
-        out: dict[str, Any] = {
-            "label": torch.tensor(int(label_idx), dtype=torch.long),
-            "stem": str(item.get("seq") or item.get("sample_id") or idx),
-            "text": str(item.get("text", item.get("mn", ""))),
-            "mn": str(item.get("mn", item.get("text", ""))),
-            "masked_text": str(item.get("masked_text", item.get("masked_mn", ""))),
-            "masked_mn": str(item.get("masked_mn", item.get("masked_text", ""))),
-            "speaker_id": str(item.get("speaker_id", "UNKNOWN")),
-            "text_cue_flag": bool(item.get("text_cue_flag", False)),
-            "cue_severity": str(item.get("cue_severity", "none")),
-            "prompt_group_id": str(item.get("prompt_group_id", "")),
-            "_global_label_en": str(item.get("label_en", item.get("_global_label_en", ""))),
-            "dataset_kind": str(item.get("dataset_kind", "")),
-            "intensity": intensity_t,
-            "video_path": str(item.get("video_path") or ""),
-            "audio_path": str(item.get("audio_path") or ""),
-        }
+        这里返回的仍然是“半成品样本”：
+        - 文本还是字符串或预分词后的 token
+        - 音频是 1D 波形
+        - 视频是采样后的原始帧
+        真正拼成模型 batch 的工作会在 `gpu_stream.py` 的 preprocessor 中完成。
+        """
+
+        item = dict(self.items[idx])
+        out = _manifest_item_to_base_output(item, idx)
+        # 如果训练/推理前已经提前缓存过 token，这里直接把缓存带上，
+        # 避免 DataLoader worker 再调用一次 tokenizer。
         if "_text_input_ids" in item:
-            out["_text_input_ids"] = item["_text_input_ids"].to(torch.long)
-            out["_text_attention_mask"] = item["_text_attention_mask"].to(torch.long)
-            if "_text_token_type_ids" in item:
-                out["_text_token_type_ids"] = item["_text_token_type_ids"].to(torch.long)
+            _attach_text_tokens(
+                out,
+                {
+                    "input_ids": item["_text_input_ids"],
+                    "attention_mask": item["_text_attention_mask"],
+                    **({"token_type_ids": item["_text_token_type_ids"]} if "_text_token_type_ids" in item else {}),
+                },
+            )
 
         need_video = (not bool(self.ingress.zero_video)) and str(self.ingress.video_backbone) in {"flow", "videomae", "dual"}
         need_audio = not bool(self.ingress.zero_audio)
@@ -145,6 +202,110 @@ class StreamingManifestDataset(Dataset):
             )
             out["video_frames"] = frames_cpu
             out["_video_backend"] = str(video_backend)
+
+        return out
+
+
+class CachedManifestDataset(Dataset):
+    """从主线输入缓存读取样本，尽量复用流式数据集的输出结构。"""
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        ingress: ManifestIngressConfig,
+        cache_dir: Path,
+        text_policy: str,
+        runtime_profile: RuntimeProfile | None = None,
+        keep_in_memory: bool | None = None,
+    ):
+        """保存 manifest items，并建立它们与缓存索引的对应关系。"""
+
+        super().__init__()
+        self.items = [dict(item) for item in items]
+        self.ingress = ingress
+        self.cache_dir = cache_dir.expanduser()
+        self.text_policy = str(text_policy)
+        self.meta = load_input_cache_meta(self.cache_dir)
+        self.cache_contract = build_input_cache_contract(self.meta)
+        self.entries = load_input_cache_index(self.cache_dir)
+        self.entries_by_key = index_entries_by_key(self.entries)
+        self.cache_keys = [manifest_item_cache_key(item) for item in self.items]
+        missing = [key for key in self.cache_keys if key not in self.entries_by_key]
+        if missing:
+            preview = ", ".join(missing[:3])
+            raise RuntimeError(f"Input cache is missing {len(missing)} selected sample(s). Example(s): {preview}")
+
+        self.selected_cache_bytes = count_selected_cache_bytes(entries_by_key=self.entries_by_key, keys=self.cache_keys)
+        if keep_in_memory is None:
+            sample_count = len(self.cache_keys)
+            avg_sample_bytes = int(self.selected_cache_bytes / max(1, sample_count))
+            self.in_memory = bool(
+                runtime_profile is not None
+                and should_keep_dataset_in_memory(
+                    sample_count=sample_count,
+                    sample_bytes=avg_sample_bytes,
+                    profile=runtime_profile,
+                )
+            )
+        else:
+            self.in_memory = bool(keep_in_memory)
+
+        self._payload_cache: dict[str, dict[str, Any]] = {}
+        if self.in_memory:
+            for key in self.cache_keys:
+                self._payload_cache[key] = self._load_cached_payload(key)
+
+    def __len__(self) -> int:
+        """返回缓存数据集大小。"""
+
+        return len(self.items)
+
+    def _load_cached_payload(self, cache_key: str) -> dict[str, Any]:
+        """从磁盘读取一个缓存样本。"""
+
+        entry = self.entries_by_key[str(cache_key)]
+        path = self.cache_dir / str(entry.get("relpath", ""))
+        if not path.is_file():
+            raise FileNotFoundError(f"Cached sample file not found: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Cached sample payload must be a dict: {path}")
+        return payload
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        """读取缓存样本，并恢复成主线 preprocessor 认识的字段。"""
+
+        item = dict(self.items[idx])
+        out = _manifest_item_to_base_output(item, idx)
+        cache_key = self.cache_keys[idx]
+        payload = self._payload_cache.get(cache_key)
+        if payload is None:
+            payload = self._load_cached_payload(cache_key)
+
+        need_video = (not bool(self.ingress.zero_video)) and str(self.ingress.video_backbone) in {"flow", "videomae", "dual"}
+        need_audio = not bool(self.ingress.zero_audio)
+
+        if need_audio:
+            if "audio" not in payload:
+                raise RuntimeError(f"Cached sample missing audio payload: {cache_key}")
+            out["audio"] = payload["audio"].to(torch.float32)
+            out["_audio_backend"] = str(payload.get("_audio_backend", "input_cache"))
+
+        if need_video:
+            if "video_frames" not in payload:
+                raise RuntimeError(f"Cached sample missing video_frames payload: {cache_key}")
+            out["video_frames"] = payload["video_frames"].to(torch.uint8)
+            out["_video_backend"] = str(payload.get("_video_backend", "input_cache"))
+
+        if str(self.text_policy) == "full":
+            token_bundle = payload.get("text_full", None)
+        elif str(self.text_policy) == "mask_emotion_cues":
+            token_bundle = payload.get("text_masked", None)
+        else:
+            token_bundle = None
+        if isinstance(token_bundle, dict):
+            _attach_text_tokens(out, token_bundle)
 
         return out
 

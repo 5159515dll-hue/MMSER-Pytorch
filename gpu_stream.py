@@ -18,6 +18,8 @@ from video_motion import _read_video_frames_cv2
 
 
 def _select_indices(total: int, num_frames: int) -> list[int]:
+    """把任意帧数的视频均匀映射到固定数量的采样位置。"""
+
     if total <= 0:
         return [0] * num_frames
     if total >= num_frames:
@@ -26,6 +28,15 @@ def _select_indices(total: int, num_frames: int) -> list[int]:
 
 @dataclass
 class GpuStreamConfig:
+    """gpu_stream 预处理阶段的静态配置。
+
+    这份配置描述“一个 batch 在进入模型前应该被处理成什么样”，例如：
+    - 使用哪个视频分支
+    - 音频重采样到多少 Hz
+    - 采多少帧
+    - 是否把某个模态整体置零
+    """
+
     device: torch.device
     video_backbone: str = "dual"
     sample_rate: int = 24000
@@ -46,6 +57,8 @@ class GpuStreamPreprocessor:
     """把 manifest item 批次转成模型可直接消费的 batch。"""
 
     def __init__(self, cfg: GpuStreamConfig):
+        """初始化预处理器并准备后端统计桶。"""
+
         self.cfg = cfg
         self._decord_ready = False
         self._decord = None
@@ -55,21 +68,29 @@ class GpuStreamPreprocessor:
 
     @staticmethod
     def _bump_counter(bucket: dict[str, int], key: str) -> None:
+        """给某个后端命中计数加一。"""
+
         name = str(key or "unknown")
         bucket[name] = int(bucket.get(name, 0)) + 1
 
     def backend_summary(self) -> dict[str, dict[str, int]]:
+        """返回当前累计的音频/视频后端命中统计。"""
+
         return {
             "audio": dict(sorted(self._audio_backend_counts.items())),
             "video": dict(sorted(self._video_backend_counts.items())),
         }
 
     def consume_prepare_stats(self) -> dict[str, float | int]:
+        """取出最近一次 `prepare_batch()` 记录的摘要统计。"""
+
         stats = dict(self._last_prepare_stats)
         self._last_prepare_stats = {}
         return stats
 
     def _maybe_import_decord(self) -> Any | None:
+        """按需导入 decord，并缓存结果。"""
+
         if self._decord_ready:
             return self._decord
         self._decord_ready = True
@@ -83,6 +104,12 @@ class GpuStreamPreprocessor:
         return self._decord
 
     def _read_video_frames(self, video_path: Path) -> torch.Tensor:
+        """读取一个视频并采样成固定数量的帧。
+
+        优先尝试 decord；失败时回退到 OpenCV 读取。这样既能在有 decord 的
+        环境里获得更高效率，也不会因为 decord 缺失而让主线完全不可用。
+        """
+
         backend = str(self.cfg.video_decode_backend).strip().lower()
         decord = self._maybe_import_decord() if backend in {"auto", "decord"} else None
         if decord is not None:
@@ -116,6 +143,8 @@ class GpuStreamPreprocessor:
 
     @staticmethod
     def _center_crop_square(frames: torch.Tensor) -> torch.Tensor:
+        """把矩形帧裁成中心正方形，便于后续统一 resize。"""
+
         # frames: (T, H, W, 3) or (T, 3, H, W)
         if frames.ndim != 4:
             raise ValueError(f"Expected 4D frames tensor, got {tuple(frames.shape)}")
@@ -134,6 +163,8 @@ class GpuStreamPreprocessor:
         return frames[:, :, top : top + side, left : left + side]
 
     def _prepare_rgb(self, frames: torch.Tensor) -> torch.Tensor:
+        """把原始帧转换成 RGB 分支需要的 `(T, 3, H, W)` float 张量。"""
+
         x = frames
         if x.ndim != 4:
             raise ValueError(f"Expected video frames to have 4 dims, got {tuple(x.shape)}")
@@ -145,9 +176,16 @@ class GpuStreamPreprocessor:
         return x
 
     def _prepare_motion(self, frames: torch.Tensor) -> torch.Tensor:
+        """从 RGB 帧近似构造 motion/flow 表征。
+
+        这里不是传统光流求解器，而是用相邻帧差分 + Sobel 梯度近似运动方向
+        与幅值，再把它们堆成 3 通道张量供 flow 分支使用。
+        """
+
         if str(self.cfg.flow_backend) not in {"torch_motion", "legacy"}:
             raise RuntimeError(f"Unsupported flow backend: {self.cfg.flow_backend}")
         rgb = self._prepare_rgb(frames)
+        # 先把三通道 RGB 压成灰度，减少后续差分和梯度计算开销。
         gray = (
             0.2989 * rgb[:, 0]
             + 0.5870 * rgb[:, 1]
@@ -165,6 +203,7 @@ class GpuStreamPreprocessor:
                 device=self.cfg.device,
                 dtype=torch.float32,
             )
+        # `dt` 表示相邻帧亮度变化，后续会在它上面再估计空间梯度。
         dt = gray[1:] - gray[:-1]  # (T-1, H, W)
         sobel_x = torch.tensor(
             [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
@@ -181,12 +220,15 @@ class GpuStreamPreprocessor:
         dy = F.conv2d(dt_4d, sobel_y, padding=1).squeeze(1)
         mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
         flow = torch.stack([dx, dy, mag], dim=0).to(torch.float32)
+        # 用 95 分位做缩放，比直接用最大值更不容易被极端运动噪声支配。
         scale = torch.quantile(mag.flatten(), q=0.95)
         if bool(torch.isfinite(scale).item()) and float(scale.item()) > 1e-6:
             flow = flow / scale
         return flow.clamp(-5.0, 5.0)
 
     def _process_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        """把单个 manifest item 变成模型前处理前的样本字典。"""
+
         stem = str(item.get("stem", ""))
         sample: dict[str, Any] = {
             "label": item["label"].to(torch.long),
@@ -247,9 +289,21 @@ class GpuStreamPreprocessor:
         text_policy: str,
         max_text_len: int,
     ) -> dict[str, Any]:
+        """把一组样本组装成模型可直接消费的 batch。
+
+        这是 gpu_stream 的核心入口。它会同时处理：
+        - 标签与元信息
+        - 波形 padding 与长度张量
+        - prosody 提取
+        - flow/rgb 堆叠
+        - 文本 token 或缓存 token 的打包
+        """
+
         t0 = time.perf_counter()
         processed = [self._process_item(item) for item in items]
 
+        # 这些字段虽然不直接参与前向，但会进入验证/推理逐样本记录，
+        # 因此 batch 级别也要一起带着走。
         labels = torch.stack([sample["label"] for sample in processed], dim=0).to(self.cfg.device)
         stems = [str(sample.get("stem", "")) for sample in processed]
         speaker_ids = [str(sample.get("speaker_id", "UNKNOWN")) for sample in processed]
@@ -296,6 +350,7 @@ class GpuStreamPreprocessor:
             padded_cpu = torch.zeros((len(audios), max_len), dtype=torch.float32)
             for idx, audio in enumerate(audios):
                 padded_cpu[idx, : audio.numel()] = audio
+            # 先统一 padding，再归一化 RMS，最后提 prosody，确保 batch 内口径一致。
             padded = normalize_wav(padded_cpu.to(self.cfg.device), target_rms=0.1)
             lens = lens_cpu.to(self.cfg.device)
             prosody = extract_prosody_features_gpu(
@@ -330,6 +385,7 @@ class GpuStreamPreprocessor:
 
         if (not bool(self.cfg.zero_text)) and tokenizer is not None:
             if all("_text_input_ids" in item and "_text_attention_mask" in item for item in items):
+                # 训练/推理前如果已经缓存过 token，就直接堆叠缓存。
                 text_inputs = {
                     "input_ids": torch.stack([item["_text_input_ids"].to(torch.long) for item in items], dim=0).to(self.cfg.device),
                     "attention_mask": torch.stack([item["_text_attention_mask"].to(torch.long) for item in items], dim=0).to(self.cfg.device),
@@ -341,6 +397,7 @@ class GpuStreamPreprocessor:
                     ).to(self.cfg.device)
                 batch_out["text_inputs"] = text_inputs
             else:
+                # 否则按当前 text policy 动态选择 full/masked/drop 文本，再现场分词。
                 texts = [
                     select_text_for_policy(
                         full_text=str(sample.get("mn", "")),
@@ -359,6 +416,7 @@ class GpuStreamPreprocessor:
                 )
                 batch_out["text_inputs"] = {k: v.to(self.cfg.device) for k, v in enc.items()}
 
+        # 这些统计不进入模型，只用于日志解释“当前 batch 的准备阶段花了多久”。
         self._last_prepare_stats = {
             "prepare_batch_sec": float(time.perf_counter() - t0),
             "batch_items": int(len(items)),

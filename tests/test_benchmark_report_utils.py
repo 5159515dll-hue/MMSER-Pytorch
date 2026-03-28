@@ -23,6 +23,7 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
         test_macro_f1: float,
         test_accuracy: float,
         manifest_sha256: str = "manifest-1",
+        input_cache_used: bool = False,
     ) -> Path:
         run_dir = root / name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +50,12 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
                 "args": {"seed": seed},
                 "deterministic_policy": {"deterministic_algorithms_enabled": True},
                 "paper_contract": contract,
+                "input_cache": "outputs/input_cache/demo" if input_cache_used else None,
+                "input_cache_contract": (
+                    {"protocol_version": "mainline_input_cache_v1", "manifest_sha256": manifest_sha256}
+                    if input_cache_used
+                    else None
+                ),
             },
             "best": {
                 "epoch": 12,
@@ -84,6 +91,12 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
             "task_mode": "confounded_7way",
             "speaker_id": None,
             "text_policy": "full",
+            "input_cache": "outputs/input_cache/demo" if input_cache_used else None,
+            "input_cache_contract": (
+                {"protocol_version": "mainline_input_cache_v1", "manifest_sha256": manifest_sha256}
+                if input_cache_used
+                else None
+            ),
             "paper_contract": contract,
             "paper_grade": {
                 "protocol_version": "paper_grade_v1",
@@ -100,6 +113,12 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
             "task_mode": "confounded_7way",
             "speaker_id": None,
             "text_policy": "full",
+            "input_cache": "outputs/input_cache/demo" if input_cache_used else None,
+            "input_cache_contract": (
+                {"protocol_version": "mainline_input_cache_v1", "manifest_sha256": manifest_sha256}
+                if input_cache_used
+                else None
+            ),
             "paper_contract": contract,
             "paper_grade": {
                 "protocol_version": "paper_grade_v1",
@@ -200,6 +219,20 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
         self.assertEqual(corrected[0]["multiple_comparison_method"], "holm_bonferroni")
         self.assertGreaterEqual(corrected[0]["macro_f1"]["adjusted_p_value"], corrected[0]["macro_f1"]["p_value"])
         self.assertGreaterEqual(corrected[1]["macro_f1"]["adjusted_p_value"], corrected[1]["macro_f1"]["p_value"])
+
+    def test_group_rejects_mixed_input_cache_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = [
+                self._write_run(root, "seed13", seed=13, test_macro_f1=0.50, test_accuracy=0.60, input_cache_used=True),
+                self._write_run(root, "seed17", seed=17, test_macro_f1=0.51, test_accuracy=0.61, input_cache_used=False),
+                self._write_run(root, "seed23", seed=23, test_macro_f1=0.52, test_accuracy=0.62, input_cache_used=True),
+                self._write_run(root, "seed42", seed=42, test_macro_f1=0.53, test_accuracy=0.63, input_cache_used=False),
+                self._write_run(root, "seed3407", seed=3407, test_macro_f1=0.54, test_accuracy=0.64, input_cache_used=True),
+            ]
+            group = summarize_experiment_group("mixed-cache", runs)
+            self.assertFalse(group["paper_grade_ready"])
+            self.assertIn("input_cache_used", group["compatibility_report"]["mismatch_keys"])
 
 
 if __name__ == "__main__":

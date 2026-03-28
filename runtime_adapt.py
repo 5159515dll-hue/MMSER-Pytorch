@@ -1,3 +1,9 @@
+"""运行环境自适应工具。
+
+主线需要根据 CPU/GPU、内存、worker 数量和 AMP 能力自动做参数决策。
+本模块负责把这些“环境事实”转换成训练/推理可直接使用的配置建议。
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -261,6 +267,7 @@ def resolve_worker_count(
     phase: str,
     profile: RuntimeProfile,
     dataset_in_memory: bool = False,
+    cache_backed: bool = False,
     total_items: Optional[int] = None,
 ) -> int:
     """根据阶段和机器资源解析 worker 数。"""
@@ -281,6 +288,8 @@ def resolve_worker_count(
     if phase in {"train", "inference", "feature_cache"}:
         if dataset_in_memory:
             return 0
+        if cache_backed:
+            return max(1, min(usable, 8))
         return max(1, min(usable // 2 if usable > 2 else usable, 4))
     return max(1, min(usable, 4))
 

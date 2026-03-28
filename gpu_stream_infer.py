@@ -1,3 +1,10 @@
+"""Manifest 驱动的主线批量推理入口。
+
+这个文件负责读取训练得到的 `best.pt`，校验 checkpoint 与当前 manifest/
+命令行配置是否兼容，然后批量生成逐样本预测 JSONL 与汇总 metrics。
+如果训练负责回答“模型怎么学出来”，这里负责回答“这个模型如何被规范地评估”。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +22,7 @@ DataLoader: Any = None
 tqdm: Any = None
 ManifestIngressConfig: Any = None
 StreamingManifestDataset: Any = None
+CachedManifestDataset: Any = None
 cache_manifest_text_tokens: Any = None
 collate_manifest_items: Any = None
 GpuStreamConfig: Any = None
@@ -51,9 +59,14 @@ resolve_prefetch_factor: Any = None
 resolve_worker_count: Any = None
 select_device: Any = None
 resolve_text_policy: Any = None
+build_input_cache_contract: Any = None
+load_input_cache_meta: Any = None
+validate_input_cache_contract: Any = None
 
 
 def _ensure_project_root_on_path() -> None:
+    """确保仓库根目录在 `sys.path` 中。"""
+
     project_root = Path(__file__).resolve().parent
     project_root_str = str(project_root)
     if project_root_str not in sys.path:
@@ -67,8 +80,13 @@ from hf_loading import resolve_hf_pretrained_source
 
 
 def _lazy_runtime_imports() -> None:
+    """按需导入推理真正需要的运行时模块。
+
+    这样可以让 `--help` 等轻量命令避免提前加载整套训练/推理依赖。
+    """
+
     global torch, DataLoader, tqdm
-    global ManifestIngressConfig, StreamingManifestDataset, cache_manifest_text_tokens, collate_manifest_items
+    global ManifestIngressConfig, StreamingManifestDataset, CachedManifestDataset, cache_manifest_text_tokens, collate_manifest_items
     global GpuStreamConfig, GpuStreamPreprocessor
     global autocast_context, build_paper_grade, build_run_contract, build_run_provenance, ccc
     global FLOW_VIDEO_ENCODER_VARIANT, LEGACY_FLOW_VIDEO_ENCODER_VARIANT
@@ -79,6 +97,7 @@ def _lazy_runtime_imports() -> None:
     global FusionClassifier
     global detect_runtime, resolve_amp_mode, resolve_batch_size, resolve_prefetch_factor, resolve_worker_count, select_device
     global resolve_text_policy
+    global build_input_cache_contract, load_input_cache_meta, validate_input_cache_contract
     if torch is not None:
         return
 
@@ -89,6 +108,7 @@ def _lazy_runtime_imports() -> None:
     from data import (
         ManifestIngressConfig as _ManifestIngressConfig,
         StreamingManifestDataset as _StreamingManifestDataset,
+        CachedManifestDataset as _CachedManifestDataset,
         cache_manifest_text_tokens as _cache_manifest_text_tokens,
         collate_manifest_items as _collate_manifest_items,
     )
@@ -133,12 +153,18 @@ def _lazy_runtime_imports() -> None:
         select_device as _select_device,
     )
     from text_policy_utils import resolve_text_policy as _resolve_text_policy
+    from input_cache import (
+        build_input_cache_contract as _build_input_cache_contract,
+        load_input_cache_meta as _load_input_cache_meta,
+        validate_input_cache_contract as _validate_input_cache_contract,
+    )
 
     torch = _torch
     DataLoader = _DataLoader
     tqdm = _tqdm
     ManifestIngressConfig = _ManifestIngressConfig
     StreamingManifestDataset = _StreamingManifestDataset
+    CachedManifestDataset = _CachedManifestDataset
     cache_manifest_text_tokens = _cache_manifest_text_tokens
     collate_manifest_items = _collate_manifest_items
     GpuStreamConfig = _GpuStreamConfig
@@ -175,9 +201,20 @@ def _lazy_runtime_imports() -> None:
     resolve_worker_count = _resolve_worker_count
     select_device = _select_device
     resolve_text_policy = _resolve_text_policy
+    build_input_cache_contract = _build_input_cache_contract
+    load_input_cache_meta = _load_input_cache_meta
+    validate_input_cache_contract = _validate_input_cache_contract
 
 
 def parse_args() -> argparse.Namespace:
+    """定义并解析批量推理 CLI 参数。
+
+    这里最关键的参数是：
+    - `--split-manifest`: 当前要评估的数据清单
+    - `--checkpoint`: 必须指向训练阶段选出的 `best.pt`
+    - `--subset`: 指定评估 train/val/test 中哪一部分
+    """
+
     p = argparse.ArgumentParser(description="Batch inference for the manifest-driven gpu_stream mainline")
     p.add_argument("--split-manifest", type=Path, required=True)
     p.add_argument("--subset", type=str, default="all", choices=["all", "train", "val", "test"])
@@ -187,6 +224,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text-policy", type=str, default="")
     p.add_argument("--checkpoint", type=Path, default=Path("outputs/motion_prosody/checkpoints/best.pt"))
     p.add_argument("--output", type=Path, default=Path("outputs/motion_prosody/inference_results.jsonl"))
+    p.add_argument("--input-cache", type=Path, default=None, help="Optional mainline input cache directory built by build_mainline_input_cache.py")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--batch-size", type=str, default="auto")
     p.add_argument("--num-workers", type=str, default="auto")
@@ -240,6 +278,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_compat_args(args: argparse.Namespace) -> None:
+    """清理旧版兼容参数，并把少量历史别名映射到新行为。"""
+
     if args.cached_dataset is not None or args.feature_cache is not None:
         raise RuntimeError(
             "Mainline inference no longer supports --cached-dataset or --feature-cache. "
@@ -263,10 +303,14 @@ def _validate_compat_args(args: argparse.Namespace) -> None:
 
 
 def _normalize_optional_text(value: Any) -> str:
+    """把可选文本配置规范化为去首尾空白的字符串。"""
+
     return str(value or "").strip()
 
 
 def _normalize_optional_upper(value: Any) -> str | None:
+    """把可选字符串标准化为大写形式，常用于 speaker_id。"""
+
     text = str(value or "").strip().upper()
     return text or None
 
@@ -279,6 +323,13 @@ def _raise_or_record_mismatch(
     reasons: list[str],
     allow_mismatch: bool,
 ) -> None:
+    """比较一项训练契约字段与当前推理字段是否一致。
+
+    默认策略是“不一致就失败”，因为论文级评测不能静默混用错配置。
+    只有用户显式打开 `--allow-incompatible-checkpoint` 时，才记录警告并把
+    当前评测结果标记为 paper-grade ineligible。
+    """
+
     if expected == actual:
         return
     message = f"{field} mismatch: expected {expected!r}, got {actual!r}"
@@ -295,6 +346,12 @@ def _checkpoint_run_contract(
     label_names: list[str],
     validity: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """从 checkpoint 恢复训练时的 run contract。
+
+    新版 checkpoint 会直接存 `paper_contract`。如果读到的是旧 checkpoint，
+    就用它保存的 args 和元数据尽量补建一份契约，方便后面统一走兼容校验。
+    """
+
     contract = ckpt.get("paper_contract", {})
     if isinstance(contract, dict) and contract:
         normalized = dict(contract)
@@ -324,6 +381,8 @@ def _checkpoint_run_contract(
 
 
 def _checkpoint_provenance(ckpt: dict[str, Any], *, deterministic_policy: dict[str, Any], profile: Any) -> dict[str, Any]:
+    """从 checkpoint 恢复 provenance；缺失时生成最小兜底记录。"""
+
     provenance = ckpt.get("provenance", {})
     if isinstance(provenance, dict) and provenance:
         return dict(provenance)
@@ -336,6 +395,8 @@ def _checkpoint_provenance(ckpt: dict[str, Any], *, deterministic_policy: dict[s
 
 
 def _assert_finite_tensor(name: str, value: Any) -> None:
+    """在推理时拦截 NaN/Inf，避免把异常输出写进正式结果。"""
+
     if value is None:
         return
     if isinstance(value, torch.Tensor):
@@ -349,6 +410,8 @@ def _assert_finite_tensor(name: str, value: Any) -> None:
 
 
 def _load_tokenizer(model_name: str) -> Any:
+    """加载推理阶段使用的 tokenizer。"""
+
     try:
         ensure_transformers_torch_compat()
         from transformers import AutoTokenizer
@@ -374,8 +437,16 @@ def _load_model(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
+    dict[str, Any] | None,
     list[str],
 ]:
+    """加载 checkpoint，并恢复推理所需的模型与实验契约信息。
+
+    这个函数除了“把权重 load 进模型”，还承担两个论文级职责：
+    1. 恢复训练时到底用了什么模型结构、任务设置、文本策略
+    2. 在用户尝试覆盖这些关键配置时，决定是直接报错还是降级为不合格评测
+    """
+
     _lazy_runtime_imports()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
@@ -384,6 +455,8 @@ def _load_model(
     validity = ckpt.get("validity", None) if isinstance(ckpt, dict) and isinstance(ckpt.get("validity"), dict) else None
     compatibility_reasons: list[str] = []
 
+    # 这些值默认优先使用 checkpoint 内保存的训练配置，
+    # 因为论文级推理必须“跟训练时选出来的模型保持同一个定义”。
     text_model = str(ckpt_args.get("text_model", "") or "xlm-roberta-large")
     audio_model = str(ckpt_args.get("audio_model", "") or "microsoft/wavlm-large")
     audio_model_revision = str(ckpt_args.get("audio_model_revision", "") or "")
@@ -449,6 +522,8 @@ def _load_model(
         allow_mismatch=bool(args.allow_incompatible_checkpoint),
     )
 
+    # 只有在用户显式传入覆盖参数时，才尝试替换本地变量；
+    # 替换前已经由 `_raise_or_record_mismatch()` 做过硬校验或降级记录。
     if _normalize_optional_text(args.text_model):
         text_model = _normalize_optional_text(args.text_model)
     if _normalize_optional_text(args.audio_model):
@@ -491,6 +566,7 @@ def _load_model(
             allow_mismatch=bool(args.allow_incompatible_checkpoint),
         )
 
+    # 推理阶段统一把各编码器 freeze 掉，因为这里只需要前向。
     model = FusionClassifier(
         num_classes=len(label_names),
         freeze_audio=True,
@@ -512,6 +588,7 @@ def _load_model(
         intensity_head=bool(use_intensity),
     )
     if bool(args.allow_incompatible_checkpoint):
+        # 只有在显式“允许不兼容”的情况下，才允许 strict=False。
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             print(f"WARNING: missing checkpoint keys: {missing[:6]}" + (" ..." if len(missing) > 6 else ""), flush=True)
@@ -529,6 +606,11 @@ def _load_model(
         deterministic_policy={"seed": 0, "deterministic_requested": True},
         profile={},
     )
+    checkpoint_input_cache_contract = (
+        dict(ckpt.get("input_cache_contract"))
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("input_cache_contract"), dict)
+        else None
+    )
     return (
         model,
         bool(use_intensity),
@@ -540,17 +622,22 @@ def _load_model(
         checkpoint_contract,
         checkpoint_paper_grade,
         checkpoint_provenance,
+        checkpoint_input_cache_contract,
         compatibility_reasons,
     )
 
 
 def _truncate_text(text: str, max_len: int) -> str:
+    """按需要截断长文本，避免日志/JSON 中出现过长样本内容。"""
+
     if int(max_len) <= 0 or len(text) <= int(max_len):
         return text
     return text[: int(max_len)] + "..."
 
 
 def _format_error_record(item: dict[str, Any], err: Exception, *, text_max_len: int) -> dict[str, Any]:
+    """把单个失败样本格式化成标准错误记录。"""
+
     return {
         "stem": str(item.get("stem", item.get("seq", ""))),
         "status": "error",
@@ -572,10 +659,14 @@ def _infer_batch(
     use_intensity: bool,
     amp_mode: str,
 ) -> list[dict[str, Any]]:
+    """对一个 batch 执行前向推理，并返回逐样本记录。"""
+
     _lazy_runtime_imports()
+    # 复用训练时同一套 preprocessor，保证推理前的张量构造方式与训练一致。
     batch = preprocessor.prepare_batch(items, tokenizer=tokenizer, text_policy=text_policy, max_text_len=max_text_len)
     labels = batch["labels"]
     device = next(model.parameters()).device
+    # 推理始终关闭梯度，但仍可根据设备和 AMP 配置使用 autocast。
     with torch.no_grad(), autocast_context(device, amp_mode):
         if model.video_backbone == "videomae":
             flow = None
@@ -608,6 +699,7 @@ def _infer_batch(
     pred_intensity_cpu = pred_intensity.detach().cpu().to(torch.float32) if pred_intensity is not None else None
     label_names = list(getattr(model, "_label_names", []))
 
+    # 每个样本都会写成一条独立记录，方便后续做误差分析和重放。
     records: list[dict[str, Any]] = []
     for idx, stem in enumerate(batch["stems"]):
         rec = {
@@ -632,9 +724,20 @@ def _infer_batch(
 
 
 def main() -> None:
+    """主推理入口。
+
+    整体流程：
+    1. 解析参数并加载 checkpoint
+    2. 校验 checkpoint 契约与当前 manifest/CLI 是否一致
+    3. 构建 dataset、DataLoader、preprocessor
+    4. 逐 batch 推理并写出 JSONL
+    5. 从逐样本结果汇总出 metrics.json
+    """
+
     args = parse_args()
     _validate_compat_args(args)
     _lazy_runtime_imports()
+    # 推理本身不做优化，但仍固定种子，确保 DataLoader 与随机路径可复现。
     deterministic_policy = set_seed(0)
 
     split_manifest_path = args.split_manifest.expanduser()
@@ -644,6 +747,7 @@ def main() -> None:
         raise FileNotFoundError(f"Split manifest not found: {split_manifest_path}")
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    # 论文级正式评测只接受验证集选出来的那个 `best.pt`。
     if ckpt_path.name != "best.pt" and not bool(args.allow_incompatible_checkpoint):
         raise RuntimeError(f"checkpoint must point to best.pt for paper-grade evaluation, got: {ckpt_path.name}")
 
@@ -663,17 +767,21 @@ def main() -> None:
         checkpoint_contract,
         checkpoint_paper_grade,
         checkpoint_provenance,
+        checkpoint_input_cache_contract,
         compatibility_reasons,
     ) = _load_model(
         ckpt_path,
         device=device,
         args=args,
     )
+    # 后续所有“为什么这次评测不再算 paper-grade”的原因都汇总到这里。
     paper_grade_reasons = list(compatibility_reasons)
     if bool(args.allow_incompatible_checkpoint):
         paper_grade_reasons.append("allow_incompatible_checkpoint_enabled")
     if ckpt_path.name != "best.pt":
         paper_grade_reasons.append("checkpoint_name_mismatch")
+    # `flow_encoder_variant` 是这条主线里很关键的结构语义字段，
+    # 目的是防止不同版本的 flow 分支 checkpoint 被静默混评。
     _raise_or_record_mismatch(
         field="flow_encoder_variant",
         expected=str(checkpoint_contract.get("flow_encoder_variant", LEGACY_FLOW_VIDEO_ENCODER_VARIANT)),
@@ -753,6 +861,8 @@ def main() -> None:
         repo_root=Path(__file__).resolve().parent,
     )
 
+    # 推理使用的是“当前磁盘上的 manifest”，因此需要重新计算 validity，
+    # 再和 checkpoint 当时的契约逐项比较，防止 stale metadata。
     manifest = load_split_manifest(split_manifest_path)
     manifest_hash = manifest_sha256(split_manifest_path)
     manifest_summary = manifest.get("summary", {})
@@ -815,9 +925,53 @@ def main() -> None:
         zero_video=bool(args.zero_video),
         video_backbone=str(model.video_backbone),
     )
-    ds = StreamingManifestDataset(items, ingress=ingress_cfg)
+    need_audio = not bool(args.zero_audio)
+    need_video = (not bool(args.zero_video)) and str(model.video_backbone) in {"flow", "videomae", "dual"}
+    need_text = not bool(args.zero_text)
+    input_cache_contract = None
+    input_cache_dir = args.input_cache.expanduser() if args.input_cache is not None else None
+    if input_cache_dir is not None:
+        cache_meta = load_input_cache_meta(input_cache_dir)
+        input_cache_contract = build_input_cache_contract(cache_meta)
+        cache_mismatch_reasons = validate_input_cache_contract(
+            input_cache_contract,
+            manifest_sha256=manifest_hash,
+            dataset_kind=dataset_kind,
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            num_frames=int(args.num_frames),
+            text_model=str(args.text_model).strip() or str(model.text.model_name),
+            max_text_len=128,
+            need_audio=bool(need_audio),
+            need_video=bool(need_video),
+            need_text=bool(need_text),
+            text_policy=str(text_policy),
+        )
+        if cache_mismatch_reasons:
+            raise RuntimeError(
+                "Input cache contract mismatch: " + ", ".join(str(reason) for reason in cache_mismatch_reasons)
+            )
+        if isinstance(checkpoint_input_cache_contract, dict) and checkpoint_input_cache_contract:
+            _raise_or_record_mismatch(
+                field="input_cache_contract",
+                expected=checkpoint_input_cache_contract,
+                actual=input_cache_contract,
+                reasons=paper_grade_reasons,
+                allow_mismatch=bool(args.allow_incompatible_checkpoint),
+            )
+        ds = CachedManifestDataset(
+            items,
+            ingress=ingress_cfg,
+            cache_dir=input_cache_dir,
+            text_policy=str(text_policy),
+            runtime_profile=profile,
+        )
+    else:
+        ds = StreamingManifestDataset(items, ingress=ingress_cfg)
     tokenizer = None
-    if not bool(args.zero_text):
+    if not bool(args.zero_text) and input_cache_contract is None:
+        # 推理文本 token 同样会先缓存到 manifest item 中，
+        # 避免每个 batch 反复调用 tokenizer。
         tokenizer = _load_tokenizer(str(args.text_model).strip() or str(model.text.model_name))
         cache_manifest_text_tokens(ds.items, tokenizer, max_text_len=128, text_policy=str(text_policy))
 
@@ -836,7 +990,8 @@ def main() -> None:
         args.num_workers,
         phase="inference",
         profile=profile,
-        dataset_in_memory=False,
+        dataset_in_memory=bool(getattr(ds, "in_memory", False)),
+        cache_backed=bool(input_cache_contract is not None),
         total_items=len(items),
     )
     prefetch_factor = resolve_prefetch_factor("auto", num_workers=int(resolved_num_workers))
@@ -918,6 +1073,8 @@ def main() -> None:
         except Exception as batch_err:
             if bool(args.fail_fast):
                 raise
+            # 非 fail-fast 模式下，先尝试把整批拆成逐样本推理，
+            # 尽量保住其它样本的结果，只把真正失败的样本记成 error record。
             if len(batch_items) > 1:
                 for item in batch_items:
                     try:
@@ -948,6 +1105,7 @@ def main() -> None:
             acc = float(correct / max(1, len(ok_records)))
             print(f"[{len(records)}/{len(items)}] ok={len(ok_records)} err={error_count} acc={acc:.4f}", flush=True)
 
+    # 逐样本记录是最原始的正式产物；后面的 metrics 汇总都会从这里再聚合。
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         for rec in records:
@@ -992,6 +1150,8 @@ def main() -> None:
 
     paper_grade = build_paper_grade(validity_summary=validity, ineligibility_reasons=paper_grade_reasons)
 
+    # metrics_summary 是推理阶段的正式摘要文件，
+    # 聚合脚本会直接消费这里的字段做多 seed 统计。
     metrics_summary = {
         "split_manifest": str(split_manifest_path),
         "subset": str(args.subset),
@@ -1029,6 +1189,9 @@ def main() -> None:
         "resolved_batch_size": int(resolved_batch_size),
         "resolved_num_workers": int(resolved_num_workers),
         "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+        "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+        "input_cache_contract": input_cache_contract,
+        "input_cache_in_memory": bool(getattr(ds, "in_memory", False)),
         "manifest_sha256": manifest_hash,
         "manifest_summary": manifest_summary,
         "validity": validity,
@@ -1037,6 +1200,7 @@ def main() -> None:
         "provenance": inference_provenance,
         "checkpoint_paper_grade": checkpoint_paper_grade,
         "checkpoint_provenance": checkpoint_provenance,
+        "checkpoint_input_cache_contract": checkpoint_input_cache_contract,
         "paper_grade": paper_grade,
         "run_status": str(run_status),
     }

@@ -1,3 +1,9 @@
+"""构建主线 split manifest 的命令行入口。
+
+主线训练与推理不再直接扫描磁盘数据集，而是先把样本、标签、路径和划分
+规则固定为一份 manifest。这个脚本负责生成那份“训练事实来源”。
+"""
+
 from __future__ import annotations
 
 import argparse

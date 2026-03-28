@@ -7,7 +7,8 @@
 这版手册只保留当前主线实现对应的 GPU 路线：
 
 - 训练与推理统一走 `gpu_stream`
-- 中间不再写 `raw/feature cache` shard
+- 中间不再写旧 `raw/feature cache` shard
+- 允许使用新的 `mainline input cache` 作为论文级等价加速路径
 - 共享前置步骤只保留 manifest、音频 sidecar 和模型下载
 
 有两个必须明确的实现事实：
@@ -97,12 +98,73 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
+## 可选的主线输入缓存加速路径
+
+如果你的 GPU 服务器 CPU 明显喂不满 GPU，正式实验推荐使用新的 `mainline input cache`。它和旧 `feature cache` 不是一回事：
+
+- 新 `input cache` 只缓存当前主线等价输入：`load_audio()` 输出波形、均匀采样后的原始视频帧、以及 `full/masked` 文本 token
+- 它不会缓存 prosody、legacy flow、音频 embedding 或文本 embedding
+- 因此它仍然属于论文级等价加速路径，只要 `input_cache_contract` 与当前运行参数匹配
+
+推荐做法是：
+
+1. 在 CPU 服务器上构建缓存
+2. 把缓存目录整体拷到 GPU 服务器
+3. 四组正式实验统一通过 `--input-cache` 读取
+
+建议固定使用下面三套缓存目录：
+
+- 实验一：`outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1`
+- 实验二/三：`outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1`
+- 实验四：`outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1`
+
+CPU 服务器构建命令：
+
+```bash
+python3 build_mainline_input_cache.py \
+  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+  --output-dir outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1 \
+  --subset all \
+  --sample-rate 16000 \
+  --max-audio-sec 6 \
+  --text-model FacebookAI/xlm-roberta-large \
+  --max-text-len 128 \
+  --num-workers auto
+
+python3 build_mainline_input_cache.py \
+  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+  --output-dir outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1 \
+  --subset all \
+  --sample-rate 16000 \
+  --max-audio-sec 6 \
+  --text-model FacebookAI/xlm-roberta-large \
+  --max-text-len 128 \
+  --include-video \
+  --num-frames 16 \
+  --num-workers auto
+
+python3 build_mainline_input_cache.py \
+  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+  --output-dir outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1 \
+  --subset all \
+  --sample-rate 16000 \
+  --max-audio-sec 6 \
+  --text-model FacebookAI/xlm-roberta-large \
+  --max-text-len 128 \
+  --include-video \
+  --num-frames 32 \
+  --num-workers auto
+```
+
+GPU 服务器上只需要把目录拷过来，后续训练/推理命令统一附带对应的 `--input-cache ...`。如果你不使用这个加速路径，删掉 `--input-cache` 那一行即可；正式论文口径仍然成立，只是 CPU 压力会更高。
+
 ## 统一的停止与报告协议
 
 从这一版开始，四组 MELD GPU 实验不再采用“单次 run 里连续 5 轮没涨就停”的经验式口径，而统一采用下面这套更稳妥的协议：
 
 - headline 结果一律来自 `5` 个固定随机种子：`13 17 23 42 3407`
 - 每个 seed 都独立训练一次，只允许用验证集选择 `checkpoints/best.pt`
+- 同一组 `5` 个 seed 必须统一 `--input-cache` 使用方式，不能一部分走缓存、一部分走原始流式路径
 - 测试集只在该 seed 训练结束后跑一次，不能参与早停、调参或挑 checkpoint
 - 主监控指标固定为 `val_f1`
 - “真正提升”定义为：当前 `val_f1 > 历史最好 val_f1 + 0.002`
@@ -211,7 +273,7 @@ export TRANSFORMERS_OFFLINE=1
 
 ### 命令
 
-这是实验一的正式论文级运行口径。不要再为它额外执行 `build_feature_cache.py`。
+这是实验一的正式论文级运行口径。不要再为它额外执行 `build_feature_cache.py`；如果想减轻 GPU 服务器 CPU 压力，直接使用下面的 `--input-cache`。
 训练、`val` 推理、`test` 推理分别按下面三个 loop 执行；每个 loop 会把 `5` 个 seed 全部跑完。
 当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
@@ -219,12 +281,14 @@ export TRANSFORMERS_OFFLINE=1
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}
 
   python3 train.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
     --epochs 80 \
     --device auto \
@@ -263,10 +327,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset val \
     --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_val.jsonl \
@@ -291,10 +357,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset test \
     --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_test.jsonl \
@@ -386,7 +454,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_si
 
 ### 命令
 
-这是实验二的正式论文级运行口径。不要再为它生成 `feature_cache_tri_*` 一类目录。
+这是实验二的正式论文级运行口径。不要再为它生成旧 `feature_cache_tri_*` 一类目录；正式加速方式改用下面的 `--input-cache`。
 训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
 当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
@@ -394,12 +462,14 @@ python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_si
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}
 
   python3 train.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
     --epochs 50 \
     --device auto \
@@ -438,10 +508,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset val \
     --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_val.jsonl \
@@ -467,10 +539,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset test \
     --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_test.jsonl \
@@ -559,7 +633,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed
 
 ### 命令
 
-这是实验三的正式论文级运行口径。它直接从原始媒体流式训练，不需要任何中间 shard。
+这是实验三的正式论文级运行口径。它不需要旧中间 shard；如果想减少 GPU 服务器 CPU 压力，直接复用实验二同一套 `rgb16` 输入缓存。
 训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
 当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。但你当前这类 `K100_AI`/旧内核服务器已经实测在 worker 模式下会于首个 batch 附近触发 `Segmentation fault (core dumped)`，因此本机应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
@@ -567,12 +641,14 @@ python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}
 
   python3 train.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
     --epochs 40 \
     --device auto \
@@ -608,10 +684,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset val \
     --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_val.jsonl \
@@ -637,10 +715,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset test \
     --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_test.jsonl \
@@ -730,7 +810,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_
 
 ### 命令
 
-这是实验四的正式论文级运行口径。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令。
+这是实验四的正式论文级运行口径。它对应当前 GPU 版 `dual(torch_motion + RGB)` 主线，不要再混用旧 CPU 光流缓存命令；正式加速方式改用下面的 `rgb32` 输入缓存。
 训练、`val` 推理、`test` 推理分别按下面三个 loop 执行，全部使用同一组 `5` 个 seed。
 当前 GPU 主线已经把媒体 ingress 挪到 `DataLoader worker`，默认推荐 `--num-workers auto`。如果你的服务器在 worker 模式下于首个 batch 附近触发 `Segmentation fault (core dumped)`，应把下面命令里的 `--num-workers auto` 改成 `--num-workers 0`。
 
@@ -738,12 +818,14 @@ python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}
 
   python3 train.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
     --epochs 60 \
     --device auto \
@@ -781,10 +863,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset val \
     --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_val.jsonl \
@@ -812,10 +896,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --input-cache ${INPUT_CACHE} \
     --subset test \
     --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
     --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_test.jsonl \

@@ -4,6 +4,7 @@
 
 - `python build_split_manifest.py --dataset-kind meld --data-root <media_root> --metadata-root <metadata_root> --output <manifest.json>`
 - `python prepare_dataset_media.py --dataset-kind meld --split-manifest <manifest.json> --subset all`
+- `python build_mainline_input_cache.py --split-manifest <manifest.json> --output-dir outputs/input_cache/<name>`
 - `python train.py --split-manifest <manifest.json> --output-dir outputs/motion_prosody`
 - `python batch_inference.py --split-manifest <manifest.json> --subset val --checkpoint outputs/motion_prosody/checkpoints/best.pt`
 
@@ -19,6 +20,7 @@
 - 同一 `manifest_sha256`
 - `checkpoints/best.pt` 的验证/测试评测
 - 与当前代码一致的 `paper_contract`，包括 `video_backbone` / `flow_encoder_variant`
+- 如果使用缓存，则必须是 `build_mainline_input_cache.py` 生成且 `input_cache_contract` 完全兼容的主线输入缓存
 - `paper_grade.eligible=true` 的训练、推理与多 seed 汇总产物
 
 对于 `legacy/baseline_v1/` 或任何 `scientific_validity=false` 的结果，只能按 archival / confounded benchmark 解释，不能写成跨说话人情绪泛化证据。
