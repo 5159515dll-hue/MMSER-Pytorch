@@ -293,9 +293,16 @@ class CachedManifestDataset(Dataset):
             out["_audio_backend"] = str(payload.get("_audio_backend", "input_cache"))
 
         if need_video:
-            if "video_frames" not in payload:
-                raise RuntimeError(f"Cached sample missing video_frames payload: {cache_key}")
-            out["video_frames"] = payload["video_frames"].to(torch.uint8)
+            if "cached_rgb" in payload:
+                # 新版主线缓存直接保存已经按训练口径 crop/resize 完的 RGB clip。
+                # 这样 CPU 服务器只做一次重活，GPU 服务器训练时不再重复做同样的
+                # 视频预处理，也显著降低单样本缓存体积。
+                out["cached_rgb"] = payload["cached_rgb"].to(torch.float16)
+            elif "video_frames" in payload:
+                # 保留对旧缓存格式的兼容：如果缓存里还是原始采样帧，就继续走老字段。
+                out["video_frames"] = payload["video_frames"].to(torch.uint8)
+            else:
+                raise RuntimeError(f"Cached sample missing video payload: {cache_key}")
             out["_video_backend"] = str(payload.get("_video_backend", "input_cache"))
 
         if str(self.text_policy) == "full":

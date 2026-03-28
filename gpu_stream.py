@@ -185,6 +185,17 @@ class GpuStreamPreprocessor:
         if str(self.cfg.flow_backend) not in {"torch_motion", "legacy"}:
             raise RuntimeError(f"Unsupported flow backend: {self.cfg.flow_backend}")
         rgb = self._prepare_rgb(frames)
+        return self._prepare_motion_from_rgb(rgb)
+
+    def _prepare_motion_from_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
+        """从已经预处理好的 RGB clip 构造 motion/flow 表征。
+
+        这个辅助函数专门服务新的 `input cache`：
+        - 流式路径会先读原始帧，再调用 `_prepare_rgb()`
+        - 缓存路径会直接提供已经处理好的 `cached_rgb`
+        两条路径最终都在这里汇合，确保 flow 分支看到的是同一套数学定义。
+        """
+
         # 先把三通道 RGB 压成灰度，减少后续差分和梯度计算开销。
         gray = (
             0.2989 * rgb[:, 0]
@@ -266,19 +277,30 @@ class GpuStreamPreprocessor:
         need_rgb = (not bool(self.cfg.zero_video)) and str(self.cfg.video_backbone) in {"videomae", "dual"}
         need_flow = (not bool(self.cfg.zero_video)) and str(self.cfg.video_backbone) in {"flow", "dual"}
         if need_rgb or need_flow:
-            if "video_frames" in item and isinstance(item["video_frames"], torch.Tensor):
+            if "cached_rgb" in item and isinstance(item["cached_rgb"], torch.Tensor):
+                rgb = item["cached_rgb"].to(self.cfg.device, dtype=torch.float32)
+                self._bump_counter(self._video_backend_counts, str(item.get("_video_backend", "input_cache_rgb")))
+                if need_rgb:
+                    sample["rgb"] = rgb
+                if need_flow:
+                    sample["flow"] = self._prepare_motion_from_rgb(rgb)
+            elif "video_frames" in item and isinstance(item["video_frames"], torch.Tensor):
                 frames = item["video_frames"].to(self.cfg.device)
                 self._bump_counter(self._video_backend_counts, str(item.get("_video_backend", "prefetched")))
+                if need_rgb:
+                    sample["rgb"] = self._prepare_rgb(frames)
+                if need_flow:
+                    sample["flow"] = self._prepare_motion(frames)
             else:
                 video_path = Path(str(item.get("video_path", ""))).expanduser()
                 if not video_path.exists():
                     raise FileNotFoundError(f"Manifest video_path not found: {video_path}")
                 frames = self._read_video_frames(video_path)
                 self._bump_counter(self._video_backend_counts, str(self.cfg.video_decode_backend))
-            if need_rgb:
-                sample["rgb"] = self._prepare_rgb(frames)
-            if need_flow:
-                sample["flow"] = self._prepare_motion(frames)
+                if need_rgb:
+                    sample["rgb"] = self._prepare_rgb(frames)
+                if need_flow:
+                    sample["flow"] = self._prepare_motion(frames)
         return sample
 
     def prepare_batch(

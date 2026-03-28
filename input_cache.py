@@ -3,7 +3,7 @@
 这个模块只服务当前 manifest-driven `gpu_stream` 主线。它定义了一种
 “论文级等价的输入缓存”：
 - 音频缓存的是 `load_audio()` 的输出波形
-- 视频缓存的是已经均匀采样好的原始 `uint8` 帧
+- 视频缓存的是已经按主线规则 resize/crop 完的 RGB clip
 - 文本缓存的是 tokenizer 输出的 token
 
 它故意不缓存以下内容：
@@ -109,10 +109,12 @@ def build_input_cache_contract(meta: dict[str, Any]) -> dict[str, Any]:
         "sample_rate": int(meta.get("sample_rate", 0) or 0),
         "max_audio_sec": float(meta.get("max_audio_sec", 0.0) or 0.0),
         "num_frames": int(meta.get("num_frames", 0) or 0),
+        "rgb_size": int(meta.get("rgb_size", 0) or 0),
         "text_model": str(meta.get("text_model", "")),
         "max_text_len": int(meta.get("max_text_len", 0) or 0),
         "has_audio": bool(meta.get("has_audio", False)),
         "has_video": bool(meta.get("has_video", False)),
+        "video_representation": str(meta.get("video_representation", "")),
         "has_text_full_tokens": bool(meta.get("has_text_full_tokens", False)),
         "has_text_masked_tokens": bool(meta.get("has_text_masked_tokens", False)),
         "subset": str(meta.get("subset", "all")),
@@ -139,6 +141,7 @@ def validate_input_cache_contract(
     sample_rate: int,
     max_audio_sec: float,
     num_frames: int,
+    rgb_size: int,
     text_model: str,
     max_text_len: int,
     need_audio: bool,
@@ -169,6 +172,10 @@ def validate_input_cache_contract(
             reasons.append("missing_cached_video")
         if int(contract.get("num_frames", 0) or 0) != int(num_frames):
             reasons.append("num_frames_mismatch")
+        if int(contract.get("rgb_size", 0) or 0) != int(rgb_size):
+            reasons.append("rgb_size_mismatch")
+        if str(contract.get("video_representation", "")) != "prepared_rgb_fp16":
+            reasons.append("video_representation_mismatch")
 
     if bool(need_text):
         if not _hf_model_name_matches(str(contract.get("text_model", "")), str(text_model)):
@@ -277,8 +284,19 @@ def build_cached_media_payload(task: dict[str, Any]) -> dict[str, Any]:
             num_frames=int(task["num_frames"]),
             backend=str(task.get("video_decode_backend", "auto")),
         )
-        payload["video_frames"] = frames_cpu.contiguous()
+        from gpu_stream import GpuStreamConfig, GpuStreamPreprocessor
+
+        preprocessor = GpuStreamPreprocessor(
+            GpuStreamConfig(
+                device=torch.device("cpu"),
+                num_frames=int(task["num_frames"]),
+                rgb_size=int(task["rgb_size"]),
+            )
+        )
+        rgb = preprocessor._prepare_rgb(frames_cpu.to(torch.device("cpu")))
+        payload["cached_rgb"] = rgb.to(torch.float16).cpu().contiguous()
         payload["_video_backend"] = str(video_backend)
+        payload["_video_representation"] = "prepared_rgb_fp16"
 
     full_tokens = task.get("text_full", None)
     if isinstance(full_tokens, dict) and full_tokens:

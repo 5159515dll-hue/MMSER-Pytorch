@@ -102,7 +102,7 @@ export TRANSFORMERS_OFFLINE=1
 
 如果你的 GPU 服务器 CPU 明显喂不满 GPU，正式实验推荐使用新的 `mainline input cache`。它和旧 `feature cache` 不是一回事：
 
-- 新 `input cache` 只缓存当前主线等价输入：`load_audio()` 输出波形、均匀采样后的原始视频帧、以及 `full/masked` 文本 token
+- 新 `input cache` 只缓存当前主线等价输入：`load_audio()` 输出波形、已经按主线规则 crop/resize 完的 RGB clip、以及 `full/masked` 文本 token
 - 它不会缓存 prosody、legacy flow、音频 embedding 或文本 embedding
 - 因此它仍然属于论文级等价加速路径，只要 `input_cache_contract` 与当前运行参数匹配
 
@@ -141,6 +141,7 @@ python3 build_mainline_input_cache.py \
   --max-text-len 128 \
   --include-video \
   --num-frames 16 \
+  --rgb-size 224 \
   --num-workers auto
 
 python3 build_mainline_input_cache.py \
@@ -153,8 +154,11 @@ python3 build_mainline_input_cache.py \
   --max-text-len 128 \
   --include-video \
   --num-frames 32 \
+  --rgb-size 224 \
   --num-workers auto
 ```
+
+如果你已经在旧代码上开始构建视频缓存，或者在 CPU 服务器上遇到 `PytorchStreamWriter failed writing file data/1` / `unexpected pos` 这类写盘错误，先删除未完成的视频缓存目录后再重跑。当前主线的视频缓存会保存更小的预处理后 RGB clip，不再推荐继续保留旧的半成品目录。
 
 GPU 服务器上只需要把目录拷过来，后续训练/推理命令统一附带对应的 `--input-cache ...`。如果你不使用这个加速路径，删掉 `--input-cache` 那一行即可；正式论文口径仍然成立，只是 CPU 压力会更高。
 

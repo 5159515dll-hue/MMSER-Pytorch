@@ -20,8 +20,8 @@
   - `provenance`
   - `validity`
 - `paper_contract` 必须锁住关键架构/预处理口径，包括 `video_backbone` 和当前 `flow_encoder_variant`；架构语义变化后，旧 checkpoint 不能与新主线混评。
-- 如果使用 `--input-cache`，缓存契约必须与当前 `manifest_sha256`、`dataset_kind`、`sample_rate`、`max_audio_sec`、`num_frames`、`text_model`、`max_text_len` 完全兼容；否则训练/推理应直接失败，而不是静默降级。
-- 允许的缓存只有当前主线 `build_mainline_input_cache.py` 生成的输入缓存；它只能缓存波形、采样帧和 token，不能缓存 prosody、flow 或 encoder embedding。
+- 如果使用 `--input-cache`，缓存契约必须与当前 `manifest_sha256`、`dataset_kind`、`sample_rate`、`max_audio_sec`、`num_frames`、`rgb_size`、`text_model`、`max_text_len` 完全兼容；否则训练/推理应直接失败，而不是静默降级。
+- 允许的缓存只有当前主线 `build_mainline_input_cache.py` 生成的输入缓存；它只能缓存波形、按主线规则预处理好的 RGB clip 和 token，不能缓存 prosody、flow 或 encoder embedding。
 - 多 seed headline 结果必须使用固定 seed 集：`13 17 23 42 3407`。
 - 同一组多 seed 正式实验必须统一缓存路径策略：要么全部不使用 `--input-cache`，要么全部使用同一套兼容的 `input_cache_contract`；不能混跑。
 - 多 seed 汇总必须报告：

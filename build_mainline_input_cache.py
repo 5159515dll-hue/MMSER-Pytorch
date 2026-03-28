@@ -3,7 +3,7 @@
 这一步设计给 CPU 服务器执行：
 1. 读取 manifest
 2. 预加载音频波形
-3. 预采样视频帧
+3. 预采样并按主线规则预处理视频 RGB clip
 4. 预分词 full / masked 文本
 5. 把结果写成可搬运到 GPU 服务器的缓存目录
 
@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-text-len", type=int, default=128)
     p.add_argument("--include-video", action="store_true")
     p.add_argument("--num-frames", type=int, default=16)
+    p.add_argument("--rgb-size", type=int, default=224)
     p.add_argument("--audio-backend", type=str, default="auto", choices=["auto", "torchaudio", "soundfile"])
     p.add_argument("--video-decode-backend", type=str, default="auto", choices=["auto", "decord", "cpu"])
     p.add_argument("--num-workers", type=str, default="auto")
@@ -142,6 +143,7 @@ def _prepare_tasks(
             "audio_backend_mode": str(args.audio_backend),
             "video_decode_backend": str(args.video_decode_backend),
             "num_frames": int(args.num_frames),
+            "rgb_size": int(args.rgb_size),
             "text_full": token_map[key]["text_full"],
             "text_masked": token_map[key]["text_masked"],
         }
@@ -199,6 +201,7 @@ def main() -> None:
                 "resolved_num_workers": int(resolved_workers),
                 "include_video": bool(args.include_video),
                 "num_frames": int(args.num_frames) if bool(args.include_video) else 0,
+                "rgb_size": int(args.rgb_size) if bool(args.include_video) else 0,
                 "sample_rate": int(args.sample_rate),
                 "max_audio_sec": float(args.max_audio_sec),
             },
@@ -219,7 +222,13 @@ def main() -> None:
         relpath = sample_relpath_for_key(key)
         path = out_dir / relpath
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(result["payload"], path)
+        try:
+            torch.save(result["payload"], path)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to write cached sample {key} -> {path}. "
+                "This is commonly caused by insufficient free disk space."
+            ) from exc
         entries.append(
             {
                 "cache_key": key,
@@ -229,7 +238,7 @@ def main() -> None:
                 "seq": str(result["payload"].get("meta", {}).get("seq", "")),
                 "sample_id": str(result["payload"].get("meta", {}).get("sample_id", "")),
                 "has_audio": "audio" in result["payload"],
-                "has_video": "video_frames" in result["payload"],
+                "has_video": "cached_rgb" in result["payload"] or "video_frames" in result["payload"],
             }
         )
 
@@ -251,10 +260,12 @@ def main() -> None:
         "sample_rate": int(args.sample_rate),
         "max_audio_sec": float(args.max_audio_sec),
         "num_frames": int(args.num_frames) if bool(args.include_video) else 0,
+        "rgb_size": int(args.rgb_size) if bool(args.include_video) else 0,
         "text_model": str(args.text_model),
         "max_text_len": int(args.max_text_len),
         "has_audio": True,
         "has_video": bool(args.include_video),
+        "video_representation": "prepared_rgb_fp16" if bool(args.include_video) else "",
         "has_text_full_tokens": True,
         "has_text_masked_tokens": True,
         "audio_backend_mode": str(args.audio_backend),

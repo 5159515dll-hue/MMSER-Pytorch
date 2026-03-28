@@ -940,6 +940,7 @@ def main() -> None:
             sample_rate=int(args.sample_rate),
             max_audio_sec=float(args.max_audio_sec),
             num_frames=int(args.num_frames),
+            rgb_size=int(args.rgb_size),
             text_model=str(args.text_model).strip() or str(model.text.model_name),
             max_text_len=128,
             need_audio=bool(need_audio),
