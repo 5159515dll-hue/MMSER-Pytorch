@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hf_compat import ensure_transformers_torch_compat
+
 class FlowVideoEncoder(nn.Module):
     """基于光流序列的轻量 3D CNN 编码器。
 
@@ -81,6 +83,7 @@ class VideoMAEEncoder(nn.Module):
         """
         super().__init__()
         try:
+            ensure_transformers_torch_compat()
             from transformers import AutoModel
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
@@ -257,6 +260,7 @@ class HFAudioEncoder(nn.Module):
         """
         super().__init__()
         try:
+            ensure_transformers_torch_compat()
             from transformers import AutoModel
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
@@ -404,6 +408,7 @@ class MbertTextEncoder(nn.Module):
         """
         super().__init__()
         try:
+            ensure_transformers_torch_compat()
             from transformers import AutoModel
         except Exception as e:  # pragma: no cover
             raise RuntimeError(

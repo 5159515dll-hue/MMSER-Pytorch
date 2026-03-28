@@ -1,9 +1,24 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
+
+def _ensure_repo_root_on_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+_ensure_repo_root_on_path()
+
 import torch
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from src.config import EMOTIONS, DEFAULT_CONFIG

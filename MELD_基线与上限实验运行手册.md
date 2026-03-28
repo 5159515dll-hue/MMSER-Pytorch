@@ -77,6 +77,7 @@ python3 download.py
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
 - `filter_meld_manifest.py` 只做本地 manifest 过滤，不会下载任何模型或远程资源。
 - `download.py` 默认把 Hugging Face 模型快照下载到仓库本地的 `.hf-cache/hub/`。同一台机器第二次运行时，会先校验本地缓存的 `config`、`tokenizer` 和 `safetensors` 头是否完整；只有校验通过才直接复用，否则会重新下载损坏或不完整的快照。
+- 当前仓库已经在 `download.py`、`train.py`、`batch_inference.py` 以及相关 Hugging Face 入口里补了 `torch.utils._pytree` 兼容层，用来兼容只暴露 `_register_pytree_node` 的旧版全局 `torch`。如果你遇到 `register_pytree_node` 缺失报错，先 `git pull` 再重试，不要第一反应就重装整套全局 CUDA/PyTorch 环境。
 - `--data-root` 必须指向实际包含 `train_splits`、`dev_splits_complete` 或 `output_repeated_splits_test` 的目录。很多服务器应该填 `../MELD.Raw`，不要机械照抄成 `../MELD.Raw/MELD.Raw`。
 - 如果 `build_split_manifest.py` 打印 `usable_rows: 0`，说明 MP4 根目录填错了；先修正 `--data-root`，再重新生成 manifest。
 - 下文四组实验的音频统一使用 `16kHz`，以对齐 `microsoft/wavlm-large` 的预训练采样率。

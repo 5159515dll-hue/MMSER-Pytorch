@@ -13,6 +13,9 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import transforms
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
 from transformers import AutoTokenizer
 from facenet_pytorch import MTCNN
 

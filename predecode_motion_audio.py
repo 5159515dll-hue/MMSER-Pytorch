@@ -41,6 +41,7 @@ def _ensure_project_root_on_path() -> None:
 
 _ensure_project_root_on_path()
 
+from hf_compat import ensure_transformers_torch_compat
 from prosody import ProsodyConfig, extract_prosody_features
 from audio_aug import normalize_wav
 from path_utils import default_databases_dir, default_xlsx_path
@@ -180,6 +181,7 @@ def _get_wavlm_model(model_name: str) -> Any:
     if key in _WAVLM_MODEL_CACHE:
         return _WAVLM_MODEL_CACHE[key]
     try:
+        ensure_transformers_torch_compat()
         from transformers import AutoModel
     except Exception as e:  # pragma: no cover
         raise RuntimeError(

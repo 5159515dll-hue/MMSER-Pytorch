@@ -15,6 +15,9 @@ import torch.nn as nn
 import torchaudio
 
 # 导入transformers库用于文本编码
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
 from transformers import AutoModel
 
 

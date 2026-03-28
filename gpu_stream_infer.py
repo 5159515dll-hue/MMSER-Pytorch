@@ -54,6 +54,8 @@ def _ensure_project_root_on_path() -> None:
 
 _ensure_project_root_on_path()
 
+from hf_compat import ensure_transformers_torch_compat
+
 
 def _lazy_runtime_imports() -> None:
     global torch, DataLoader, tqdm
@@ -230,6 +232,7 @@ def _validate_compat_args(args: argparse.Namespace) -> None:
 
 def _load_tokenizer(model_name: str) -> Any:
     try:
+        ensure_transformers_torch_compat()
         from transformers import AutoTokenizer
     except Exception as e:
         raise RuntimeError("transformers is required for text-enabled inference.") from e

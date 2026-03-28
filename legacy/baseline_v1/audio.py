@@ -18,8 +18,21 @@ os.environ.setdefault('TRANSFORMERS_NO_TORCHVISION', '1')
 # 强制使用官方 Hugging Face 端点，避免镜像 SSL 异常
 os.environ.setdefault('HF_ENDPOINT', 'https://huggingface.co')
 
+
+def _ensure_repo_root_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+
+_ensure_repo_root_on_path()
+
+from hf_compat import ensure_transformers_torch_compat
+
 try:
     import torch
+    ensure_transformers_torch_compat()
     from transformers import AutoModel
     WAVLM_AVAILABLE = True
     WAVLM_IMPORT_ERROR = None
@@ -38,16 +51,6 @@ try:
     SOUNDFILE_AVAILABLE = True
 except Exception:
     SOUNDFILE_AVAILABLE = False
-
-
-def _ensure_repo_root_on_path() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    repo_root_str = str(repo_root)
-    if repo_root_str not in sys.path:
-        sys.path.insert(0, repo_root_str)
-
-
-_ensure_repo_root_on_path()
 
 from motion_prosody.audio_aug import normalize_wav
 from motion_prosody.prosody import ProsodyConfig, extract_prosody_features

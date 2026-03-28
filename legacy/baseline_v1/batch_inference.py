@@ -4,11 +4,6 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import pandas as pd
-import torch
-from transformers import AutoTokenizer
-
-
 def _ensure_repo_root_on_path() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
     repo_root_str = str(repo_root)
@@ -18,6 +13,14 @@ def _ensure_repo_root_on_path() -> Path:
 
 
 _REPO_ROOT = _ensure_repo_root_on_path()
+
+import pandas as pd
+import torch
+
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
+from transformers import AutoTokenizer
 
 from path_utils import default_databases_dir, default_xlsx_path
 

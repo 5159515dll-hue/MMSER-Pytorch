@@ -8,6 +8,9 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
 from safetensors import safe_open
+from hf_compat import ensure_transformers_torch_compat
+
+ensure_transformers_torch_compat()
 from transformers import AutoConfig, AutoTokenizer
 
 
