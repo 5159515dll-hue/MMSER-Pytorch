@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -405,6 +406,28 @@ def _load_tokenizer(model_name: str) -> Any:
     return AutoTokenizer.from_pretrained(source, **load_kwargs)
 
 
+def _startup_log(message: str) -> None:
+    """打印启动阶段日志，帮助定位静默初始化卡点。"""
+
+    print(f"[startup] {message}", flush=True)
+
+
+@contextmanager
+def _startup_stage(label: str) -> Any:
+    """为启动阶段打印开始/完成/失败与耗时。"""
+
+    _startup_log(f"{label} [start]")
+    started = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        elapsed = time.perf_counter() - started
+        _startup_log(f"{label} [failed after {elapsed:.1f}s]")
+        raise
+    elapsed = time.perf_counter() - started
+    _startup_log(f"{label} [done in {elapsed:.1f}s]")
+
+
 def _current_lr(optimizer: Any) -> float:
     """读取优化器第一个参数组的当前学习率。"""
 
@@ -782,13 +805,13 @@ def main() -> None:
 
     # 这里先按 subset 取样本，再根据任务模式映射成当前任务自己的标签索引。
     train_items = prepare_manifest_items_for_task(
-        filter_manifest_items_for_task(select_manifest_items(manifest, "train"), task_mode, task_speaker_id),
+        filter_manifest_items_for_task(select_manifest_items(manifest, "train"), task_mode, task_speaker_id),   # 先选出 train 子集的样本，再根据 task_mode 和 speaker_id 过滤成当前任务的样本，最后映射成当前任务的标签索引。
         task_mode=task_mode,
         speaker_id=task_speaker_id,
         map_label_to_task_index=map_label_to_task_index,
     )
     val_items = prepare_manifest_items_for_task(
-        filter_manifest_items_for_task(select_manifest_items(manifest, "val"), task_mode, task_speaker_id),
+        filter_manifest_items_for_task(select_manifest_items(manifest, "val"), task_mode, task_speaker_id), # 先选出 val 子集的样本，再根据 task_mode 和 speaker_id 过滤成当前任务的样本，最后映射成当前任务的标签索引。
         task_mode=task_mode,
         speaker_id=task_speaker_id,
         map_label_to_task_index=map_label_to_task_index,
@@ -823,165 +846,179 @@ def main() -> None:
     input_cache_contract = None
     input_cache_dir = args.input_cache.expanduser() if args.input_cache is not None else None
     if input_cache_dir is not None:
-        cache_meta = load_input_cache_meta(input_cache_dir)
-        input_cache_contract = build_input_cache_contract(cache_meta)
-        cache_mismatch_reasons = validate_input_cache_contract(
-            input_cache_contract,
-            manifest_sha256=manifest_hash,
-            dataset_kind=dataset_kind,
-            sample_rate=int(args.sample_rate),
-            max_audio_sec=float(args.max_audio_sec),
-            num_frames=int(args.num_frames),
-            rgb_size=int(args.rgb_size),
-            text_model=str(args.text_model),
-            max_text_len=int(args.max_text_len),
-            need_audio=bool(need_audio),
-            need_video=bool(need_video),
-            need_text=bool(need_text),
-            text_policy=str(args.text_policy),
-        )
-        if cache_mismatch_reasons:
-            raise RuntimeError(
-                "Input cache contract mismatch: " + ", ".join(str(reason) for reason in cache_mismatch_reasons)
+        with _startup_stage(f"validate input cache contract: {input_cache_dir}"):
+            cache_meta = load_input_cache_meta(input_cache_dir)
+            input_cache_contract = build_input_cache_contract(cache_meta)
+            cache_mismatch_reasons = validate_input_cache_contract(
+                input_cache_contract,
+                manifest_sha256=manifest_hash,
+                dataset_kind=dataset_kind,
+                sample_rate=int(args.sample_rate),
+                max_audio_sec=float(args.max_audio_sec),
+                num_frames=int(args.num_frames),
+                rgb_size=int(args.rgb_size),
+                text_model=str(args.text_model),
+                max_text_len=int(args.max_text_len),
+                need_audio=bool(need_audio),
+                need_video=bool(need_video),
+                need_text=bool(need_text),
+                text_policy=str(args.text_policy),
             )
-        train_ds = CachedManifestDataset(
-            train_items,
-            ingress=ingress_cfg,
-            cache_dir=input_cache_dir,
-            text_policy=str(args.text_policy),
-            runtime_profile=profile,
-        )
-        val_ds = CachedManifestDataset(
-            val_items,
-            ingress=ingress_cfg,
-            cache_dir=input_cache_dir,
-            text_policy=str(args.text_policy),
-            runtime_profile=profile,
-        )
+            if cache_mismatch_reasons:
+                raise RuntimeError(
+                    "Input cache contract mismatch: " + ", ".join(str(reason) for reason in cache_mismatch_reasons)
+                )
+        with _startup_stage("build cached train dataset"):
+            train_ds = CachedManifestDataset(
+                train_items,
+                ingress=ingress_cfg,
+                cache_dir=input_cache_dir,
+                text_policy=str(args.text_policy),
+                runtime_profile=profile,
+                progress_logger=_startup_log,
+            )
+        with _startup_stage("build cached val dataset"):
+            val_ds = CachedManifestDataset(
+                val_items,
+                ingress=ingress_cfg,
+                cache_dir=input_cache_dir,
+                text_policy=str(args.text_policy),
+                runtime_profile=profile,
+                progress_logger=_startup_log,
+            )
     else:
-        train_ds = StreamingManifestDataset(train_items, ingress=ingress_cfg)
-        val_ds = StreamingManifestDataset(val_items, ingress=ingress_cfg)
+        with _startup_stage("build streaming train dataset"):
+            train_ds = StreamingManifestDataset(train_items, ingress=ingress_cfg)
+        with _startup_stage("build streaming val dataset"):
+            val_ds = StreamingManifestDataset(val_items, ingress=ingress_cfg)
 
     # 文本不被 zero 掉时，提前把整份 manifest 文本分词缓存好，
     # 避免每个 batch 都重复调用 tokenizer。
     tokenizer = None
     if not bool(args.zero_text) and input_cache_contract is None:
-        tokenizer = _load_tokenizer(str(args.text_model))
-        cache_manifest_text_tokens(train_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
-        cache_manifest_text_tokens(val_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
+        with _startup_stage(f"load tokenizer + pretokenize manifest text: {args.text_model}"):
+            tokenizer = _load_tokenizer(str(args.text_model))
+            cache_manifest_text_tokens(train_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
+            cache_manifest_text_tokens(val_ds.items, tokenizer, max_text_len=int(args.max_text_len), text_policy=str(args.text_policy))
 
     # batch size / worker 数都走自动解析，避免用户在不同机器上手工调很多次。
-    resolved_batch_size = resolve_batch_size(
-        args.batch_size,
-        phase="train",
-        profile=profile,
-        feature_cache=False,
-        video_backbone=str(args.video_backbone),
-        freeze_audio=bool(args.freeze_audio),
-        freeze_text=bool(args.freeze_text),
-        freeze_flow=bool(args.freeze_video or args.freeze_flow),
-        freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
-    )
-    resolved_num_workers = resolve_worker_count(
-        args.num_workers,
-        phase="train",
-        profile=profile,
-        dataset_in_memory=bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
-        cache_backed=bool(input_cache_contract is not None),
-        total_items=len(train_items) + len(val_items),
-    )
-    prefetch_factor = resolve_prefetch_factor("auto", num_workers=int(resolved_num_workers))
-    dl_kwargs: dict[str, Any] = {
-        "num_workers": int(resolved_num_workers),
-        "collate_fn": collate_manifest_items,
-        "pin_memory": bool(device.type == "cuda"),
-    }
-    if int(resolved_num_workers) > 0:
-        dl_kwargs["persistent_workers"] = True
-        if prefetch_factor is not None:
-            dl_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+    with _startup_stage("resolve loader settings + build dataloaders"):
+        resolved_batch_size = resolve_batch_size(
+            args.batch_size,
+            phase="train",
+            profile=profile,
+            feature_cache=False,
+            video_backbone=str(args.video_backbone),
+            freeze_audio=bool(args.freeze_audio),
+            freeze_text=bool(args.freeze_text),
+            freeze_flow=bool(args.freeze_video or args.freeze_flow),
+            freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
+        )
+        resolved_num_workers = resolve_worker_count(
+            args.num_workers,
+            phase="train",
+            profile=profile,
+            dataset_in_memory=bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+            cache_backed=bool(input_cache_contract is not None),
+            total_items=len(train_items) + len(val_items),
+        )
+        prefetch_factor = resolve_prefetch_factor("auto", num_workers=int(resolved_num_workers))
+        dl_kwargs: dict[str, Any] = {
+            "num_workers": int(resolved_num_workers),
+            "collate_fn": collate_manifest_items,
+            "pin_memory": bool(device.type == "cuda"),
+        }
+        if int(resolved_num_workers) > 0:
+            dl_kwargs["persistent_workers"] = True
+            if prefetch_factor is not None:
+                dl_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
 
-    # train/val 分别使用不同的 generator seed，避免两者的随机流完全相同。
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(resolved_batch_size),
-        shuffle=True,
-        worker_init_fn=make_dataloader_worker_init_fn(int(args.seed)),
-        generator=make_torch_generator(int(args.seed)),
-        **dl_kwargs,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=int(resolved_batch_size),
-        shuffle=False,
-        worker_init_fn=make_dataloader_worker_init_fn(int(args.seed) + 1000),
-        generator=make_torch_generator(int(args.seed) + 1000),
-        **dl_kwargs,
-    )
+        # train/val 分别使用不同的 generator seed，避免两者的随机流完全相同。
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(resolved_batch_size),
+            shuffle=True,
+            worker_init_fn=make_dataloader_worker_init_fn(int(args.seed)),
+            generator=make_torch_generator(int(args.seed)),
+            **dl_kwargs,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(resolved_batch_size),
+            shuffle=False,
+            worker_init_fn=make_dataloader_worker_init_fn(int(args.seed) + 1000),
+            generator=make_torch_generator(int(args.seed) + 1000),
+            **dl_kwargs,
+        )
 
     # 模型初始化完全由命令行与 paper contract 决定，
     # 这里不会根据数据内容偷偷改动结构。
-    model = FusionClassifier(
-        num_classes=len(label_names),
-        freeze_audio=bool(args.freeze_audio),
-        freeze_video=bool(args.freeze_video),
-        freeze_flow=bool(args.freeze_video or args.freeze_flow),
-        freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
-        freeze_prosody=bool(args.freeze_prosody),
-        text_model=str(args.text_model),
-        freeze_text=bool(args.freeze_text),
-        audio_model=str(args.audio_model),
-        audio_model_revision=(str(args.audio_model_revision).strip() or None),
-        video_backbone=str(args.video_backbone),
-        video_model=str(args.video_model),
-        fusion_mode=str(args.fusion_mode),
-        modality_dropout=float(args.modality_dropout),
-        gate_temperature=float(args.gate_temperature),
-        gate_scale=float(args.gate_scale),
-        delta_scale=float(args.delta_scale),
-        intensity_head=bool(args.use_intensity),
-    ).to(device)
+    with _startup_stage("construct fusion classifier"):
+        model = FusionClassifier(
+            num_classes=len(label_names),
+            freeze_audio=bool(args.freeze_audio),
+            freeze_video=bool(args.freeze_video),
+            freeze_flow=bool(args.freeze_video or args.freeze_flow),
+            freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
+            freeze_prosody=bool(args.freeze_prosody),
+            text_model=str(args.text_model),
+            freeze_text=bool(args.freeze_text),
+            audio_model=str(args.audio_model),
+            audio_model_revision=(str(args.audio_model_revision).strip() or None),
+            video_backbone=str(args.video_backbone),
+            video_model=str(args.video_model),
+            fusion_mode=str(args.fusion_mode),
+            modality_dropout=float(args.modality_dropout),
+            gate_temperature=float(args.gate_temperature),
+            gate_scale=float(args.gate_scale),
+            delta_scale=float(args.delta_scale),
+            intensity_head=bool(args.use_intensity),
+            progress_callback=_startup_log,
+        )
+    with _startup_stage(f"move model to device: {device}"):
+        model = model.to(device)
     setattr(model, "_label_names", list(label_names))
 
-    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-    scheduler = None
-    if str(args.lr_scheduler) == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt,
-            mode="min",
-            factor=float(args.lr_plateau_factor),
-            patience=int(args.lr_plateau_patience),
-            min_lr=float(args.lr_min),
-        )
-    loss_fn = torch.nn.CrossEntropyLoss()
+    with _startup_stage("initialize optimizer + scheduler + preprocessors"):
+        opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+        scheduler = None
+        if str(args.lr_scheduler) == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                mode="min",
+                factor=float(args.lr_plateau_factor),
+                patience=int(args.lr_plateau_patience),
+                min_lr=float(args.lr_min),
+            )
+        loss_fn = torch.nn.CrossEntropyLoss()
 
-    stream_preprocessor = GpuStreamPreprocessor(
-        GpuStreamConfig(
-            device=device,
-            video_backbone=str(args.video_backbone),
-            sample_rate=int(args.sample_rate),
-            max_audio_sec=float(args.max_audio_sec),
-            audio_backend_mode=str(args.audio_backend),
-            num_frames=int(args.num_frames),
-            flow_size=int(args.flow_size),
-            rgb_size=int(args.rgb_size),
-            zero_video=bool(args.zero_video),
-            zero_audio=bool(args.zero_audio),
-            zero_text=bool(args.zero_text),
-            prosody_use_pitch=(not bool(args.prosody_no_pitch)),
-            video_decode_backend=str(args.video_decode_backend),
-            flow_backend=str(args.flow_backend),
+        stream_preprocessor = GpuStreamPreprocessor(
+            GpuStreamConfig(
+                device=device,
+                video_backbone=str(args.video_backbone),
+                sample_rate=int(args.sample_rate),
+                max_audio_sec=float(args.max_audio_sec),
+                audio_backend_mode=str(args.audio_backend),
+                num_frames=int(args.num_frames),
+                flow_size=int(args.flow_size),
+                rgb_size=int(args.rgb_size),
+                zero_video=bool(args.zero_video),
+                zero_audio=bool(args.zero_audio),
+                zero_text=bool(args.zero_text),
+                prosody_use_pitch=(not bool(args.prosody_no_pitch)),
+                video_decode_backend=str(args.video_decode_backend),
+                flow_backend=str(args.flow_backend),
+            )
         )
-    )
-    aug_cfg = AudioAugConfig(sample_rate=int(args.sample_rate))
-    prosody_cfg = ProsodyConfig(sample_rate=int(args.sample_rate), use_pitch=(not bool(args.prosody_no_pitch)))
-    scaler = None
-    if device.type == "cuda":
-        amp_mod = getattr(torch, "amp", None)
-        if amp_mod is not None and hasattr(amp_mod, "GradScaler"):
-            scaler = amp_mod.GradScaler("cuda", enabled=(resolved_amp_mode == "fp16"))  # type: ignore[attr-defined]
-        else:
-            scaler = torch.cuda.amp.GradScaler(enabled=(resolved_amp_mode == "fp16"))
+        aug_cfg = AudioAugConfig(sample_rate=int(args.sample_rate))
+        prosody_cfg = ProsodyConfig(sample_rate=int(args.sample_rate), use_pitch=(not bool(args.prosody_no_pitch)))
+        scaler = None
+        if device.type == "cuda":
+            amp_mod = getattr(torch, "amp", None)
+            if amp_mod is not None and hasattr(amp_mod, "GradScaler"):
+                scaler = amp_mod.GradScaler("cuda", enabled=(resolved_amp_mode == "fp16"))  # type: ignore[attr-defined]
+            else:
+                scaler = torch.cuda.amp.GradScaler(enabled=(resolved_amp_mode == "fp16"))
 
     print(
         json.dumps(

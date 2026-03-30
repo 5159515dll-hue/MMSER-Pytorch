@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+import time
+from typing import Any, Callable, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -24,6 +25,14 @@ from video_motion import _read_video_frames_cv2
 
 _DECORD_CPU_READY = False
 _DECORD_CPU = None
+ProgressLogger = Callable[[str], None]
+
+
+def _emit_progress(progress_logger: Optional[ProgressLogger], message: str) -> None:
+    """向可选的进度记录器发送一条消息。"""
+
+    if progress_logger is not None:
+        progress_logger(str(message))
 
 
 def _maybe_import_decord_cpu() -> Any | None:
@@ -218,6 +227,8 @@ class CachedManifestDataset(Dataset):
         text_policy: str,
         runtime_profile: RuntimeProfile | None = None,
         keep_in_memory: bool | None = None,
+        progress_logger: Optional[ProgressLogger] = None,
+        progress_interval: int = 512,
     ):
         """保存 manifest items，并建立它们与缓存索引的对应关系。"""
 
@@ -252,9 +263,32 @@ class CachedManifestDataset(Dataset):
             self.in_memory = bool(keep_in_memory)
 
         self._payload_cache: dict[str, dict[str, Any]] = {}
+        total = len(self.cache_keys)
+        total_gib = float(self.selected_cache_bytes) / float(1024**3)
+        _emit_progress(
+            progress_logger,
+            f"input cache residency decided: in_memory={self.in_memory}, samples={total}, estimated_size_gib={total_gib:.2f}",
+        )
         if self.in_memory:
-            for key in self.cache_keys:
+            _emit_progress(
+                progress_logger,
+                f"preloading input cache into RAM: samples={total}, estimated_size_gib={total_gib:.2f}",
+            )
+            preload_started = time.perf_counter()
+            every = max(1, int(progress_interval))
+            for idx, key in enumerate(self.cache_keys, start=1):
                 self._payload_cache[key] = self._load_cached_payload(key)
+                if idx == total or idx % every == 0:
+                    elapsed = time.perf_counter() - preload_started
+                    pct = 100.0 * float(idx / max(1, total))
+                    _emit_progress(
+                        progress_logger,
+                        f"input cache preload progress: {idx}/{total} ({pct:.1f}%), elapsed_sec={elapsed:.1f}",
+                    )
+            _emit_progress(
+                progress_logger,
+                f"finished preloading input cache: samples={total}, elapsed_sec={time.perf_counter() - preload_started:.1f}",
+            )
 
     def __len__(self) -> int:
         """返回缓存数据集大小。"""

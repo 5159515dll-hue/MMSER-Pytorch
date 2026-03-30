@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -16,6 +16,15 @@ import torch.nn.functional as F
 from hf_compat import ensure_transformers_torch_compat
 from hf_loading import resolve_hf_pretrained_source
 from mainline_utils import FLOW_VIDEO_ENCODER_VARIANT
+
+ProgressCallback = Callable[[str], None]
+
+
+def _emit_progress(progress_callback: Optional[ProgressCallback], message: str) -> None:
+    """向可选的进度回调发送一条消息。"""
+
+    if progress_callback is not None:
+        progress_callback(str(message))
 
 
 def _disable_hf_audio_spec_augment(model: nn.Module) -> None:
@@ -108,7 +117,12 @@ class VideoMAEEncoder(nn.Module):
     - rgb: (B, T, 3, H, W)，像素值为 [0, 1] 的 float。
     """
 
-    def __init__(self, model_name: str = "MCG-NJU/videomae-large", freeze: bool = True):
+    def __init__(
+        self,
+        model_name: str = "MCG-NJU/videomae-large",
+        freeze: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+    ):
         """初始化 VideoMAE 编码器并注册 RGB 归一化缓冲区。
 
         Args:
@@ -126,7 +140,9 @@ class VideoMAEEncoder(nn.Module):
 
         self.model_name = str(model_name)
         load_source, load_kwargs = resolve_hf_pretrained_source(self.model_name)
+        _emit_progress(progress_callback, f"loading video backbone: {self.model_name}")
         self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
+        _emit_progress(progress_callback, f"loaded video backbone: {self.model_name}")
         self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
         self.expected_num_frames = int(getattr(self.model.config, "num_frames", 16))
         image_size = getattr(self.model.config, "image_size", 224)
@@ -283,6 +299,7 @@ class HFAudioEncoder(nn.Module):
         freeze: bool = True,
         revision: Optional[str] = None,
         use_safetensors: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
     ):
         """初始化 HuggingFace 音频编码器。
 
@@ -309,7 +326,10 @@ class HFAudioEncoder(nn.Module):
         load_source, source_kwargs = resolve_hf_pretrained_source(self.model_name, revision=self.revision)
         load_kwargs.update(source_kwargs)
         try:
+            revision_suffix = f"@{self.revision}" if self.revision is not None else ""
+            _emit_progress(progress_callback, f"loading audio backbone: {self.model_name}{revision_suffix}")
             self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
+            _emit_progress(progress_callback, f"loaded audio backbone: {self.model_name}{revision_suffix}")
         except Exception as e:  # pragma: no cover
             revision_hint = self.revision if self.revision is not None else "<default>"
             raise RuntimeError(
@@ -422,7 +442,12 @@ class ProsodyMLP(nn.Module):
 class MbertTextEncoder(nn.Module):
     """基于 HuggingFace `AutoModel` 的文本编码器封装。"""
 
-    def __init__(self, model_name: str = "bert-base-multilingual-cased", freeze: bool = True):
+    def __init__(
+        self,
+        model_name: str = "bert-base-multilingual-cased",
+        freeze: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+    ):
         """mBERT 文本编码器（HuggingFace Transformers）。
 
         编码方式
@@ -453,7 +478,9 @@ class MbertTextEncoder(nn.Module):
 
         self.model_name = str(model_name)
         load_source, load_kwargs = resolve_hf_pretrained_source(self.model_name)
+        _emit_progress(progress_callback, f"loading text backbone: {self.model_name}")
         self.model = AutoModel.from_pretrained(load_source, **load_kwargs)
+        _emit_progress(progress_callback, f"loaded text backbone: {self.model_name}")
         self.out_dim = int(getattr(self.model.config, "hidden_size", 768))
 
         if freeze:
@@ -513,6 +540,7 @@ class FusionClassifier(nn.Module):
         gate_temperature: float = 1.0,
         gate_scale: float = 1.0,
         delta_scale: float = 1.0,
+        progress_callback: Optional[ProgressCallback] = None,
     ):
         """多模态融合分类器（视频 + 语音 wav2vec2 + 韵律 + 文本 mBERT）。
 
@@ -557,13 +585,21 @@ class FusionClassifier(nn.Module):
         self._freeze_flow = bool(freeze_flow)
         self._freeze_rgb = bool(freeze_rgb)
         if self.video_backbone == "videomae":
-            self.video = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
+            self.video = VideoMAEEncoder(
+                model_name=video_model,
+                freeze=freeze_rgb,
+                progress_callback=progress_callback,
+            )
             self.video_flow = None
             self.video_rgb = None
         elif self.video_backbone == "dual":
             self.video = None
             self.video_flow = FlowVideoEncoder(out_dim=video_dim)
-            self.video_rgb = VideoMAEEncoder(model_name=video_model, freeze=freeze_rgb)
+            self.video_rgb = VideoMAEEncoder(
+                model_name=video_model,
+                freeze=freeze_rgb,
+                progress_callback=progress_callback,
+            )
         else:
             self.video = FlowVideoEncoder(out_dim=video_dim)
             self.video_flow = None
@@ -577,9 +613,14 @@ class FusionClassifier(nn.Module):
                 freeze=freeze_audio,
                 revision=audio_model_revision,
                 use_safetensors=True,
+                progress_callback=progress_callback,
             )
         self.prosody = ProsodyMLP(in_dim=10, out_dim=prosody_dim)
-        self.text = MbertTextEncoder(model_name=text_model, freeze=freeze_text)
+        self.text = MbertTextEncoder(
+            model_name=text_model,
+            freeze=freeze_text,
+            progress_callback=progress_callback,
+        )
 
         if self.video is not None and self.video_backbone != "videomae" and freeze_flow:
             for p in self.video.parameters():
