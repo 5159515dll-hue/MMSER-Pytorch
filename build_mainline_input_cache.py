@@ -22,13 +22,16 @@ from typing import Any
 from hf_compat import ensure_transformers_torch_compat
 from hf_loading import resolve_hf_pretrained_source
 from input_cache import (
+    INPUT_CACHE_SHARD_FORMAT_VERSION,
     INPUT_CACHE_PROTOCOL_VERSION,
     INPUT_CACHE_STORAGE_PER_SAMPLE,
+    INPUT_CACHE_STORAGE_SHARDED,
     build_cached_media_payload,
     manifest_item_cache_key,
     sample_relpath_for_key,
     save_input_cache_index,
     save_input_cache_meta,
+    shard_relpath_for_index,
 )
 from manifest_utils import load_split_manifest, manifest_sha256, select_manifest_items
 
@@ -51,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video-decode-backend", type=str, default="auto", choices=["auto", "decord", "cpu"])
     p.add_argument("--num-workers", type=str, default="auto")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument(
+        "--storage-format",
+        type=str,
+        default="per-sample",
+        choices=["per-sample", "sharded"],
+        help="Write one .pt per sample, or merge samples into shard files directly during build",
+    )
+    p.add_argument("--samples-per-shard", type=int, default=512)
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -157,6 +168,22 @@ def _prepare_tasks(
     return tasks
 
 
+def _entry_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    """从单个缓存构建结果提取索引条目的公共字段。"""
+
+    payload = result["payload"]
+    meta = payload.get("meta", {})
+    return {
+        "cache_key": str(result["cache_key"]),
+        "sample_bytes": int(result.get("sample_bytes", 0) or 0),
+        "split": str(meta.get("split", "")),
+        "seq": str(meta.get("seq", "")),
+        "sample_id": str(meta.get("sample_id", "")),
+        "has_audio": "audio" in payload,
+        "has_video": "cached_rgb" in payload or "video_frames" in payload,
+    }
+
+
 def main() -> None:
     """主缓存构建入口。"""
 
@@ -205,6 +232,8 @@ def main() -> None:
                 "rgb_size": int(args.rgb_size) if bool(args.include_video) else 0,
                 "sample_rate": int(args.sample_rate),
                 "max_audio_sec": float(args.max_audio_sec),
+                "storage_format": str(args.storage_format),
+                "samples_per_shard": int(args.samples_per_shard) if str(args.storage_format) == "sharded" else 0,
             },
             ensure_ascii=False,
             indent=2,
@@ -217,9 +246,24 @@ def main() -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
+    shard_payloads: list[dict[str, Any]] = []
+    shard_entries: list[dict[str, Any]] = []
+    shard_keys: list[str] = []
+    shard_count = 0
+    write_sharded = str(args.storage_format) == "sharded"
+    if write_sharded and int(args.samples_per_shard) <= 0:
+        raise RuntimeError(f"--samples-per-shard must be > 0, got {args.samples_per_shard}")
 
     def _write_result(result: dict[str, Any]) -> None:
         key = str(result["cache_key"])
+        entry = _entry_from_result(result)
+        if write_sharded:
+            shard_payloads.append(result["payload"])
+            shard_entries.append(entry)
+            shard_keys.append(key)
+            if len(shard_payloads) >= int(args.samples_per_shard):
+                _flush_shard()
+            return
         relpath = sample_relpath_for_key(key)
         path = out_dir / relpath
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,20 +272,45 @@ def main() -> None:
         except RuntimeError as exc:
             raise RuntimeError(
                 f"Failed to write cached sample {key} -> {path}. "
-                "This is commonly caused by insufficient free disk space."
+                "This is commonly caused by insufficient free disk space, inode exhaustion, "
+                "or a per-directory / filesystem quota limit. Consider using "
+                "--storage-format sharded for large video caches."
             ) from exc
-        entries.append(
-            {
-                "cache_key": key,
-                "relpath": str(relpath),
-                "sample_bytes": int(result.get("sample_bytes", 0) or 0),
-                "split": str(result["payload"].get("meta", {}).get("split", "")),
-                "seq": str(result["payload"].get("meta", {}).get("seq", "")),
-                "sample_id": str(result["payload"].get("meta", {}).get("sample_id", "")),
-                "has_audio": "audio" in result["payload"],
-                "has_video": "cached_rgb" in result["payload"] or "video_frames" in result["payload"],
-            }
-        )
+        row = dict(entry)
+        row["relpath"] = str(relpath)
+        entries.append(row)
+
+    def _flush_shard() -> None:
+        nonlocal shard_payloads, shard_entries, shard_keys, shard_count
+
+        if not shard_payloads:
+            return
+        relpath = shard_relpath_for_index(shard_count)
+        path = out_dir / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(
+                {
+                    "format_version": INPUT_CACHE_SHARD_FORMAT_VERSION,
+                    "cache_keys": list(shard_keys),
+                    "payloads": list(shard_payloads),
+                },
+                path,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to write input-cache shard {relpath} with {len(shard_payloads)} sample(s) -> {path}. "
+                "This is commonly caused by insufficient free disk space or a filesystem quota limit."
+            ) from exc
+        for sample_idx, entry in enumerate(shard_entries):
+            row = dict(entry)
+            row["shard_relpath"] = str(relpath)
+            row["shard_index"] = int(sample_idx)
+            entries.append(row)
+        shard_payloads = []
+        shard_entries = []
+        shard_keys = []
+        shard_count += 1
 
     if int(resolved_workers) <= 1:
         for task in tqdm(tasks, desc="Build input cache", unit="sample"):
@@ -250,6 +319,8 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=int(resolved_workers)) as executor:
             for result in tqdm(executor.map(build_cached_media_payload, tasks), total=len(tasks), desc="Build input cache", unit="sample"):
                 _write_result(result)
+    if write_sharded:
+        _flush_shard()
 
     meta = {
         "protocol_version": INPUT_CACHE_PROTOCOL_VERSION,
@@ -272,8 +343,11 @@ def main() -> None:
         "audio_backend_mode": str(args.audio_backend),
         "video_decode_backend": str(args.video_decode_backend),
         "runtime_profile": profile.to_jsonable(),
-        "storage_format": INPUT_CACHE_STORAGE_PER_SAMPLE,
+        "storage_format": INPUT_CACHE_STORAGE_SHARDED if write_sharded else INPUT_CACHE_STORAGE_PER_SAMPLE,
     }
+    if write_sharded:
+        meta["samples_per_shard"] = int(args.samples_per_shard)
+        meta["shard_count"] = int(shard_count)
     save_input_cache_meta(out_dir, meta)
     save_input_cache_index(out_dir, entries)
     print(f"Wrote input cache -> {out_dir}", flush=True)

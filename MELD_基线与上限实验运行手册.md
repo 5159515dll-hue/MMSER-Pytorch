@@ -120,20 +120,24 @@ export TRANSFORMERS_OFFLINE=1
 
 CPU 服务器构建命令：
 
+如果目标是直接在 GPU 服务器上使用 shard cache，当前更推荐在构建阶段就直接输出 shard 目录，而不是先写散文件再二次合并。下面三条命令已经按这个口径写好：
+
 ```bash
 python3 build_mainline_input_cache.py \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1 \
+  --output-dir outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
   --text-model FacebookAI/xlm-roberta-large \
   --max-text-len 128 \
+  --storage-format sharded \
+  --samples-per-shard 512 \
   --num-workers auto
 
 python3 build_mainline_input_cache.py \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1 \
+  --output-dir outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
@@ -142,11 +146,13 @@ python3 build_mainline_input_cache.py \
   --include-video \
   --num-frames 16 \
   --rgb-size 224 \
+  --storage-format sharded \
+  --samples-per-shard 512 \
   --num-workers auto
 
 python3 build_mainline_input_cache.py \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1 \
+  --output-dir outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
@@ -155,10 +161,12 @@ python3 build_mainline_input_cache.py \
   --include-video \
   --num-frames 32 \
   --rgb-size 224 \
+  --storage-format sharded \
+  --samples-per-shard 512 \
   --num-workers auto
 ```
 
-如果你已经在旧代码上开始构建视频缓存，或者在 CPU 服务器上遇到 `PytorchStreamWriter failed writing file data/1` / `unexpected pos` 这类写盘错误，先删除未完成的视频缓存目录后再重跑。当前主线的视频缓存会保存更小的预处理后 RGB clip，不再推荐继续保留旧的半成品目录。
+如果你已经在旧代码上开始构建视频缓存，或者在 CPU 服务器上遇到 `PytorchStreamWriter failed writing file data/1` / `unexpected pos` / `cannot be opened` 这类写盘错误，先删除未完成的缓存目录后再重跑。对于 `rgb16` / `rgb32` 这类视频缓存，这类错误除了空间不足，也经常是 inode 耗尽或小文件目录/文件系统配额导致；优先改用上面的 `--storage-format sharded`，不要继续硬写上万个散文件 `.pt`。
 
 GPU 服务器上只需要把目录拷过来，后续训练/推理命令统一附带对应的 `--input-cache ...`。如果你不使用这个加速路径，删掉 `--input-cache` 那一行即可；正式论文口径仍然成立，只是 CPU 压力会更高。
 
@@ -191,7 +199,7 @@ python3 shard_input_cache.py \
 - 原始散文件 cache 不会被删除
 - 训练与推理主线可以直接读取新的 shard 目录
 
-转换完成后，推荐把四组实验的 `--input-cache` 改成：
+转换完成后，本文下方四组实验的训练/推理命令默认统一使用下面这些 shard 路径：
 
 - 实验一：`outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded`
 - 实验二/三：`outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded`
@@ -326,7 +334,7 @@ python3 shard_input_cache.py \
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}
@@ -335,7 +343,7 @@ for seed in $SEEDS; do
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
     --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
-    --epochs 80 \
+    --epochs 100 \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
@@ -372,7 +380,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -402,7 +410,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -507,7 +515,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_si
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}
@@ -516,7 +524,7 @@ for seed in $SEEDS; do
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
     --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
-    --epochs 50 \
+    --epochs 100 \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
@@ -553,7 +561,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -584,7 +592,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -686,7 +694,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}
@@ -695,7 +703,7 @@ for seed in $SEEDS; do
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
     --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
-    --epochs 40 \
+    --epochs 100 \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
@@ -729,7 +737,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -760,7 +768,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -863,7 +871,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}
@@ -872,7 +880,7 @@ for seed in $SEEDS; do
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
     --input-cache ${INPUT_CACHE} \
     --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
-    --epochs 60 \
+    --epochs 100 \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
@@ -908,7 +916,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
@@ -941,7 +949,7 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
+INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
