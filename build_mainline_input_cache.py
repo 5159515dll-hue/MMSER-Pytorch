@@ -23,6 +23,7 @@ from hf_compat import ensure_transformers_torch_compat
 from hf_loading import resolve_hf_pretrained_source
 from input_cache import (
     INPUT_CACHE_PROTOCOL_VERSION,
+    INPUT_CACHE_STORAGE_PER_SAMPLE,
     build_cached_media_payload,
     manifest_item_cache_key,
     sample_relpath_for_key,
@@ -271,6 +272,7 @@ def main() -> None:
         "audio_backend_mode": str(args.audio_backend),
         "video_decode_backend": str(args.video_decode_backend),
         "runtime_profile": profile.to_jsonable(),
+        "storage_format": INPUT_CACHE_STORAGE_PER_SAMPLE,
     }
     save_input_cache_meta(out_dir, meta)
     save_input_cache_index(out_dir, entries)

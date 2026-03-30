@@ -162,6 +162,47 @@ python3 build_mainline_input_cache.py \
 
 GPU 服务器上只需要把目录拷过来，后续训练/推理命令统一附带对应的 `--input-cache ...`。如果你不使用这个加速路径，删掉 `--input-cache` 那一行即可；正式论文口径仍然成立，只是 CPU 压力会更高。
 
+### 可选：把散文件 input cache 合并成 shard cache
+
+如果你已经成功构建出上面三套 `input cache`，但在 GPU 服务器上发现训练启动阶段长期停在：
+
+- `build cached train dataset`
+- `preloading input cache into RAM`
+- `input cache preload progress`
+
+通常不是 GPU 算不动，而是因为当前默认 cache 目录里有上万个分散的小 `.pt` 文件。`CachedManifestDataset` 在 `in_memory=True` 时会逐个 `torch.load()` 它们，小文件元数据和反序列化开销会显著拖慢启动。
+
+当前主线已经兼容 **shard 版 input cache**。你可以先保留原始散文件目录，再额外生成一套合并后的 shard 目录，后续训练/推理直接把 `--input-cache` 指向 shard 版即可。
+
+批量转换上面三套 cache 的命令：
+
+```bash
+python3 shard_input_cache.py \
+  outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1 \
+  outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1 \
+  outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1 \
+  --samples-per-shard 512 \
+  --overwrite
+```
+
+默认行为：
+
+- 每个输入目录都会在旁边生成一个新的 `*_sharded` 目录
+- 原始散文件 cache 不会被删除
+- 训练与推理主线可以直接读取新的 shard 目录
+
+转换完成后，推荐把四组实验的 `--input-cache` 改成：
+
+- 实验一：`outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded`
+- 实验二/三：`outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded`
+- 实验四：`outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded`
+
+补充说明：
+
+- `--samples-per-shard 512` 是默认推荐值；它的目标是显著减少小文件数量，而不是把所有样本塞进单个超大文件。
+- 如果你只想转换其中一个 cache 目录，也可以单独执行 `python3 shard_input_cache.py <cache_dir>`。
+- 如果训练启动仍然很慢，再检查实际读盘目录是否在网络盘、共享盘或低 IOPS 挂载点上；`shard` 能明显减少小文件开销，但无法把慢盘变成快盘。
+
 ## 统一的停止与报告协议
 
 从这一版开始，四组 MELD GPU 实验不再采用“单次 run 里连续 5 轮没涨就停”的经验式口径，而统一采用下面这套更稳妥的协议：

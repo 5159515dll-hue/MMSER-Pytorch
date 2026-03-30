@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any
 
 INPUT_CACHE_PROTOCOL_VERSION = "mainline_input_cache_v1"
+INPUT_CACHE_STORAGE_PER_SAMPLE = "per_sample_pt_v1"
+INPUT_CACHE_STORAGE_SHARDED = "sharded_pt_v1"
+INPUT_CACHE_SHARD_FORMAT_VERSION = "mainline_input_cache_shard_v1"
 
 
 def manifest_item_cache_key(item: dict[str, Any]) -> str:
@@ -40,6 +43,15 @@ def sample_relpath_for_key(cache_key: str) -> Path:
 
     digest = hashlib.sha1(str(cache_key).encode("utf-8")).hexdigest()
     return Path("samples") / digest[:2] / f"{digest}.pt"
+
+
+def shard_relpath_for_index(shard_index: int) -> Path:
+    """返回某个 shard 文件在缓存目录内的相对路径。"""
+
+    idx = int(shard_index)
+    if idx < 0:
+        raise ValueError(f"shard_index must be >= 0, got {shard_index}")
+    return Path("shards") / f"{idx:05d}.pt"
 
 
 def cache_meta_path(cache_dir: Path) -> Path:
@@ -118,6 +130,7 @@ def build_input_cache_contract(meta: dict[str, Any]) -> dict[str, Any]:
         "has_text_full_tokens": bool(meta.get("has_text_full_tokens", False)),
         "has_text_masked_tokens": bool(meta.get("has_text_masked_tokens", False)),
         "subset": str(meta.get("subset", "all")),
+        "storage_format": str(meta.get("storage_format", INPUT_CACHE_STORAGE_PER_SAMPLE)),
     }
 
 
@@ -221,6 +234,75 @@ def save_input_cache_index(cache_dir: Path, entries: list[dict[str, Any]]) -> No
     with path.open("w", encoding="utf-8") as f:
         for entry in entries:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _load_input_cache_sample(cache_dir: Path, relpath: str) -> dict[str, Any]:
+    """从旧版单样本 `.pt` 缓存中读取 payload。"""
+
+    import torch
+
+    path = cache_dir / str(relpath)
+    if not path.is_file():
+        raise FileNotFoundError(f"Cached sample file not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Cached sample payload must be a dict: {path}")
+    return payload
+
+
+def load_input_cache_shard(cache_dir: Path, shard_relpath: str) -> dict[str, Any]:
+    """读取一个 shard 文件并校验结构。"""
+
+    import torch
+
+    path = cache_dir / str(shard_relpath)
+    if not path.is_file():
+        raise FileNotFoundError(f"Input cache shard file not found: {path}")
+    shard = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(shard, dict):
+        raise RuntimeError(f"Input cache shard payload must be a dict: {path}")
+    version = str(shard.get("format_version", "") or "")
+    if version != INPUT_CACHE_SHARD_FORMAT_VERSION:
+        raise RuntimeError(f"Unsupported input cache shard format: {path} (got {version!r})")
+    payloads = shard.get("payloads", None)
+    cache_keys = shard.get("cache_keys", None)
+    if not isinstance(payloads, list):
+        raise RuntimeError(f"Input cache shard missing payload list: {path}")
+    if not isinstance(cache_keys, list) or len(cache_keys) != len(payloads):
+        raise RuntimeError(f"Input cache shard cache_keys/payloads mismatch: {path}")
+    return shard
+
+
+def load_input_cache_entry_payload(
+    cache_dir: Path,
+    entry: dict[str, Any],
+    *,
+    shard_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """根据索引条目读取单个样本 payload，兼容散文件和 shard 格式。"""
+
+    if "relpath" in entry:
+        return _load_input_cache_sample(cache_dir, str(entry.get("relpath", "")))
+
+    shard_relpath = str(entry.get("shard_relpath", "") or "")
+    if shard_relpath:
+        shard = shard_cache.get(shard_relpath) if shard_cache is not None else None
+        if shard is None:
+            shard = load_input_cache_shard(cache_dir, shard_relpath)
+            if shard_cache is not None:
+                shard_cache[shard_relpath] = shard
+        payloads = shard["payloads"]
+        shard_index = int(entry.get("shard_index", -1))
+        if shard_index < 0 or shard_index >= len(payloads):
+            raise RuntimeError(
+                f"Input cache shard index out of range: relpath={shard_relpath}, shard_index={shard_index}, total={len(payloads)}"
+            )
+        payload = payloads[shard_index]
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Input cache shard payload must be a dict: relpath={shard_relpath}, shard_index={shard_index}")
+        return payload
+
+    raise RuntimeError(f"Input cache index entry missing relpath/shard_relpath: {entry}")
 
 
 _WORKER_THREADS_LIMITED = False

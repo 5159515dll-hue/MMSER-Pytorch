@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -14,6 +15,7 @@ from input_cache import (
     build_input_cache_contract,
     count_selected_cache_bytes,
     index_entries_by_key,
+    load_input_cache_entry_payload,
     load_input_cache_index,
     load_input_cache_meta,
     manifest_item_cache_key,
@@ -263,11 +265,21 @@ class CachedManifestDataset(Dataset):
             self.in_memory = bool(keep_in_memory)
 
         self._payload_cache: dict[str, dict[str, Any]] = {}
+        self._shard_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._shard_cache_limit = None if self.in_memory else 2
+        selected_shards = {
+            str(self.entries_by_key[key].get("shard_relpath", "") or "")
+            for key in self.cache_keys
+            if str(self.entries_by_key[key].get("shard_relpath", "") or "")
+        }
         total = len(self.cache_keys)
         total_gib = float(self.selected_cache_bytes) / float(1024**3)
         _emit_progress(
             progress_logger,
-            f"input cache residency decided: in_memory={self.in_memory}, samples={total}, estimated_size_gib={total_gib:.2f}",
+            (
+                f"input cache residency decided: in_memory={self.in_memory}, samples={total}, "
+                f"estimated_size_gib={total_gib:.2f}, selected_shards={len(selected_shards)}"
+            ),
         )
         if self.in_memory:
             _emit_progress(
@@ -299,12 +311,16 @@ class CachedManifestDataset(Dataset):
         """从磁盘读取一个缓存样本。"""
 
         entry = self.entries_by_key[str(cache_key)]
-        path = self.cache_dir / str(entry.get("relpath", ""))
-        if not path.is_file():
-            raise FileNotFoundError(f"Cached sample file not found: {path}")
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Cached sample payload must be a dict: {path}")
+        shard_cache: dict[str, dict[str, Any]] | None = self._shard_cache
+        if not self.in_memory and "shard_relpath" not in entry:
+            shard_cache = None
+        payload = load_input_cache_entry_payload(self.cache_dir, entry, shard_cache=shard_cache)
+        shard_relpath = str(entry.get("shard_relpath", "") or "")
+        if shard_relpath and shard_cache is self._shard_cache:
+            self._shard_cache.move_to_end(shard_relpath)
+            if self._shard_cache_limit is not None:
+                while len(self._shard_cache) > int(self._shard_cache_limit):
+                    self._shard_cache.popitem(last=False)
         return payload
 
     def __getitem__(self, idx: int) -> dict[str, Any]:

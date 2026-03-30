@@ -4,16 +4,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
+
 from input_cache import (
     INPUT_CACHE_PROTOCOL_VERSION,
+    INPUT_CACHE_SHARD_FORMAT_VERSION,
     build_input_cache_contract,
     index_entries_by_key,
+    load_input_cache_entry_payload,
     load_input_cache_index,
     load_input_cache_meta,
     manifest_item_cache_key,
     sample_relpath_for_key,
     save_input_cache_index,
     save_input_cache_meta,
+    shard_relpath_for_index,
     validate_input_cache_contract,
 )
 
@@ -49,6 +57,30 @@ class InputCacheTests(unittest.TestCase):
             self.assertEqual(loaded_entries, entries)
             indexed = index_entries_by_key(loaded_entries)
             self.assertEqual(indexed["train:a"]["sample_bytes"], 123)
+
+    @unittest.skipIf(torch is None, "torch is required for shard payload round-trip")
+    def test_load_entry_payload_supports_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            shard_relpath = shard_relpath_for_index(0)
+            shard_path = cache_dir / shard_relpath
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "format_version": INPUT_CACHE_SHARD_FORMAT_VERSION,
+                    "cache_keys": ["train:a", "val:b"],
+                    "payloads": [
+                        {"meta": {"cache_key": "train:a"}, "audio": torch.tensor([1.0], dtype=torch.float32)},
+                        {"meta": {"cache_key": "val:b"}, "audio": torch.tensor([2.0], dtype=torch.float32)},
+                    ],
+                },
+                shard_path,
+            )
+            payload = load_input_cache_entry_payload(
+                cache_dir,
+                {"cache_key": "val:b", "shard_relpath": str(shard_relpath), "shard_index": 1},
+            )
+            self.assertEqual(float(payload["audio"][0].item()), 2.0)
 
     def test_validate_contract_requires_modalities_and_matching_manifest(self) -> None:
         contract = build_input_cache_contract(
