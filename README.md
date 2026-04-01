@@ -14,6 +14,7 @@
 
 - [PAPER_GRADE_PROTOCOL.md](/Users/dailulu/projects/MMSER-Pytorch/PAPER_GRADE_PROTOCOL.md)
 - [MELD_基线与上限实验运行手册.md](/Users/dailulu/projects/MMSER-Pytorch/MELD_%E5%9F%BA%E7%BA%BF%E4%B8%8E%E4%B8%8A%E9%99%90%E5%AE%9E%E9%AA%8C%E8%BF%90%E8%A1%8C%E6%89%8B%E5%86%8C.md)
+- [主工程认知地图.md](/Users/dailulu/projects/MMSER-Pytorch/%E4%B8%BB%E5%B7%A5%E7%A8%8B%E8%AE%A4%E7%9F%A5%E5%9C%B0%E5%9B%BE.md)
 
 当前主线的正式论文级结果只接受：
 

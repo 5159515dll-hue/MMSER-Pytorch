@@ -506,6 +506,7 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
     meta = metrics.get("meta", {})
     best_val = best.get("best_val_summary", {})
     input_cache_contract = meta.get("input_cache_contract", {}) if isinstance(meta.get("input_cache_contract"), dict) else {}
+    best_bundle_relpath = str(meta.get("best_bundle_relpath", "") or "")
     lines = [
         "# Run Summary",
         "",
@@ -550,11 +551,9 @@ def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
         "",
         "## Artifacts",
         "",
-        "- `metrics.json`",
-        "- `checkpoints/best.pt`",
-        "- `checkpoints/last.pt`",
-        "- `inference_val.jsonl`",
-        "- `inference_val.metrics.json`",
-        "- training curves, lr curve, and confusion matrix PNGs",
+        f"- published_metrics: `{meta.get('attempt_dir', '')}/published/metrics.json`",
+        f"- published_last_checkpoint: `{meta.get('attempt_dir', '')}/published/last.pt`",
+        f"- best_bundle: `{best_bundle_relpath}`",
+        "- published plots: `published/*.png`",
     ]
     (out_dir / "results_summary.md").write_text("\n".join(lines).strip() + "\n", encoding="utf-8")

@@ -77,6 +77,11 @@ _ensure_project_root_on_path()
 
 from hf_compat import ensure_transformers_torch_compat
 from hf_loading import resolve_hf_pretrained_source
+from run_store import (
+    register_published_inference_output,
+    resolve_attempt_dir,
+    resolve_best_bundle,
+)
 
 
 def _lazy_runtime_imports() -> None:
@@ -222,8 +227,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--speaker-id", type=str, default="")
     p.add_argument("--benchmark-tag", type=str, default="default")
     p.add_argument("--text-policy", type=str, default="")
-    p.add_argument("--checkpoint", type=Path, default=Path("outputs/motion_prosody/checkpoints/best.pt"))
-    p.add_argument("--output", type=Path, default=Path("outputs/motion_prosody/inference_results.jsonl"))
+    p.add_argument("--run-dir", type=Path, default=None, help="Run directory created by train.py with run_manifest.json")
+    p.add_argument("--attempt-id", type=str, default="", help="Optional attempt id under --run-dir")
+    p.add_argument("--checkpoint", type=Path, default=None, help="Low-level checkpoint path override for direct/debug inference")
+    p.add_argument("--output", type=Path, default=None)
     p.add_argument("--input-cache", type=Path, default=None, help="Optional mainline input cache directory built by build_mainline_input_cache.py")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--batch-size", type=str, default="auto")
@@ -741,14 +748,26 @@ def main() -> None:
     deterministic_policy = set_seed(0)
 
     split_manifest_path = args.split_manifest.expanduser()
-    ckpt_path = args.checkpoint.expanduser()
-    out_path = args.output.expanduser()
+    attempt_dir: Path | None = None
+    if args.run_dir is not None:
+        run_dir = args.run_dir.expanduser()
+        attempt_dir = resolve_attempt_dir(run_dir, attempt_id=str(args.attempt_id or ""), prefer_published=True)
+        bundle = resolve_best_bundle(attempt_dir)
+        ckpt_path = Path(bundle["checkpoint_path"]).expanduser()
+        if args.output is None:
+            out_path = attempt_dir / "published" / f"inference_{str(args.subset)}.jsonl"
+        else:
+            out_path = args.output.expanduser()
+    else:
+        if args.checkpoint is None:
+            raise RuntimeError("Either --run-dir or --checkpoint must be provided.")
+        ckpt_path = args.checkpoint.expanduser()
+        out_path = args.output.expanduser() if args.output is not None else Path("outputs/motion_prosody/inference_results.jsonl")
     if not split_manifest_path.exists():
         raise FileNotFoundError(f"Split manifest not found: {split_manifest_path}")
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    # 论文级正式评测只接受验证集选出来的那个 `best.pt`。
-    if ckpt_path.name != "best.pt" and not bool(args.allow_incompatible_checkpoint):
+    if attempt_dir is None and ckpt_path.name != "best.pt" and not bool(args.allow_incompatible_checkpoint):
         raise RuntimeError(f"checkpoint must point to best.pt for paper-grade evaluation, got: {ckpt_path.name}")
 
     profile = detect_runtime(str(args.device))
@@ -1212,6 +1231,8 @@ def main() -> None:
 
     metrics_path = out_path.parent / f"{out_path.stem}.metrics.json"
     metrics_path.write_text(json.dumps(metrics_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if attempt_dir is not None:
+        register_published_inference_output(attempt_dir, subset=str(args.subset), output_path=out_path)
     print(json.dumps(metrics_summary, ensure_ascii=False, indent=2), flush=True)
 
 

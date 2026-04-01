@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,7 @@ _ensure_project_root_on_path()
 
 from hf_compat import ensure_transformers_torch_compat
 from hf_loading import resolve_hf_pretrained_source
+from run_store import RunAttemptStore, SignalCapture
 from training_control import EarlyStopConfig, EarlyStopController
 
 
@@ -1040,9 +1042,22 @@ def main() -> None:
     )
 
     out_dir = args.output_dir.expanduser()
-    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    store = RunAttemptStore.create(
+        out_dir,
+        seed=int(args.seed),
+        benchmark_tag=str(args.benchmark_tag),
+        args_payload=to_jsonable(vars(args)),
+        run_contract=run_contract,
+        provenance=run_provenance,
+        validity=validity_summary,
+        input_cache_contract=input_cache_contract,
+        deterministic_policy=deterministic_policy,
+    )
+    signal_capture = SignalCapture().install()
+    metrics_dir = store.published_dir
+    store.mark_running()
 
-    # `history` 既服务于后续画图，也会成为 metrics.json 的原始时间序列部分。
+    # `history` 既服务于后续画图，也会成为 published metrics.json 的原始时间序列部分。
     history: dict[str, Any] = {
         "train_loss": [],
         "train_acc": [],
@@ -1068,10 +1083,6 @@ def main() -> None:
             }
         )
 
-    # 早停控制器内部同时维护：
-    # - “显著提升”的最佳 monitor 值
-    # - tie-break 触发的 checkpoint 保存
-    # - LR 降档次数是否已经满足允许早停的前提
     early_stop = EarlyStopController(
         EarlyStopConfig(
             monitor_name=str(args.monitor),
@@ -1098,138 +1109,313 @@ def main() -> None:
     stop_reason = ""
     run_status = "completed"
 
-    for epoch in range(1, int(args.epochs) + 1):
-        final_epoch = int(epoch)
-        epoch_lr = _current_lr(opt)
-        try:
-            train_stats = _run_phase(
-                phase=f"Epoch {epoch}/{args.epochs} [train]",
-                model=model,
-                loader=train_loader,
-                preprocessor=stream_preprocessor,
-                tokenizer=tokenizer,
-                args=args,
-                device=device,
-                amp_mode=resolved_amp_mode,
-                loss_fn=loss_fn,
-                optimizer=opt,
-                scaler=scaler,
-                prosody_cfg=prosody_cfg,
-                aug_cfg=aug_cfg,
-            )
-            val_stats = _run_phase(
-                phase=f"Epoch {epoch}/{args.epochs} [val]",
-                model=model,
-                loader=val_loader,
-                preprocessor=stream_preprocessor,
-                tokenizer=tokenizer,
-                args=args,
-                device=device,
-                amp_mode=resolved_amp_mode,
-                loss_fn=loss_fn,
-                optimizer=None,
-                scaler=None,
-                prosody_cfg=prosody_cfg,
-                aug_cfg=aug_cfg,
-            )
-        except NumericStabilityError as exc:
-            # 数值失稳直接把当前 run 标成失败，不能继续写成论文级结果。
-            run_status = "failed_numeric"
-            stop_reason = f"failed_numeric: {exc}"
-            paper_grade_reasons.append("numeric_failure")
-            print(f"Stopping training due to numeric instability: {exc}", flush=True)
-            break
-        except DeterminismCompatibilityError as exc:
-            # 如果当前 torch/CUDA 组合不支持某个 deterministic backward，
-            # 也要立刻停下，因为这意味着“当前实验协议无法按既定复现规则执行”。
-            run_status = "failed_determinism"
-            stop_reason = f"failed_determinism: {exc}"
-            paper_grade_reasons.append("determinism_unsupported_op")
-            print(f"Stopping training due to deterministic-op incompatibility: {exc}", flush=True)
-            break
+    try:
+        for epoch in range(1, int(args.epochs) + 1):
+            final_epoch = int(epoch)
+            epoch_lr = _current_lr(opt)
+            try:
+                train_stats = _run_phase(
+                    phase=f"Epoch {epoch}/{args.epochs} [train]",
+                    model=model,
+                    loader=train_loader,
+                    preprocessor=stream_preprocessor,
+                    tokenizer=tokenizer,
+                    args=args,
+                    device=device,
+                    amp_mode=resolved_amp_mode,
+                    loss_fn=loss_fn,
+                    optimizer=opt,
+                    scaler=scaler,
+                    prosody_cfg=prosody_cfg,
+                    aug_cfg=aug_cfg,
+                )
+                val_stats = _run_phase(
+                    phase=f"Epoch {epoch}/{args.epochs} [val]",
+                    model=model,
+                    loader=val_loader,
+                    preprocessor=stream_preprocessor,
+                    tokenizer=tokenizer,
+                    args=args,
+                    device=device,
+                    amp_mode=resolved_amp_mode,
+                    loss_fn=loss_fn,
+                    optimizer=None,
+                    scaler=None,
+                    prosody_cfg=prosody_cfg,
+                    aug_cfg=aug_cfg,
+                )
+            except NumericStabilityError as exc:
+                run_status = "failed_numeric"
+                stop_reason = f"failed_numeric: {exc}"
+                paper_grade_reasons.append("numeric_failure")
+                print(f"Stopping training due to numeric instability: {exc}", flush=True)
+                break
+            except DeterminismCompatibilityError as exc:
+                run_status = "failed_determinism"
+                stop_reason = f"failed_determinism: {exc}"
+                paper_grade_reasons.append("determinism_unsupported_op")
+                print(f"Stopping training due to deterministic-op incompatibility: {exc}", flush=True)
+                break
 
-        print(
-            "Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
-            "val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} "
-            "lr={lr:.2e} train_prepare_s={train_prepare:.2f} val_prepare_s={val_prepare:.2f}".format(
-                epoch=epoch,
-                train_loss=train_stats["loss"],
-                train_acc=train_stats["accuracy"],
-                train_f1=train_stats["macro_f1"],
-                val_loss=val_stats["loss"],
-                val_acc=val_stats["accuracy"],
-                val_f1=val_stats["macro_f1"],
-                lr=epoch_lr,
-                train_prepare=train_stats["prepare_sec"],
-                val_prepare=val_stats["prepare_sec"],
-            ),
-            flush=True,
-        )
-        if bool(args.use_intensity):
             print(
-                "Intensity: train_mse={train_mse:.4f} train_mae={train_mae:.4f} train_ccc={train_ccc:.4f} (n={train_n}) "
-                "val_mse={val_mse:.4f} val_mae={val_mae:.4f} val_ccc={val_ccc:.4f} (n={val_n})".format(
-                    train_mse=train_stats["mse"],
-                    train_mae=train_stats["mae"],
-                    train_ccc=train_stats["ccc"],
-                    train_n=train_stats["intensity_n"],
-                    val_mse=val_stats["mse"],
-                    val_mae=val_stats["mae"],
-                    val_ccc=val_stats["ccc"],
-                    val_n=val_stats["intensity_n"],
+                "Epoch {epoch}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
+                "val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} "
+                "lr={lr:.2e} train_prepare_s={train_prepare:.2f} val_prepare_s={val_prepare:.2f}".format(
+                    epoch=epoch,
+                    train_loss=train_stats["loss"],
+                    train_acc=train_stats["accuracy"],
+                    train_f1=train_stats["macro_f1"],
+                    val_loss=val_stats["loss"],
+                    val_acc=val_stats["accuracy"],
+                    val_f1=val_stats["macro_f1"],
+                    lr=epoch_lr,
+                    train_prepare=train_stats["prepare_sec"],
+                    val_prepare=val_stats["prepare_sec"],
                 ),
                 flush=True,
             )
+            if bool(args.use_intensity):
+                print(
+                    "Intensity: train_mse={train_mse:.4f} train_mae={train_mae:.4f} train_ccc={train_ccc:.4f} (n={train_n}) "
+                    "val_mse={val_mse:.4f} val_mae={val_mae:.4f} val_ccc={val_ccc:.4f} (n={val_n})".format(
+                        train_mse=train_stats["mse"],
+                        train_mae=train_stats["mae"],
+                        train_ccc=train_stats["ccc"],
+                        train_n=train_stats["intensity_n"],
+                        val_mse=val_stats["mse"],
+                        val_mae=val_stats["mae"],
+                        val_ccc=val_stats["ccc"],
+                        val_n=val_stats["intensity_n"],
+                    ),
+                    flush=True,
+                )
 
-        history["train_loss"].append(float(train_stats["loss"]))
-        history["train_acc"].append(float(train_stats["accuracy"]))
-        history["train_f1"].append(float(train_stats["macro_f1"]))
-        history["val_loss"].append(float(val_stats["loss"]))
-        history["val_acc"].append(float(val_stats["accuracy"]))
-        history["val_f1"].append(float(val_stats["macro_f1"]))
-        history["lr"].append(float(epoch_lr))
-        history["train_per_class_recall"].append(dict(train_stats["class_summary"].get("per_class_recall", {})))
-        history["val_per_class_recall"].append(dict(val_stats["class_summary"].get("per_class_recall", {})))
-        if bool(args.use_intensity):
-            history["train_mse"].append(float(train_stats["mse"]))
-            history["train_mae"].append(float(train_stats["mae"]))
-            history["train_ccc"].append(float(train_stats["ccc"]))
-            history["train_intensity_n"].append(float(train_stats["intensity_n"]))
-            history["val_mse"].append(float(val_stats["mse"]))
-            history["val_mae"].append(float(val_stats["mae"]))
-            history["val_ccc"].append(float(val_stats["ccc"]))
-            history["val_intensity_n"].append(float(val_stats["intensity_n"]))
+            history["train_loss"].append(float(train_stats["loss"]))
+            history["train_acc"].append(float(train_stats["accuracy"]))
+            history["train_f1"].append(float(train_stats["macro_f1"]))
+            history["val_loss"].append(float(val_stats["loss"]))
+            history["val_acc"].append(float(val_stats["accuracy"]))
+            history["val_f1"].append(float(val_stats["macro_f1"]))
+            history["lr"].append(float(epoch_lr))
+            history["train_per_class_recall"].append(dict(train_stats["class_summary"].get("per_class_recall", {})))
+            history["val_per_class_recall"].append(dict(val_stats["class_summary"].get("per_class_recall", {})))
+            if bool(args.use_intensity):
+                history["train_mse"].append(float(train_stats["mse"]))
+                history["train_mae"].append(float(train_stats["mae"]))
+                history["train_ccc"].append(float(train_stats["ccc"]))
+                history["train_intensity_n"].append(float(train_stats["intensity_n"]))
+                history["val_mse"].append(float(val_stats["mse"]))
+                history["val_mae"].append(float(val_stats["mae"]))
+                history["val_ccc"].append(float(val_stats["ccc"]))
+                history["val_intensity_n"].append(float(val_stats["intensity_n"]))
 
-        # 模型选择永远只看验证集指标，不看测试集。
-        monitor_value = float(val_stats["macro_f1"] if str(args.monitor) == "val_f1" else val_stats["accuracy"])
-        decision = early_stop.observe(
-            epoch=epoch,
-            monitor_value=monitor_value,
-            tie_break_value=float(val_stats["loss"]),
-        )
-        if decision.should_save_checkpoint:
-            # 这里只保存“当前被验证集选中的最好模型”。
-            # 之后无论跑 val 还是 test 推理，读取的都应该是同一个 `best.pt`。
-            best_epoch = int(epoch)
-            best_acc = float(val_stats["accuracy"])
-            best_f1 = float(val_stats["macro_f1"])
-            best_monitor_value = float(monitor_value)
-            best_val_loss = float(val_stats["loss"])
-            best_checkpoint_reason = str(decision.checkpoint_reason or "")
-            significant_best_monitor_value = float(
-                early_stop.best_monitor_value if early_stop.best_monitor_value is not None else monitor_value
+            monitor_value = float(val_stats["macro_f1"] if str(args.monitor) == "val_f1" else val_stats["accuracy"])
+            decision = early_stop.observe(
+                epoch=epoch,
+                monitor_value=monitor_value,
+                tie_break_value=float(val_stats["loss"]),
             )
-            best_train_summary = dict(train_stats["class_summary"])
-            best_val_summary = dict(val_stats["class_summary"])
-            best_val_records = list(val_stats["records"])
-            ckpt = {
-                "model": model.state_dict(),
+            if decision.should_save_checkpoint:
+                best_epoch = int(epoch)
+                best_acc = float(val_stats["accuracy"])
+                best_f1 = float(val_stats["macro_f1"])
+                best_monitor_value = float(monitor_value)
+                best_val_loss = float(val_stats["loss"])
+                best_checkpoint_reason = str(decision.checkpoint_reason or "")
+                significant_best_monitor_value = float(
+                    early_stop.best_monitor_value if early_stop.best_monitor_value is not None else monitor_value
+                )
+                best_train_summary = dict(train_stats["class_summary"])
+                best_val_summary = dict(val_stats["class_summary"])
+                best_val_records = list(val_stats["records"])
+                bundle_checkpoint_path = store.attempt_dir / "bundles" / f"best_epoch_{int(epoch):04d}" / "checkpoint.pt"
+                ckpt = {
+                    "model": model.state_dict(),
+                    "epoch": int(epoch),
+                    "best_acc": float(best_acc),
+                    "best_f1": float(best_f1),
+                    "best_monitor_name": str(args.monitor),
+                    "best_monitor_value": float(best_monitor_value),
+                    "significant_best_monitor_value": float(significant_best_monitor_value),
+                    "best_val_loss": float(best_val_loss),
+                    "checkpoint_reason": str(best_checkpoint_reason),
+                    "args": to_jsonable(vars(args)),
+                    "label_names": list(label_names),
+                    "task_mode": task_mode,
+                    "speaker_id": task_speaker_id,
+                    "text_policy": str(args.text_policy),
+                    "validity": validity_summary,
+                    "resolved_runtime": {
+                        "device": str(device),
+                        "profile": profile.to_jsonable(),
+                        "batch_size": int(resolved_batch_size),
+                        "num_workers": int(resolved_num_workers),
+                        "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+                        "amp_mode": resolved_amp_mode,
+                        "pipeline": "gpu_stream",
+                        "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+                        "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+                    },
+                    "benchmark_tag": str(args.benchmark_tag),
+                    "dataset_kind": dataset_kind,
+                    "split_manifest": str(split_manifest_path),
+                    "manifest_sha256": manifest_hash,
+                    "ablation": str(args.ablation),
+                    "zero_video": bool(args.zero_video),
+                    "zero_audio": bool(args.zero_audio),
+                    "zero_text": bool(args.zero_text),
+                    "best_val_summary": best_val_summary,
+                    "paper_contract": run_contract,
+                    "input_cache_contract": input_cache_contract,
+                    "provenance": run_provenance,
+                    "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
+                    "run_status": str(run_status),
+                }
+                val_metrics_summary = {
+                    "split_manifest": str(split_manifest_path),
+                    "subset": "val",
+                    "benchmark_tag": str(args.benchmark_tag),
+                    "checkpoint": str(bundle_checkpoint_path),
+                    "task_mode": task_mode,
+                    "speaker_id": task_speaker_id,
+                    "text_policy": str(args.text_policy),
+                    "label_names": list(label_names),
+                    "attempted": len(best_val_records),
+                    "ok": len(best_val_records),
+                    "errors": 0,
+                    "skipped": 0,
+                    "accuracy_on_ok": float(best_acc),
+                    "macro_f1_on_ok": float(best_f1),
+                    "loss_on_ok": float(best_val_loss),
+                    "best_epoch": int(best_epoch),
+                    "checkpoint_reason": str(best_checkpoint_reason),
+                    "per_class_recall": best_val_summary.get("per_class_recall", {}),
+                    "confusion_matrix": best_val_summary.get("confusion_matrix", []),
+                    "support": best_val_summary.get("support", {}),
+                    "pred_counts": best_val_summary.get("pred_counts", {}),
+                    "manifest_sha256": manifest_hash,
+                    "manifest_summary": manifest_summary,
+                    "validity": validity_summary,
+                    "speaker_majority_baseline": speaker_baseline,
+                    "speaker_only_baseline": speaker_only,
+                    "pipeline": "gpu_stream",
+                    "paper_contract": run_contract,
+                    "input_cache_contract": input_cache_contract,
+                    "provenance": run_provenance,
+                    "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
+                    "run_status": str(run_status),
+                }
+                bundle_dir = store.publish_best_bundle(
+                    torch_mod=torch,
+                    epoch=epoch,
+                    checkpoint_payload=ckpt,
+                    records=best_val_records,
+                    metrics_summary=val_metrics_summary,
+                    selection_meta={
+                        "checkpoint_reason": str(best_checkpoint_reason),
+                        "best_monitor_value": float(best_monitor_value),
+                        "best_val_loss": float(best_val_loss),
+                    },
+                )
+                print(f"Saved best checkpoint bundle -> {bundle_dir / 'checkpoint.pt'}", flush=True)
+
+            epoch_state = {
+                "schema_version": "run_store_v1",
                 "epoch": int(epoch),
+                "lr": float(epoch_lr),
+                "train": {
+                    "loss": float(train_stats["loss"]),
+                    "accuracy": float(train_stats["accuracy"]),
+                    "macro_f1": float(train_stats["macro_f1"]),
+                    "prepare_sec": float(train_stats["prepare_sec"]),
+                    "class_summary": dict(train_stats["class_summary"]),
+                },
+                "val": {
+                    "loss": float(val_stats["loss"]),
+                    "accuracy": float(val_stats["accuracy"]),
+                    "macro_f1": float(val_stats["macro_f1"]),
+                    "prepare_sec": float(val_stats["prepare_sec"]),
+                    "class_summary": dict(val_stats["class_summary"]),
+                },
+                "selection": {
+                    "monitor_name": str(args.monitor),
+                    "monitor_value": float(monitor_value),
+                    "checkpoint_selected": bool(decision.should_save_checkpoint),
+                    "checkpoint_reason": str(decision.checkpoint_reason or ""),
+                    "best_epoch": int(best_epoch),
+                    "best_bundle_relpath": store.best_bundle_relpath,
+                },
+            }
+            if bool(args.use_intensity):
+                epoch_state["train"].update(
+                    {
+                        "mse": float(train_stats["mse"]),
+                        "mae": float(train_stats["mae"]),
+                        "ccc": float(train_stats["ccc"]),
+                        "intensity_n": float(train_stats["intensity_n"]),
+                    }
+                )
+                epoch_state["val"].update(
+                    {
+                        "mse": float(val_stats["mse"]),
+                        "mae": float(val_stats["mae"]),
+                        "ccc": float(val_stats["ccc"]),
+                        "intensity_n": float(val_stats["intensity_n"]),
+                    }
+                )
+
+            if scheduler is not None:
+                lr_before_step = _current_lr(opt)
+                scheduler.step(float(val_stats["loss"]))
+                lr_after_step = _current_lr(opt)
+                if lr_after_step + 1.0e-12 < lr_before_step:
+                    early_stop.register_lr_drop(epoch)
+                    print(
+                        f"LR reduced at epoch {epoch}: {lr_before_step:.2e} -> {lr_after_step:.2e}",
+                        flush=True,
+                    )
+                    epoch_state["scheduler"] = {
+                        "lr_before_step": float(lr_before_step),
+                        "lr_after_step": float(lr_after_step),
+                        "lr_drop_registered": True,
+                    }
+
+            store.write_epoch_state(
+                epoch=epoch,
+                epoch_payload=epoch_state,
+                best_epoch=best_epoch,
+                best_bundle_relpath=store.best_bundle_relpath,
+            )
+
+            should_stop, stop_reason_candidate = early_stop.evaluate_stop(epoch)
+            if should_stop:
+                stop_reason = str(stop_reason_candidate or "")
+                print(f"Early stopping at epoch {epoch}: {stop_reason}", flush=True)
+                break
+            if signal_capture.state.requested:
+                signal_name = str(signal_capture.state.signal_name or "SIGTERM")
+                store.note_signal(signal_name)
+                run_status = "interrupted"
+                stop_reason = f"interrupted:{signal_name}"
+                print(f"Stopping training after epoch {epoch} due to {signal_name}", flush=True)
+                break
+
+        if not stop_reason:
+            stop_reason = "max_epochs_reached"
+
+        paper_grade = build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons)
+
+        if run_status not in {"failed_numeric", "failed_determinism"}:
+            last_ckpt = {
+                "model": model.state_dict(),
+                "epoch": int(final_epoch),
                 "best_acc": float(best_acc),
                 "best_f1": float(best_f1),
                 "best_monitor_name": str(args.monitor),
                 "best_monitor_value": float(best_monitor_value),
-                "significant_best_monitor_value": float(significant_best_monitor_value),
+                "significant_best_monitor_value": float(
+                    significant_best_monitor_value if significant_best_monitor_value != float("-inf") else 0.0
+                ),
                 "best_val_loss": float(best_val_loss),
                 "checkpoint_reason": str(best_checkpoint_reason),
                 "args": to_jsonable(vars(args)),
@@ -1249,223 +1435,144 @@ def main() -> None:
                     "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
                     "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
                 },
-                "benchmark_tag": str(args.benchmark_tag),
-                "dataset_kind": dataset_kind,
-                "split_manifest": str(split_manifest_path),
-                "manifest_sha256": manifest_hash,
-                "ablation": str(args.ablation),
-                "zero_video": bool(args.zero_video),
-                "zero_audio": bool(args.zero_audio),
-                "zero_text": bool(args.zero_text),
-                "best_val_summary": best_val_summary,
+                "stop": {
+                    "epoch": int(final_epoch),
+                    "reason": str(stop_reason),
+                    "epochs_without_improvement": int(early_stop.epochs_without_improvement),
+                    "lr_drop_epochs": list(early_stop.lr_drop_epochs),
+                },
                 "paper_contract": run_contract,
                 "input_cache_contract": input_cache_contract,
                 "provenance": run_provenance,
-                "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
+                "paper_grade": paper_grade,
                 "run_status": str(run_status),
             }
-            torch.save(ckpt, out_dir / "checkpoints" / "best.pt")
+            store.publish_last_checkpoint(torch_mod=torch, checkpoint_payload=last_ckpt)
 
-            # 同步把该最佳 epoch 的验证集逐样本结果写成标准推理产物，
-            # 这样训练结束后不需要再额外跑一次 val 推理才能复核最佳模型。
-            val_metrics_summary = {
-                "split_manifest": str(split_manifest_path),
-                "subset": "val",
-                "benchmark_tag": str(args.benchmark_tag),
-                "checkpoint": str(out_dir / "checkpoints" / "best.pt"),
-                "task_mode": task_mode,
-                "speaker_id": task_speaker_id,
-                "text_policy": str(args.text_policy),
-                "label_names": list(label_names),
-                "attempted": len(best_val_records),
-                "ok": len(best_val_records),
-                "errors": 0,
-                "skipped": 0,
-                "accuracy_on_ok": float(best_acc),
-                "macro_f1_on_ok": float(best_f1),
-                "loss_on_ok": float(best_val_loss),
-                "best_epoch": int(best_epoch),
-                "checkpoint_reason": str(best_checkpoint_reason),
-                "per_class_recall": best_val_summary.get("per_class_recall", {}),
-                "confusion_matrix": best_val_summary.get("confusion_matrix", []),
-                "support": best_val_summary.get("support", {}),
-                "pred_counts": best_val_summary.get("pred_counts", {}),
-                "manifest_sha256": manifest_hash,
-                "manifest_summary": manifest_summary,
-                "validity": validity_summary,
-                "speaker_majority_baseline": speaker_baseline,
-                "speaker_only_baseline": speaker_only,
-                "pipeline": "gpu_stream",
-                "paper_contract": run_contract,
-                "input_cache_contract": input_cache_contract,
-                "provenance": run_provenance,
-                "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
-                "run_status": str(run_status),
-            }
-            write_best_val_inference_outputs(out_dir, records=best_val_records, metrics_summary=val_metrics_summary)
-            print(f"Saved best checkpoint -> {out_dir / 'checkpoints' / 'best.pt'}", flush=True)
-
-        # Plateau 调度器看的是验证损失；一旦发生降档，要通知 early stop 控制器。
-        if scheduler is not None:
-            lr_before_step = _current_lr(opt)
-            scheduler.step(float(val_stats["loss"]))
-            lr_after_step = _current_lr(opt)
-            if lr_after_step + 1.0e-12 < lr_before_step:
-                early_stop.register_lr_drop(epoch)
-                print(
-                    f"LR reduced at epoch {epoch}: {lr_before_step:.2e} -> {lr_after_step:.2e}",
-                    flush=True,
-                )
-
-        should_stop, stop_reason_candidate = early_stop.evaluate_stop(epoch)
-        if should_stop:
-            stop_reason = str(stop_reason_candidate or "")
-            print(
-                f"Early stopping at epoch {epoch}: {stop_reason}",
-                flush=True,
-            )
-            break
-
-    # 如果不是异常中断也不是 early stop，就说明训练跑到了最大 epoch。
-    if not stop_reason:
-        stop_reason = "max_epochs_reached"
-
-    paper_grade = build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons)
-    best_ckpt_path = out_dir / "checkpoints" / "best.pt"
-    if best_ckpt_path.is_file() and not bool(paper_grade.get("eligible", False)):
-        best_ckpt = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
-        if isinstance(best_ckpt, dict):
-            best_ckpt["paper_grade"] = paper_grade
-            best_ckpt["run_status"] = str(run_status)
-            torch.save(best_ckpt, best_ckpt_path)
-    best_val_metrics_path = out_dir / "inference_val.metrics.json"
-    if best_val_metrics_path.is_file() and not bool(paper_grade.get("eligible", False)):
-        best_val_metrics = json.loads(best_val_metrics_path.read_text(encoding="utf-8"))
-        if isinstance(best_val_metrics, dict):
-            best_val_metrics["paper_grade"] = paper_grade
-            best_val_metrics["run_status"] = str(run_status)
-            best_val_metrics_path.write_text(
-                json.dumps(best_val_metrics, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-    # 只有在 run 没有因为数值/确定性失败中断时，才有意义写 `last.pt`。
-    if run_status not in {"failed_numeric", "failed_determinism"}:
-        last_ckpt = {
-            "model": model.state_dict(),
-            "epoch": int(final_epoch),
+        metrics_payload: dict[str, Any] = dict(history)
+        metrics_payload["meta"] = {
+            "benchmark_tag": str(args.benchmark_tag),
+            "split_manifest": str(split_manifest_path),
+            "manifest_sha256": manifest_hash,
+            "dataset_kind": dataset_kind,
+            "task_mode": task_mode,
+            "speaker_id": task_speaker_id,
+            "text_policy": str(args.text_policy),
+            "label_names": list(label_names),
+            "train_size": len(train_ds),
+            "val_size": len(val_ds),
+            "ablation": str(args.ablation),
+            "zero_video": bool(args.zero_video),
+            "zero_audio": bool(args.zero_audio),
+            "zero_text": bool(args.zero_text),
+            "args": to_jsonable(vars(args)),
+            "device": str(device),
+            "runtime_profile": profile.to_jsonable(),
+            "resolved_batch_size": int(resolved_batch_size),
+            "resolved_num_workers": int(resolved_num_workers),
+            "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
+            "amp_mode": resolved_amp_mode,
+            "lr_scheduler": str(args.lr_scheduler),
+            "pipeline": "gpu_stream",
+            "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+            "input_cache_contract": input_cache_contract,
+            "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+            "manifest_summary": manifest_summary,
+            "paper_protocol_version": str(run_contract.get("protocol_version")),
+            "deterministic_policy": deterministic_policy,
+            "paper_contract": run_contract,
+            "run_dir": str(out_dir),
+            "attempt_dir": str(store.attempt_dir),
+            "best_bundle_relpath": store.best_bundle_relpath,
+        }
+        metrics_payload["best"] = {
+            "epoch": int(best_epoch),
             "best_acc": float(best_acc),
             "best_f1": float(best_f1),
+            "best_val_loss": float(best_val_loss),
             "best_monitor_name": str(args.monitor),
             "best_monitor_value": float(best_monitor_value),
             "significant_best_monitor_value": float(
                 significant_best_monitor_value if significant_best_monitor_value != float("-inf") else 0.0
             ),
-            "best_val_loss": float(best_val_loss),
             "checkpoint_reason": str(best_checkpoint_reason),
-            "args": to_jsonable(vars(args)),
-            "label_names": list(label_names),
-            "task_mode": task_mode,
-            "speaker_id": task_speaker_id,
-            "text_policy": str(args.text_policy),
-            "validity": validity_summary,
-            "resolved_runtime": {
-                "device": str(device),
-                "profile": profile.to_jsonable(),
-                "batch_size": int(resolved_batch_size),
-                "num_workers": int(resolved_num_workers),
-                "prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
-                "amp_mode": resolved_amp_mode,
-                "pipeline": "gpu_stream",
-                "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
-                "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
-            },
-            "stop": {
-                "epoch": int(final_epoch),
-                "reason": str(stop_reason),
-                "epochs_without_improvement": int(early_stop.epochs_without_improvement),
-                "lr_drop_epochs": list(early_stop.lr_drop_epochs),
-            },
-            "paper_contract": run_contract,
-            "input_cache_contract": input_cache_contract,
-            "provenance": run_provenance,
-            "paper_grade": paper_grade,
-            "run_status": str(run_status),
+            "best_train_summary": best_train_summary,
+            "best_val_summary": best_val_summary,
         }
-        torch.save(last_ckpt, out_dir / "checkpoints" / "last.pt")
+        metrics_payload["stop"] = {
+            "epoch": int(final_epoch),
+            "reason": str(stop_reason),
+            "epochs_without_improvement": int(early_stop.epochs_without_improvement),
+            "lr_drop_epochs": list(early_stop.lr_drop_epochs),
+        }
+        metrics_payload["validity"] = validity_summary
+        metrics_payload["provenance"] = run_provenance
+        metrics_payload["paper_grade"] = paper_grade
+        metrics_payload["run_status"] = str(run_status)
+        if speaker_baseline is not None:
+            metrics_payload["speaker_majority_baseline"] = speaker_baseline
+        if speaker_only is not None:
+            metrics_payload["speaker_only_baseline"] = speaker_only
 
-    # 最终 metrics payload 由三层组成：
-    # - history: 每轮时间序列
-    # - meta/best/stop: 解释怎么训练、如何选最优、为什么停止
-    # - validity/provenance/paper_grade: 论文级可信性元数据
-    metrics_payload: dict[str, Any] = dict(history)
-    metrics_payload["meta"] = {
-        "benchmark_tag": str(args.benchmark_tag),
-        "split_manifest": str(split_manifest_path),
-        "manifest_sha256": manifest_hash,
-        "dataset_kind": dataset_kind,
-        "task_mode": task_mode,
-        "speaker_id": task_speaker_id,
-        "text_policy": str(args.text_policy),
-        "label_names": list(label_names),
-        "train_size": len(train_ds),
-        "val_size": len(val_ds),
-        "ablation": str(args.ablation),
-        "zero_video": bool(args.zero_video),
-        "zero_audio": bool(args.zero_audio),
-        "zero_text": bool(args.zero_text),
-        "args": to_jsonable(vars(args)),
-        "device": str(device),
-        "runtime_profile": profile.to_jsonable(),
-        "resolved_batch_size": int(resolved_batch_size),
-        "resolved_num_workers": int(resolved_num_workers),
-        "resolved_prefetch_factor": int(prefetch_factor) if prefetch_factor is not None else None,
-        "amp_mode": resolved_amp_mode,
-        "lr_scheduler": str(args.lr_scheduler),
-        "pipeline": "gpu_stream",
-        "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
-        "input_cache_contract": input_cache_contract,
-        "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
-        "manifest_summary": manifest_summary,
-        "paper_protocol_version": str(run_contract.get("protocol_version")),
-        "deterministic_policy": deterministic_policy,
-        "paper_contract": run_contract,
-    }
-    metrics_payload["best"] = {
-        "epoch": int(best_epoch),
-        "best_acc": float(best_acc),
-        "best_f1": float(best_f1),
-        "best_val_loss": float(best_val_loss),
-        "best_monitor_name": str(args.monitor),
-        "best_monitor_value": float(best_monitor_value),
-        "significant_best_monitor_value": float(
-            significant_best_monitor_value if significant_best_monitor_value != float("-inf") else 0.0
-        ),
-        "checkpoint_reason": str(best_checkpoint_reason),
-        "best_train_summary": best_train_summary,
-        "best_val_summary": best_val_summary,
-    }
-    metrics_payload["stop"] = {
-        "epoch": int(final_epoch),
-        "reason": str(stop_reason),
-        "epochs_without_improvement": int(early_stop.epochs_without_improvement),
-        "lr_drop_epochs": list(early_stop.lr_drop_epochs),
-    }
-    metrics_payload["validity"] = validity_summary
-    metrics_payload["provenance"] = run_provenance
-    metrics_payload["paper_grade"] = paper_grade
-    metrics_payload["run_status"] = str(run_status)
-    if speaker_baseline is not None:
-        metrics_payload["speaker_majority_baseline"] = speaker_baseline
-    if speaker_only is not None:
-        metrics_payload["speaker_only_baseline"] = speaker_only
+        save_metrics_and_plots(metrics_dir, metrics_payload)
+        write_results_summary(metrics_dir, metrics_payload)
+        store.publish_reports(metrics_dir=metrics_dir)
 
-    save_metrics_and_plots(out_dir, metrics_payload)
-    write_results_summary(out_dir, metrics_payload)
-    print(
-        f"Best val macro_f1={best_f1:.4f}, acc={best_acc:.4f}, epoch={best_epoch}, stop_reason={stop_reason}",
-        flush=True,
-    )
+        terminal_status = {
+            "completed": "completed",
+            "failed_numeric": "failed_numeric",
+            "failed_determinism": "failed_determinism",
+            "interrupted": "interrupted",
+        }.get(str(run_status), "completed")
+        publish_attempt = terminal_status == "completed"
+        if terminal_status in {"failed_numeric", "failed_determinism"}:
+            store.record_failure(status=terminal_status, message=stop_reason, exc_type=terminal_status)
+        store.finalize(
+            status=terminal_status,
+            run_status=str(run_status),
+            stop_reason=str(stop_reason),
+            publish_attempt=publish_attempt,
+            failure=None,
+        )
+        print(
+            f"Best val macro_f1={best_f1:.4f}, acc={best_acc:.4f}, epoch={best_epoch}, stop_reason={stop_reason}",
+            flush=True,
+        )
+    except KeyboardInterrupt:
+        run_status = "interrupted"
+        stop_reason = str(stop_reason or "interrupted:KeyboardInterrupt")
+        failure = {
+            "type": "KeyboardInterrupt",
+            "message": str(stop_reason),
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        store.finalize(
+            status="interrupted",
+            run_status=run_status,
+            stop_reason=stop_reason,
+            publish_attempt=False,
+            failure=failure,
+        )
+        raise
+    except Exception as exc:
+        run_status = "failed_exception"
+        stop_reason = str(stop_reason or f"failed_exception: {type(exc).__name__}: {exc}")
+        failure = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        store.finalize(
+            status="failed_exception",
+            run_status=run_status,
+            stop_reason=stop_reason,
+            publish_attempt=False,
+            failure=failure,
+        )
+        raise
+    finally:
+        signal_capture.restore()
 
 
 if __name__ == "__main__":

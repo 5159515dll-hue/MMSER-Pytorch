@@ -11,6 +11,7 @@ from benchmark_report_utils import (
     ensure_group_is_paper_grade_ready,
     summarize_experiment_group,
 )
+from run_store import RUN_STORE_SCHEMA_VERSION
 
 
 class BenchmarkReportUtilsTests(unittest.TestCase):
@@ -26,7 +27,12 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
         input_cache_used: bool = False,
     ) -> Path:
         run_dir = root / name
-        run_dir.mkdir(parents=True, exist_ok=True)
+        attempt_id = f"attempt_seed{seed}"
+        attempt_dir = run_dir / "attempts" / attempt_id
+        bundle_dir = attempt_dir / "bundles" / "best_epoch_0012"
+        published_dir = attempt_dir / "published"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        (published_dir / "plots").mkdir(parents=True, exist_ok=True)
         contract = {
             "protocol_version": "paper_grade_v1",
             "manifest_sha256": manifest_sha256,
@@ -83,7 +89,7 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
             "run_status": "completed",
         }
         val_metrics = {
-            "checkpoint": str(run_dir / "checkpoints" / "best.pt"),
+            "checkpoint": str(bundle_dir / "checkpoint.pt"),
             "macro_f1_on_ok": test_macro_f1 - 0.05,
             "accuracy_on_ok": test_accuracy - 0.05,
             "manifest_sha256": manifest_sha256,
@@ -105,7 +111,7 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
             },
         }
         test_metrics = {
-            "checkpoint": str(run_dir / "checkpoints" / "best.pt"),
+            "checkpoint": str(bundle_dir / "checkpoint.pt"),
             "macro_f1_on_ok": test_macro_f1,
             "accuracy_on_ok": test_accuracy,
             "manifest_sha256": manifest_sha256,
@@ -126,12 +132,85 @@ class BenchmarkReportUtilsTests(unittest.TestCase):
                 "ineligibility_reasons": [],
             },
         }
-        (run_dir / "metrics.json").write_text(json.dumps(train_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-        (run_dir / "inference_val.metrics.json").write_text(
+        run_manifest = {
+            "schema_version": RUN_STORE_SCHEMA_VERSION,
+            "run_dir": str(run_dir),
+            "created_at": "2026-03-30T00:00:00Z",
+            "updated_at": "2026-03-30T00:00:00Z",
+            "benchmark_tag": name,
+            "published_attempt_id": attempt_id,
+            "active_attempt_id": None,
+            "attempts": [
+                {
+                    "attempt_id": attempt_id,
+                    "attempt_relpath": str(attempt_dir.relative_to(run_dir)),
+                    "seed": seed,
+                    "status": "completed",
+                    "started_at": "2026-03-30T00:00:00Z",
+                    "finished_at": "2026-03-30T00:10:00Z",
+                    "best_epoch": 12,
+                    "run_status": "completed",
+                }
+            ],
+        }
+        attempt_manifest = {
+            "schema_version": RUN_STORE_SCHEMA_VERSION,
+            "attempt_id": attempt_id,
+            "attempt_relpath": str(attempt_dir.relative_to(run_dir)),
+            "run_dir": str(run_dir),
+            "status": "completed",
+            "benchmark_tag": name,
+            "seed": seed,
+            "created_at": "2026-03-30T00:00:00Z",
+            "updated_at": "2026-03-30T00:10:00Z",
+            "started_at": "2026-03-30T00:00:00Z",
+            "finished_at": "2026-03-30T00:10:00Z",
+            "args": {"seed": seed},
+            "run_contract": contract,
+            "provenance": {},
+            "validity": train_metrics["validity"],
+            "input_cache_contract": train_metrics["meta"]["input_cache_contract"] or {},
+            "deterministic_policy": train_metrics["meta"]["deterministic_policy"],
+            "current_epoch": 18,
+            "epochs_completed": [1, 2, 3],
+            "best_epoch": 12,
+            "best_bundle_relpath": str(bundle_dir.relative_to(attempt_dir)),
+            "published_last_checkpoint_relpath": str((published_dir / "last.pt").relative_to(attempt_dir)),
+            "published_metrics_relpath": str((published_dir / "metrics.json").relative_to(attempt_dir)),
+            "published_results_summary_relpath": str((published_dir / "results_summary.md").relative_to(attempt_dir)),
+            "published_inference_outputs": {
+                "val": str((bundle_dir / "inference_val.jsonl").relative_to(attempt_dir)),
+                "test": str((published_dir / "inference_test.jsonl").relative_to(attempt_dir)),
+            },
+            "published_inference_metrics": {
+                "val": str((bundle_dir / "inference_val.metrics.json").relative_to(attempt_dir)),
+                "test": str((published_dir / "inference_test.metrics.json").relative_to(attempt_dir)),
+            },
+            "run_status": "completed",
+            "stop_reason": "max_epochs_reached",
+            "failure": None,
+        }
+        bundle_manifest = {
+            "schema_version": RUN_STORE_SCHEMA_VERSION,
+            "bundle_id": "best_epoch_0012",
+            "attempt_id": attempt_id,
+            "epoch": 12,
+            "selection_meta": {"checkpoint_reason": "monitor_improved"},
+        }
+        (run_dir / "run_manifest.json").write_text(json.dumps(run_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (attempt_dir / "attempt_manifest.json").write_text(json.dumps(attempt_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (published_dir / "metrics.json").write_text(json.dumps(train_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        (published_dir / "results_summary.md").write_text("# summary\n", encoding="utf-8")
+        (published_dir / "last.pt").write_bytes(b"last")
+        (bundle_dir / "bundle_manifest.json").write_text(json.dumps(bundle_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (bundle_dir / "checkpoint.pt").write_bytes(b"best")
+        (bundle_dir / "inference_val.jsonl").write_text("", encoding="utf-8")
+        (published_dir / "inference_test.jsonl").write_text("", encoding="utf-8")
+        (bundle_dir / "inference_val.metrics.json").write_text(
             json.dumps(val_metrics, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        (run_dir / "inference_test.metrics.json").write_text(
+        (published_dir / "inference_test.metrics.json").write_text(
             json.dumps(test_metrics, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

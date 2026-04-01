@@ -216,7 +216,7 @@ python3 shard_input_cache.py \
 从这一版开始，四组 MELD GPU 实验不再采用“单次 run 里连续 5 轮没涨就停”的经验式口径，而统一采用下面这套更稳妥的协议：
 
 - headline 结果一律来自 `5` 个固定随机种子：`13 17 23 42 3407`
-- 每个 seed 都独立训练一次，只允许用验证集选择 `checkpoints/best.pt`
+- 每个 seed 都独立训练一次；训练产物以 `<run_dir>/run_manifest.json` 里发布的 published attempt 为准
 - 同一组 `5` 个 seed 必须统一 `--input-cache` 使用方式，不能一部分走缓存、一部分走原始流式路径
 - 测试集只在该 seed 训练结束后跑一次，不能参与早停、调参或挑 checkpoint
 - 主监控指标固定为 `val_f1`
@@ -232,14 +232,20 @@ python3 shard_input_cache.py \
 
 统一说明：
 
-- `batch_inference.py` 的 checkpoint 统一使用 `checkpoints/best.pt`
+- 正式实验里统一用 `python3 batch_inference.py --run-dir <run_dir>`，不要再手工拼 `checkpoints/best.pt`
+- `batch_inference.py --checkpoint ...` 只保留给低层调试；正式评测不要用它
 - 正式实验里不要使用 `--allow-incompatible-checkpoint`；它只用于调试，且会让输出自动失去论文级资格
-- 推理统计摘要统一写成 `inference_val.metrics.json` 和 `inference_test.metrics.json`
+- 训练结果的权威入口是 `<run_dir>/run_manifest.json`
+- 训练摘要统一看 `attempts/<attempt_id>/published/metrics.json`
+- 验证集最佳 bundle 摘要统一看 `attempts/<attempt_id>/bundles/best_epoch_xxxx/inference_val.metrics.json`
+- 测试集推理摘要统一看 `attempts/<attempt_id>/published/inference_test.metrics.json`
 - 训练、推理和聚合产物里都应检查 `paper_grade.eligible=true`
 - 正式 headline 结果必须保证 train / val / test 共享同一 `manifest_sha256`
 - 单个 seed 的最好结果只能作为明细，不应直接作为论文表格 headline
 - 正式对外汇报时，应使用多 seed 汇总结果里的 `mean ± std`、`95% CI` 和相邻实验之间的配对显著性检验
 - 如果某次 run 的 `paper_grade.eligible=false`，即使数值更高，也不能放进正式论文表
+- 如果要快速检查某个 run 是否完整，直接执行 `python3 validate_run_artifacts.py --run-dir <run_dir>`
+- 历史平铺目录若要纳入新协议，使用 `python3 migrate_legacy_run_dir.py --run-dir <run_dir>`
 
 ## MELD GPU 主实验以后不要再用的旧命令
 
@@ -378,6 +384,11 @@ done
 
 验证集推理：
 
+说明：
+
+- `batch_inference.py --run-dir ...` 会先读取该 run 的 `run_manifest.json`，再自动解析 published attempt 的最佳 bundle
+- 因此这里不要再额外传 `--video-backbone`、`--audio-model`、`--text-model`、`--flow-backend`、`--flow-size`、`--rgb-size` 这类训练期结构参数
+
 ```bash
 SEEDS="13 17 23 42 3407"
 INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
@@ -385,18 +396,13 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_shard
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset val \
-    --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_val.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone flow \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --ablation no-video \
@@ -415,18 +421,13 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_shard
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset test \
-    --checkpoint outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}/inference_test.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone flow \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --ablation no-video \
@@ -450,7 +451,7 @@ python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_si
 重点看：
 
 - `multi_seed_summary.json` 里的 `test_macro_f1.mean/std/95% CI`
-- 每个 seed 的 `metrics.json` 里 `stop.reason`、`stop.lr_drop_epochs` 和 `best.best_val_loss`
+- 每个 seed 的 `attempts/<published_attempt_id>/published/metrics.json` 里 `stop.reason`、`stop.lr_drop_epochs` 和 `best.best_val_loss`
 - 这一组主要作为后续三组的统计比较基线
 
 ### 总结
@@ -566,20 +567,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset val \
-    --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_val.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone videomae \
     --num-frames 16 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \
@@ -597,20 +592,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset test \
-    --checkpoint outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}/inference_test.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone videomae \
     --num-frames 16 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \
@@ -742,20 +731,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset val \
-    --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_val.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone videomae \
     --num-frames 16 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \
@@ -773,20 +756,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset test \
-    --checkpoint outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}/inference_test.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone videomae \
     --num-frames 16 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \
@@ -921,22 +898,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset val \
-    --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_val.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone dual \
-    --flow-backend torch_motion \
     --num-frames 32 \
-    --flow-size 112 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \
@@ -954,22 +923,14 @@ INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1
 for seed in $SEEDS; do
   python3 batch_inference.py \
     --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --run-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
     --input-cache ${INPUT_CACHE} \
     --subset test \
-    --checkpoint outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/checkpoints/best.pt \
-    --output outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}/inference_test.jsonl \
     --device auto \
     --amp-mode bf16 \
     --batch-size 16 \
     --num-workers auto \
-    --video-backbone dual \
-    --flow-backend torch_motion \
     --num-frames 32 \
-    --flow-size 112 \
-    --rgb-size 224 \
-    --audio-model microsoft/wavlm-large \
-    --audio-model-revision e4e472c491084b2c6fb9736099130aa805159c62 \
-    --text-model FacebookAI/xlm-roberta-large \
     --task-mode confounded_7way \
     --text-policy full \
     --sample-rate 16000 \

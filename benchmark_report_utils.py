@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from metrics_utils import holm_bonferroni_adjust, mean_confidence_interval_t, paired_t_test
+from run_store import load_attempt_manifest, resolve_attempt_dir, resolve_published_metrics
 
 PAPER_MULTI_SEED = [13, 17, 23, 42, 3407]
 
@@ -70,15 +71,24 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _resolve_inference_metrics_path(run_dir: Path, stem: str) -> Path:
-    candidates = [
-        run_dir / f"{stem}.metrics.json",
-        run_dir / f"{stem}.jsonl.metrics.json",
-    ]
+def _resolve_inference_metrics_path(attempt_dir: Path, attempt_manifest: dict[str, Any], subset: str) -> Path:
+    published_metrics = attempt_manifest.get("published_inference_metrics", {})
+    metrics_relpath = ""
+    if isinstance(published_metrics, dict):
+        metrics_relpath = str(published_metrics.get(str(subset), "") or "")
+    candidates = []
+    if metrics_relpath:
+        candidates.append(Path(attempt_dir).expanduser() / metrics_relpath)
+    candidates.extend(
+        [
+            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.metrics.json",
+            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.jsonl.metrics.json",
+        ]
+    )
     for path in candidates:
         if path.is_file():
             return path
-    raise FileNotFoundError(f"missing metrics summary for {stem} under {run_dir}")
+    raise FileNotFoundError(f"missing metrics summary for inference_{subset} under {attempt_dir}")
 
 
 def _merge_reasons(*reason_groups: Any) -> list[str]:
@@ -142,13 +152,13 @@ def _contract_or_default(train_metrics: dict[str, Any], test_metrics: dict[str, 
 
 def load_run_bundle(run_dir: Path) -> dict[str, Any]:
     run_dir = Path(run_dir).expanduser()
-    metrics_path = run_dir / "metrics.json"
-    if not metrics_path.is_file():
-        raise FileNotFoundError(f"missing metrics.json under {run_dir}")
+    attempt_dir = resolve_attempt_dir(run_dir, prefer_published=True)
+    attempt_manifest = load_attempt_manifest(attempt_dir)
+    metrics_path = resolve_published_metrics(attempt_dir)
     train_metrics = _load_json(metrics_path)
-    val_metrics = _load_json(_resolve_inference_metrics_path(run_dir, "inference_val"))
-    test_metrics = _load_json(_resolve_inference_metrics_path(run_dir, "inference_test"))
-    seed = int(train_metrics.get("meta", {}).get("args", {}).get("seed", 0))
+    val_metrics = _load_json(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "val"))
+    test_metrics = _load_json(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "test"))
+    seed = int(attempt_manifest.get("seed", train_metrics.get("meta", {}).get("args", {}).get("seed", 0)))
     best = train_metrics.get("best", {})
     stop = train_metrics.get("stop", {})
     validity = train_metrics.get("validity", {})
@@ -163,6 +173,8 @@ def load_run_bundle(run_dir: Path) -> dict[str, Any]:
     )
     return {
         "run_dir": str(run_dir),
+        "attempt_dir": str(attempt_dir),
+        "attempt_status": str(attempt_manifest.get("status", "") or ""),
         "seed": int(seed),
         "selected_epoch": int(best.get("epoch", 0) or 0),
         "selected_val_f1": float(best.get("best_f1", 0.0) or 0.0),
@@ -180,27 +192,29 @@ def load_run_bundle(run_dir: Path) -> dict[str, Any]:
         "val_macro_f1_reported": float(val_metrics.get("macro_f1_on_ok", 0.0) or 0.0),
         "val_accuracy_reported": float(val_metrics.get("accuracy_on_ok", 0.0) or 0.0),
         "train_metrics_path": str(metrics_path),
-        "val_metrics_path": str(_resolve_inference_metrics_path(run_dir, "inference_val")),
-        "test_metrics_path": str(_resolve_inference_metrics_path(run_dir, "inference_test")),
+        "val_metrics_path": str(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "val")),
+        "test_metrics_path": str(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "test")),
         "val_checkpoint": str(val_metrics.get("checkpoint", "") or ""),
         "test_checkpoint": str(test_metrics.get("checkpoint", "") or ""),
         "paper_grade_eligible": bool(train_paper.get("eligible", False))
         and bool(val_paper.get("eligible", False))
         and bool(test_paper.get("eligible", False)),
         "paper_grade_reasons": reasons,
-        "run_status": str(train_metrics.get("run_status", "") or ""),
+        "run_status": str(attempt_manifest.get("run_status", train_metrics.get("run_status", "")) or ""),
         "contract": contract,
     }
 
 
 def _validate_run_bundle(run: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
+    if str(run.get("attempt_status", "") or "") != "completed":
+        reasons.append("attempt_not_completed")
     if not bool(run.get("paper_grade_eligible", False)):
         reasons.append("paper_grade_ineligible")
-    if Path(str(run.get("val_checkpoint", ""))).name != "best.pt":
-        reasons.append("val_checkpoint_not_best")
-    if Path(str(run.get("test_checkpoint", ""))).name != "best.pt":
-        reasons.append("test_checkpoint_not_best")
+    if Path(str(run.get("val_checkpoint", ""))).name != "checkpoint.pt":
+        reasons.append("val_checkpoint_not_published_bundle")
+    if Path(str(run.get("test_checkpoint", ""))).name != "checkpoint.pt":
+        reasons.append("test_checkpoint_not_published_bundle")
     for key in ("selected_val_f1", "selected_val_acc", "selected_val_loss", "test_macro_f1", "test_accuracy"):
         value = float(run.get(key, 0.0) or 0.0)
         if not math.isfinite(value):
