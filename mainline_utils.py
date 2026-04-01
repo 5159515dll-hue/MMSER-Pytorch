@@ -382,114 +382,120 @@ def save_metrics_and_plots(out_dir: Path, metrics: dict[str, Any]) -> None:
         return
 
     label_names = list(metrics.get("meta", {}).get("label_names", []))
-
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(epochs, metrics.get("train_acc", []), label="train")
-    plt.plot(epochs, metrics.get("val_acc", []), label="val")
-    plt.xlabel("epoch")
-    plt.ylabel("accuracy")
-    plt.title("Accuracy vs Epoch")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "accuracy_curve.png", dpi=160)
-    plt.close()
-
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(epochs, metrics.get("train_loss", []), label="train")
-    plt.plot(epochs, metrics.get("val_loss", []), label="val")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.title("Loss vs Epoch")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "loss_curve.png", dpi=160)
-    plt.close()
-
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(epochs, metrics.get("train_f1", []), label="train")
-    plt.plot(epochs, metrics.get("val_f1", []), label="val")
-    plt.xlabel("epoch")
-    plt.ylabel("macro_f1")
-    plt.title("Macro-F1 vs Epoch")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "macro_f1_curve.png", dpi=160)
-    plt.close()
-
-    lr_history = metrics.get("lr", [])
-    if lr_history:
+    try:
         plt.figure(figsize=(8, 4.5))
-        plt.plot(epochs[: len(lr_history)], lr_history, label="lr")
+        plt.plot(epochs, metrics.get("train_acc", []), label="train")
+        plt.plot(epochs, metrics.get("val_acc", []), label="val")
         plt.xlabel("epoch")
-        plt.ylabel("learning_rate")
-        plt.title("Learning Rate vs Epoch")
+        plt.ylabel("accuracy")
+        plt.title("Accuracy vs Epoch")
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        plt.savefig(out_dir / "lr_curve.png", dpi=160)
+        plt.savefig(out_dir / "accuracy_curve.png", dpi=160)
         plt.close()
 
-    train_recall_history = metrics.get("train_per_class_recall", [])
-    val_recall_history = metrics.get("val_per_class_recall", [])
-    if train_recall_history or val_recall_history:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-        for ax, recall_history, title in (
-            (axes[0], train_recall_history, "Train Per-Class Recall"),
-            (axes[1], val_recall_history, "Val Per-Class Recall"),
-        ):
-            if not recall_history:
-                ax.set_title(f"{title} (empty)")
-                ax.grid(True, alpha=0.3)
-                continue
-            for label_name in label_names:
-                values = [float(step.get(label_name, 0.0)) for step in recall_history]
-                ax.plot(epochs[: len(values)], values, label=label_name)
-            ax.set_ylabel("recall")
-            ax.set_title(title)
-            ax.set_ylim(0.0, 1.05)
-            ax.grid(True, alpha=0.3)
-        axes[-1].set_xlabel("epoch")
-        handles, labels = axes[0].get_legend_handles_labels()
-        if handles:
-            fig.legend(handles, labels, loc="upper center", ncol=min(4, max(1, len(labels))), frameon=False)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        fig.savefig(out_dir / "per_class_recall_curve.png", dpi=160)
-        plt.close(fig)
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(epochs, metrics.get("train_loss", []), label="train")
+        plt.plot(epochs, metrics.get("val_loss", []), label="val")
+        plt.xlabel("epoch")
+        plt.ylabel("loss")
+        plt.title("Loss vs Epoch")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "loss_curve.png", dpi=160)
+        plt.close()
 
-    best_val_summary = metrics.get("best", {}).get("best_val_summary", {})
-    matrix = best_val_summary.get("confusion_matrix", [])
-    if not isinstance(matrix, list) or not matrix:
-        return
-    plt.figure(figsize=(8.5, 7))
-    ax = plt.gca()
-    im = ax.imshow(matrix, cmap="Blues")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_title("Best Val Confusion Matrix")
-    ax.set_xlabel("pred")
-    ax.set_ylabel("true")
-    ax.set_xticks(range(len(label_names)))
-    ax.set_yticks(range(len(label_names)))
-    ax.set_xticklabels(label_names, rotation=45, ha="right")
-    ax.set_yticklabels(label_names)
-    vmax = max((max(row) for row in matrix if row), default=0)
-    threshold = vmax / 2.0 if vmax > 0 else 0.0
-    for i, row in enumerate(matrix):
-        for j, value in enumerate(row):
-            ax.text(
-                j,
-                i,
-                str(int(value)),
-                ha="center",
-                va="center",
-                color="white" if float(value) > threshold else "black",
-                fontsize=8,
-            )
-    plt.tight_layout()
-    plt.savefig(out_dir / "confusion_matrix_best_val.png", dpi=160)
-    plt.close()
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(epochs, metrics.get("train_f1", []), label="train")
+        plt.plot(epochs, metrics.get("val_f1", []), label="val")
+        plt.xlabel("epoch")
+        plt.ylabel("macro_f1")
+        plt.title("Macro-F1 vs Epoch")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "macro_f1_curve.png", dpi=160)
+        plt.close()
+
+        lr_history = metrics.get("lr", [])
+        if lr_history:
+            plt.figure(figsize=(8, 4.5))
+            plt.plot(epochs[: len(lr_history)], lr_history, label="lr")
+            plt.xlabel("epoch")
+            plt.ylabel("learning_rate")
+            plt.title("Learning Rate vs Epoch")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_dir / "lr_curve.png", dpi=160)
+            plt.close()
+
+        train_recall_history = metrics.get("train_per_class_recall", [])
+        val_recall_history = metrics.get("val_per_class_recall", [])
+        if train_recall_history or val_recall_history:
+            fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            for ax, recall_history, title in (
+                (axes[0], train_recall_history, "Train Per-Class Recall"),
+                (axes[1], val_recall_history, "Val Per-Class Recall"),
+            ):
+                if not recall_history:
+                    ax.set_title(f"{title} (empty)")
+                    ax.grid(True, alpha=0.3)
+                    continue
+                for label_name in label_names:
+                    values = [float(step.get(label_name, 0.0)) for step in recall_history]
+                    ax.plot(epochs[: len(values)], values, label=label_name)
+                ax.set_ylabel("recall")
+                ax.set_title(title)
+                ax.set_ylim(0.0, 1.05)
+                ax.grid(True, alpha=0.3)
+            axes[-1].set_xlabel("epoch")
+            handles, labels = axes[0].get_legend_handles_labels()
+            if handles:
+                fig.legend(handles, labels, loc="upper center", ncol=min(4, max(1, len(labels))), frameon=False)
+            fig.tight_layout(rect=(0, 0, 1, 0.95))
+            fig.savefig(out_dir / "per_class_recall_curve.png", dpi=160)
+            plt.close(fig)
+
+        best_val_summary = metrics.get("best", {}).get("best_val_summary", {})
+        matrix = best_val_summary.get("confusion_matrix", [])
+        if not isinstance(matrix, list) or not matrix:
+            return
+        plt.figure(figsize=(8.5, 7))
+        ax = plt.gca()
+        im = ax.imshow(matrix, cmap="Blues")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title("Best Val Confusion Matrix")
+        ax.set_xlabel("pred")
+        ax.set_ylabel("true")
+        ax.set_xticks(range(len(label_names)))
+        ax.set_yticks(range(len(label_names)))
+        ax.set_xticklabels(label_names, rotation=45, ha="right")
+        ax.set_yticklabels(label_names)
+        vmax = max((max(row) for row in matrix if row), default=0)
+        threshold = vmax / 2.0 if vmax > 0 else 0.0
+        for i, row in enumerate(matrix):
+            for j, value in enumerate(row):
+                ax.text(
+                    j,
+                    i,
+                    str(int(value)),
+                    ha="center",
+                    va="center",
+                    color="white" if float(value) > threshold else "black",
+                    fontsize=8,
+                )
+        plt.tight_layout()
+        plt.savefig(out_dir / "confusion_matrix_best_val.png", dpi=160)
+        plt.close()
+    except Exception as e:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        print(f"Plot skipped (plot generation failed): {type(e).__name__}: {e}", flush=True)
 
 
 def write_results_summary(out_dir: Path, metrics: dict[str, Any]) -> None:
