@@ -36,8 +36,18 @@
 
 当前推荐默认使用服务器全局 Python 环境，不再额外创建 `.venv-server` 或 conda 环境。`setup_ubuntu_server.sh` 会在全局环境上补装缺失依赖，并把模型缓存固定到仓库本地目录。
 
+如果你的仓库代码放在 `/root/autodl-fs/MMSER-Pytorch`，但希望所有实验产物都写到 `/root/autodl-tmp/output`，从这里开始就要统一显式传路径，不再依赖任何默认 `outputs/...` 目录。
+下文所有命令默认共享下面这组变量：
+
 ```bash
-cd /root/private_data/MMSER-Pytorch
+export PROJECT_ROOT=/root/autodl-fs/MMSER-Pytorch
+export OUTPUT_ROOT=/root/autodl-tmp/output
+export MELD_OUT=${OUTPUT_ROOT}/benchmarks/meld
+export AUDIO_CACHE_ROOT=${OUTPUT_ROOT}/datasets/meld/audio_cache
+
+mkdir -p "${MELD_OUT}/splits" "${MELD_OUT}/input_cache" "${MELD_OUT}/reports" "${AUDIO_CACHE_ROOT}"
+
+cd "${PROJECT_ROOT}"
 git pull
 
 export HF_ENDPOINT=https://hf-mirror.com
@@ -56,27 +66,30 @@ python3 build_split_manifest.py \
   --dataset-kind meld \
   --data-root ../MELD.Raw \
   --metadata-root ../MELD.metadata \
-  --audio-cache-root outputs/datasets/meld/audio_cache \
-  --output outputs/benchmarks/meld/splits/default_manifest.json
+  --audio-cache-root "${AUDIO_CACHE_ROOT}" \
+  --output "${MELD_OUT}/splits/default_manifest.json"
 
 python3 prepare_dataset_media.py \
   --dataset-kind meld \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.json \
+  --split-manifest "${MELD_OUT}/splits/default_manifest.json" \
   --subset all \
   --num-workers auto
 
-python3 filter_meld_manifest.py
+python3 filter_meld_manifest.py \
+  --input "${MELD_OUT}/splits/default_manifest.json" \
+  --output "${MELD_OUT}/splits/default_manifest.filtered.json"
 python3 download.py
 ```
 
 经过这一步后，正式实验统一使用：
 
-- `outputs/benchmarks/meld/splits/default_manifest.filtered.json`
+- `${MELD_OUT}/splits/default_manifest.filtered.json`
 
 说明：
 
 - 当前手册默认使用全局环境模式：`USE_GLOBAL_ENV=1`。只有在你明确想隔离依赖、并且服务器本身没有环境兼容问题时，才考虑脚本里的 conda 路线。
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
+- 如果你希望音频 sidecar 也写到 `/root/autodl-tmp/output`，必须像上面这样重新生成 manifest，并把 `--audio-cache-root` 显式指向 `${AUDIO_CACHE_ROOT}`。不要复用旧 manifest，否则它会继续把 `audio_path` 指向仓库目录下的旧 `outputs/...`。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
 - `filter_meld_manifest.py` 只做本地 manifest 过滤，不会下载任何模型或远程资源。
 - `download.py` 默认把 Hugging Face 模型快照下载到仓库本地的 `.hf-cache/hub/`。同一台机器第二次运行时，会先校验本地缓存的 `config`、`tokenizer` 和 `safetensors` 头是否完整；只有校验通过才直接复用，否则会重新下载损坏或不完整的快照。
@@ -114,9 +127,9 @@ export TRANSFORMERS_OFFLINE=1
 
 建议固定使用下面三套缓存目录：
 
-- 实验一：`outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1`
-- 实验二/三：`outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1`
-- 实验四：`outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1`
+- 实验一：`${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1`
+- 实验二/三：`${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1`
+- 实验四：`${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1`
 
 CPU 服务器构建命令：
 
@@ -124,8 +137,8 @@ CPU 服务器构建命令：
 
 ```bash
 python3 build_mainline_input_cache.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded \
+  --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+  --output-dir "${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1_sharded" \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
@@ -136,8 +149,8 @@ python3 build_mainline_input_cache.py \
   --num-workers auto
 
 python3 build_mainline_input_cache.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded \
+  --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+  --output-dir "${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded" \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
@@ -151,8 +164,8 @@ python3 build_mainline_input_cache.py \
   --num-workers auto
 
 python3 build_mainline_input_cache.py \
-  --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-  --output-dir outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded \
+  --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+  --output-dir "${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded" \
   --subset all \
   --sample-rate 16000 \
   --max-audio-sec 6 \
@@ -186,9 +199,9 @@ GPU 服务器上只需要把目录拷过来，后续训练/推理命令统一附
 
 ```bash
 python3 shard_input_cache.py \
-  outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1 \
-  outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1 \
-  outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1 \
+  "${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1" \
+  "${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1" \
+  "${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1" \
   --samples-per-shard 512 \
   --overwrite
 ```
@@ -201,9 +214,9 @@ python3 shard_input_cache.py \
 
 转换完成后，本文下方四组实验的训练/推理命令默认统一使用下面这些 shard 路径：
 
-- 实验一：`outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded`
-- 实验二/三：`outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded`
-- 实验四：`outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded`
+- 实验一：`${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1_sharded`
+- 实验二/三：`${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded`
+- 实验四：`${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded`
 
 补充说明：
 
@@ -255,7 +268,7 @@ python3 shard_input_cache.py \
 - `python3 validate_cached_shards.py ...`
 - `python3 train.py --feature-cache ...`
 - `python3 batch_inference.py --feature-cache ...`
-- 任何依赖 `outputs/benchmarks/meld/feature_cache_*` 的训练或推理命令
+- 任何依赖 `${MELD_OUT}/feature_cache_*` 的训练或推理命令
 
 原因很简单：
 
@@ -340,15 +353,15 @@ python3 shard_input_cache.py \
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
-  rm -rf outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed}
+  rm -rf "${MELD_OUT}/run_gpu_practical_no_video_seed${seed}"
 
   python3 train.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
     --input-cache ${INPUT_CACHE} \
-    --output-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
+    --output-dir "${MELD_OUT}/run_gpu_practical_no_video_seed${seed}" \
     --epochs 100 \
     --device auto \
     --amp-mode bf16 \
@@ -391,12 +404,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_practical_no_video_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset val \
     --device auto \
@@ -416,12 +429,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_practical_no_video_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_practical_no_video_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset test \
     --device auto \
@@ -441,11 +454,11 @@ done
 
 ```bash
 python3 aggregate_multi_seed_results.py \
-  --group practical=outputs/benchmarks/meld/run_gpu_practical_no_video_seed* \
-  --output-dir outputs/benchmarks/meld/reports/practical_5seed
+  --group practical=${MELD_OUT}/run_gpu_practical_no_video_seed* \
+  --output-dir "${MELD_OUT}/reports/practical_5seed"
 
-python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/multi_seed_summary.json
-python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_significance.json
+python3 -m json.tool "${MELD_OUT}/reports/practical_5seed/multi_seed_summary.json"
+python3 -m json.tool "${MELD_OUT}/reports/practical_5seed/pairwise_significance.json"
 ```
 
 重点看：
@@ -516,15 +529,15 @@ python3 -m json.tool outputs/benchmarks/meld/reports/practical_5seed/pairwise_si
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
-  rm -rf outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed}
+  rm -rf "${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed${seed}"
 
   python3 train.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
     --input-cache ${INPUT_CACHE} \
-    --output-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
+    --output-dir "${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed${seed}" \
     --epochs 100 \
     --device auto \
     --amp-mode bf16 \
@@ -562,12 +575,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset val \
     --device auto \
@@ -587,12 +600,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset test \
     --device auto \
@@ -612,10 +625,10 @@ done
 
 ```bash
 python3 aggregate_multi_seed_results.py \
-  --group tri_frozen=outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed* \
-  --output-dir outputs/benchmarks/meld/reports/tri_frozen_5seed
+  --group tri_frozen=${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed* \
+  --output-dir "${MELD_OUT}/reports/tri_frozen_5seed"
 
-python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed_summary.json
+python3 -m json.tool "${MELD_OUT}/reports/tri_frozen_5seed/multi_seed_summary.json"
 ```
 
 重点看：
@@ -683,15 +696,15 @@ python3 -m json.tool outputs/benchmarks/meld/reports/tri_frozen_5seed/multi_seed
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
-  rm -rf outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed}
+  rm -rf "${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed${seed}"
 
   python3 train.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
     --input-cache ${INPUT_CACHE} \
-    --output-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
+    --output-dir "${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed${seed}" \
     --epochs 100 \
     --device auto \
     --amp-mode bf16 \
@@ -726,12 +739,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset val \
     --device auto \
@@ -751,12 +764,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb16_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset test \
     --device auto \
@@ -776,10 +789,10 @@ done
 
 ```bash
 python3 aggregate_multi_seed_results.py \
-  --group upper_rgb=outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed* \
-  --output-dir outputs/benchmarks/meld/reports/upper_rgb_5seed
+  --group upper_rgb=${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed* \
+  --output-dir "${MELD_OUT}/reports/upper_rgb_5seed"
 
-python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_summary.json
+python3 -m json.tool "${MELD_OUT}/reports/upper_rgb_5seed/multi_seed_summary.json"
 ```
 
 重点看：
@@ -848,15 +861,15 @@ python3 -m json.tool outputs/benchmarks/meld/reports/upper_rgb_5seed/multi_seed_
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
-  rm -rf outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed}
+  rm -rf "${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed${seed}"
 
   python3 train.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
     --input-cache ${INPUT_CACHE} \
-    --output-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
+    --output-dir "${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed${seed}" \
     --epochs 100 \
     --device auto \
     --amp-mode bf16 \
@@ -893,12 +906,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset val \
     --device auto \
@@ -918,12 +931,12 @@ done
 
 ```bash
 SEEDS="13 17 23 42 3407"
-INPUT_CACHE=outputs/benchmarks/meld/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
+INPUT_CACHE=${MELD_OUT}/input_cache/rgb32_audio_text_sr16000_len6_v1_sharded
 
 for seed in $SEEDS; do
   python3 batch_inference.py \
-    --split-manifest outputs/benchmarks/meld/splits/default_manifest.filtered.json \
-    --run-dir outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed${seed} \
+    --split-manifest "${MELD_OUT}/splits/default_manifest.filtered.json" \
+    --run-dir "${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed${seed}" \
     --input-cache ${INPUT_CACHE} \
     --subset test \
     --device auto \
@@ -943,10 +956,10 @@ done
 
 ```bash
 python3 aggregate_multi_seed_results.py \
-  --group dual_upper=outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed* \
-  --output-dir outputs/benchmarks/meld/reports/dual_upper_5seed
+  --group dual_upper=${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed* \
+  --output-dir "${MELD_OUT}/reports/dual_upper_5seed"
 
-python3 -m json.tool outputs/benchmarks/meld/reports/dual_upper_5seed/multi_seed_summary.json
+python3 -m json.tool "${MELD_OUT}/reports/dual_upper_5seed/multi_seed_summary.json"
 ```
 
 重点看：
@@ -987,14 +1000,14 @@ python3 -m json.tool outputs/benchmarks/meld/reports/dual_upper_5seed/multi_seed
 
 ```bash
 python3 aggregate_multi_seed_results.py \
-  --group practical=outputs/benchmarks/meld/run_gpu_practical_no_video_seed* \
-  --group tri_frozen=outputs/benchmarks/meld/run_gpu_tri_rgb_audio_text_frozen_seed* \
-  --group upper_rgb=outputs/benchmarks/meld/run_gpu_upper_rgb_audio_text_seed* \
-  --group dual_upper=outputs/benchmarks/meld/run_gpu_upper_dual_torch_motion_seed* \
-  --output-dir outputs/benchmarks/meld/reports/full_comparison_5seed
+  --group practical=${MELD_OUT}/run_gpu_practical_no_video_seed* \
+  --group tri_frozen=${MELD_OUT}/run_gpu_tri_rgb_audio_text_frozen_seed* \
+  --group upper_rgb=${MELD_OUT}/run_gpu_upper_rgb_audio_text_seed* \
+  --group dual_upper=${MELD_OUT}/run_gpu_upper_dual_torch_motion_seed* \
+  --output-dir "${MELD_OUT}/reports/full_comparison_5seed"
 
-python3 -m json.tool outputs/benchmarks/meld/reports/full_comparison_5seed/multi_seed_summary.json
-python3 -m json.tool outputs/benchmarks/meld/reports/full_comparison_5seed/pairwise_significance.json
+python3 -m json.tool "${MELD_OUT}/reports/full_comparison_5seed/multi_seed_summary.json"
+python3 -m json.tool "${MELD_OUT}/reports/full_comparison_5seed/pairwise_significance.json"
 ```
 
 正式对外报告时，优先使用：
