@@ -828,7 +828,7 @@ def main() -> None:
     paper_grade_reasons = list(compatibility_reasons)
     if bool(args.allow_incompatible_checkpoint):
         paper_grade_reasons.append("allow_incompatible_checkpoint_enabled")
-    if ckpt_path.name != "best.pt":
+    if attempt_dir is None and ckpt_path.name != "best.pt":
         paper_grade_reasons.append("checkpoint_name_mismatch")
     # `flow_encoder_variant` 是这条主线里很关键的结构语义字段，
     # 目的是防止不同版本的 flow 分支 checkpoint 被静默混评。
