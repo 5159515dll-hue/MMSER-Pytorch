@@ -363,8 +363,16 @@ def _checkpoint_run_contract(
     if isinstance(contract, dict) and contract:
         normalized = dict(contract)
         normalized.setdefault("flow_encoder_variant", LEGACY_FLOW_VIDEO_ENCODER_VARIANT)
+        normalized.setdefault("text_model", str(ckpt_args.get("text_model", "") or "xlm-roberta-large"))
+        normalized_max_text_len = int(normalized.get("max_text_len", ckpt_args.get("max_text_len", 128)) or 128)
+        if normalized_max_text_len <= 0:
+            normalized_max_text_len = 128
+        normalized["max_text_len"] = int(normalized_max_text_len)
         return normalized
     split_manifest_raw = ckpt.get("split_manifest", "")
+    fallback_max_text_len = int(ckpt_args.get("max_text_len", 128) or 128)
+    if fallback_max_text_len <= 0:
+        fallback_max_text_len = 128
     return build_run_contract(
         split_manifest=Path(str(split_manifest_raw or ".")),
         manifest_sha256=str(ckpt.get("manifest_sha256", "") or ""),
@@ -381,6 +389,8 @@ def _checkpoint_run_contract(
         use_intensity=bool(ckpt_args.get("use_intensity", False)),
         video_backbone=str(ckpt_args.get("video_backbone", "dual") or "dual"),
         flow_encoder_variant=LEGACY_FLOW_VIDEO_ENCODER_VARIANT,
+        text_model=str(ckpt_args.get("text_model", "") or "xlm-roberta-large"),
+        max_text_len=int(fallback_max_text_len),
         sample_rate=int(ckpt_args.get("sample_rate", 24000) or 24000),
         max_audio_sec=float(ckpt_args.get("max_audio_sec", 6.0) or 6.0),
         num_frames=int(ckpt_args.get("num_frames", 64) or 64),
@@ -440,7 +450,6 @@ def _load_model(
     str,
     str | None,
     str,
-    int,
     dict[str, Any] | None,
     dict[str, Any],
     dict[str, Any],
@@ -479,15 +488,6 @@ def _load_model(
     task_mode = str(ckpt_args.get("task_mode", "") or "confounded_7way")
     task_speaker_id = _normalize_optional_upper(ckpt_args.get("speaker_id", ""))
     text_policy = str(ckpt_args.get("text_policy", "") or "full")
-    checkpoint_max_text_len = int(ckpt_args.get("max_text_len", 0) or 0)
-
-    _raise_or_record_mismatch(
-        field="text_model",
-        expected=text_model,
-        actual=_normalize_optional_text(args.text_model) or text_model,
-        reasons=compatibility_reasons,
-        allow_mismatch=bool(args.allow_incompatible_checkpoint),
-    )
     _raise_or_record_mismatch(
         field="audio_model",
         expected=audio_model,
@@ -533,8 +533,6 @@ def _load_model(
 
     # 只有在用户显式传入覆盖参数时，才尝试替换本地变量；
     # 替换前已经由 `_raise_or_record_mismatch()` 做过硬校验或降级记录。
-    if _normalize_optional_text(args.text_model):
-        text_model = _normalize_optional_text(args.text_model)
     if _normalize_optional_text(args.audio_model):
         audio_model = _normalize_optional_text(args.audio_model)
     if _normalize_optional_text(args.audio_model_revision):
@@ -560,6 +558,15 @@ def _load_model(
         label_names=label_names,
         validity=validity,
     )
+    contract_text_model = str(checkpoint_contract.get("text_model", text_model) or text_model)
+    _raise_or_record_mismatch(
+        field="text_model",
+        expected=contract_text_model,
+        actual=_normalize_optional_text(args.text_model) or contract_text_model,
+        reasons=compatibility_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    text_model = _normalize_optional_text(args.text_model) or contract_text_model
     checkpoint_paper_grade = ckpt.get("paper_grade", {}) if isinstance(ckpt, dict) and isinstance(ckpt.get("paper_grade"), dict) else {}
     if not isinstance(checkpoint_paper_grade, dict) or not checkpoint_paper_grade:
         checkpoint_paper_grade = build_paper_grade(
@@ -627,7 +634,6 @@ def _load_model(
         task_mode,
         task_speaker_id,
         text_policy,
-        int(checkpoint_max_text_len),
         validity,
         checkpoint_contract,
         checkpoint_paper_grade,
@@ -785,7 +791,6 @@ def main() -> None:
         task_mode,
         task_speaker_id,
         text_policy,
-        checkpoint_max_text_len,
         validity,
         checkpoint_contract,
         checkpoint_paper_grade,
@@ -797,11 +802,14 @@ def main() -> None:
         device=device,
         args=args,
     )
+    contract_text_model = str(checkpoint_contract.get("text_model", str(model.text.model_name)) or str(model.text.model_name))
+    contract_max_text_len = int(checkpoint_contract.get("max_text_len", 128) or 128)
+    if contract_max_text_len <= 0:
+        contract_max_text_len = 128
+    resolved_text_model = _normalize_optional_text(args.text_model) or contract_text_model
     resolved_text_max_len = int(args.text_max_len)
     if resolved_text_max_len <= 0:
-        resolved_text_max_len = int(checkpoint_max_text_len)
-    if resolved_text_max_len <= 0:
-        resolved_text_max_len = 128
+        resolved_text_max_len = int(contract_max_text_len)
     # 后续所有“为什么这次评测不再算 paper-grade”的原因都汇总到这里。
     paper_grade_reasons = list(compatibility_reasons)
     if bool(args.allow_incompatible_checkpoint):
@@ -848,6 +856,13 @@ def main() -> None:
         field="num_frames",
         expected=int(checkpoint_contract.get("num_frames", args.num_frames)),
         actual=int(args.num_frames),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="max_text_len",
+        expected=int(contract_max_text_len),
+        actual=int(resolved_text_max_len),
         reasons=paper_grade_reasons,
         allow_mismatch=bool(args.allow_incompatible_checkpoint),
     )
@@ -969,7 +984,7 @@ def main() -> None:
             max_audio_sec=float(args.max_audio_sec),
             num_frames=int(args.num_frames),
             rgb_size=int(args.rgb_size),
-            text_model=str(args.text_model).strip() or str(model.text.model_name),
+            text_model=str(resolved_text_model),
             max_text_len=int(resolved_text_max_len),
             need_audio=bool(need_audio),
             need_video=bool(need_video),
@@ -1001,7 +1016,7 @@ def main() -> None:
     if not bool(args.zero_text) and input_cache_contract is None:
         # 推理文本 token 同样会先缓存到 manifest item 中，
         # 避免每个 batch 反复调用 tokenizer。
-        tokenizer = _load_tokenizer(str(args.text_model).strip() or str(model.text.model_name))
+        tokenizer = _load_tokenizer(str(resolved_text_model))
         cache_manifest_text_tokens(ds.items, tokenizer, max_text_len=int(resolved_text_max_len), text_policy=str(text_policy))
 
     resolved_batch_size = resolve_batch_size(
