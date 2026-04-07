@@ -9,6 +9,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from audio_aug import normalize_wav
 from predecode_motion_audio import load_audio
@@ -287,20 +288,22 @@ class GpuStreamPreprocessor:
             elif "video_frames" in item and isinstance(item["video_frames"], torch.Tensor):
                 frames = item["video_frames"].to(self.cfg.device)
                 self._bump_counter(self._video_backend_counts, str(item.get("_video_backend", "prefetched")))
+                rgb = self._prepare_rgb(frames)
                 if need_rgb:
-                    sample["rgb"] = self._prepare_rgb(frames)
+                    sample["rgb"] = rgb
                 if need_flow:
-                    sample["flow"] = self._prepare_motion(frames)
+                    sample["flow"] = self._prepare_motion_from_rgb(rgb)
             else:
                 video_path = Path(str(item.get("video_path", ""))).expanduser()
                 if not video_path.exists():
                     raise FileNotFoundError(f"Manifest video_path not found: {video_path}")
                 frames = self._read_video_frames(video_path)
                 self._bump_counter(self._video_backend_counts, str(self.cfg.video_decode_backend))
+                rgb = self._prepare_rgb(frames)
                 if need_rgb:
-                    sample["rgb"] = self._prepare_rgb(frames)
+                    sample["rgb"] = rgb
                 if need_flow:
-                    sample["flow"] = self._prepare_motion(frames)
+                    sample["flow"] = self._prepare_motion_from_rgb(rgb)
         return sample
 
     def prepare_batch(
@@ -368,10 +371,7 @@ class GpuStreamPreprocessor:
         else:
             audios = [sample["audio"] for sample in processed]
             lens_cpu = torch.tensor([audio.numel() for audio in audios], dtype=torch.long)
-            max_len = int(lens_cpu.max().item())
-            padded_cpu = torch.zeros((len(audios), max_len), dtype=torch.float32)
-            for idx, audio in enumerate(audios):
-                padded_cpu[idx, : audio.numel()] = audio
+            padded_cpu = pad_sequence(audios, batch_first=True, padding_value=0.0)
             # 先统一 padding，再归一化 RMS，最后提 prosody，确保 batch 内口径一致。
             padded = normalize_wav(padded_cpu.to(self.cfg.device), target_rms=0.1)
             lens = lens_cpu.to(self.cfg.device)

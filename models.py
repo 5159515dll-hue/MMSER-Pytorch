@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+import inspect
 from typing import Callable, Optional
 
 import torch
@@ -47,6 +49,19 @@ def _disable_hf_audio_spec_augment(model: nn.Module) -> None:
         config.mask_time_prob = 0.0
     if hasattr(config, "mask_feature_prob"):
         config.mask_feature_prob = 0.0
+
+
+def _module_supports_lengths_arg(module: nn.Module) -> bool:
+    """判断模块 `forward()` 是否显式支持 `lengths=` 参数。"""
+
+    try:
+        signature = inspect.signature(module.forward)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters.values()
+    if "lengths" in signature.parameters:
+        return True
+    return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters)
 
 
 class FlowVideoEncoder(nn.Module):
@@ -615,6 +630,7 @@ class FusionClassifier(nn.Module):
                 use_safetensors=True,
                 progress_callback=progress_callback,
             )
+        self._audio_supports_lengths = _module_supports_lengths_arg(self.audio)
         self.prosody = ProsodyMLP(in_dim=10, out_dim=prosody_dim)
         self.text = MbertTextEncoder(
             model_name=text_model,
@@ -662,7 +678,6 @@ class FusionClassifier(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.Linear(hidden, text_dim),
-                nn.Sigmoid(),
             )
             fusion_in_dim = text_dim
         else:
@@ -727,6 +742,89 @@ class FusionClassifier(nn.Module):
         keep = (torch.rand((x.shape[0], 1), device=x.device) > p).to(x.dtype)
         return x * keep
 
+    @staticmethod
+    def _maybe_no_grad(enabled: bool) -> torch.no_grad | nullcontext:
+        """冻结分支在前向时显式关闭梯度，减少热路径开销。"""
+
+        return torch.no_grad() if enabled else nullcontext()
+
+    def _encode_video(self, flow: Optional[torch.Tensor], rgb: Optional[torch.Tensor]) -> torch.Tensor:
+        """根据主线 `video_backbone` 配置编码视频分支。"""
+
+        if self.video_backbone == "videomae":
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video is None:
+                raise RuntimeError("video_encoder_missing")
+            with self._maybe_no_grad(self._freeze_rgb):
+                return self.video(rgb)
+
+        if self.video_backbone == "dual":
+            if flow is None:
+                raise ValueError("flow_missing")
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video_flow is None:
+                raise RuntimeError("flow_encoder_missing")
+            if self.video_rgb is None:
+                raise RuntimeError("rgb_encoder_missing")
+            with self._maybe_no_grad(self._freeze_flow):
+                v_flow = self.video_flow(flow)
+            with self._maybe_no_grad(self._freeze_rgb):
+                v_rgb = self.video_rgb(rgb)
+            return torch.cat([v_flow, v_rgb], dim=1)
+
+        if flow is None:
+            raise ValueError("flow_missing")
+        if self.video is None:
+            raise RuntimeError("video_encoder_missing")
+        with self._maybe_no_grad(self._freeze_flow):
+            return self.video(flow)
+
+    def _encode_audio(self, wav: torch.Tensor, audio_lens: Optional[torch.Tensor]) -> torch.Tensor:
+        """编码音频，并只在支持时传入 `lengths=`。"""
+
+        kwargs = {"lengths": audio_lens} if audio_lens is not None and self._audio_supports_lengths else {}
+        with self._maybe_no_grad(self._freeze_audio):
+            return self.audio(wav, **kwargs)
+
+    def _encode_text(
+        self,
+        text_inputs: Optional[dict[str, torch.Tensor]],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """编码文本；无文本输入时返回与主线契约一致的零向量占位。"""
+
+        if text_inputs is None:
+            return torch.zeros((batch_size, int(self.text.out_dim)), device=device, dtype=dtype)
+        with self._maybe_no_grad(self._freeze_text):
+            return self.text(text_inputs).to(dtype=dtype)
+
+    def _fuse_modalities(
+        self,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        p: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """执行主线定义的多模态融合。"""
+
+        if self.fusion_mode != "gated_text":
+            return torch.cat([v, a, p, t], dim=1)
+
+        non_text = torch.cat([v, a, p], dim=1)
+        if self.delta_proj is None or self.gate_proj is None:
+            raise RuntimeError("gated_fusion_missing")
+        delta = self.delta_proj(non_text)
+        gate_logits = self.gate_proj(non_text)
+        if self.gate_temperature <= 0:
+            raise ValueError("gate_temperature_must_be_positive")
+        gate = torch.sigmoid(gate_logits / float(self.gate_temperature))
+        return t + (float(self.gate_scale) * gate) * (float(self.delta_scale) * delta)
+
     def forward(
         self,
         flow: Optional[torch.Tensor],
@@ -746,77 +844,17 @@ class FusionClassifier(nn.Module):
             text_inputs: tokenizer 输出字典；若为 None，则用零向量代替文本模态。
             return_intensity: 是否同时返回强度回归结果。
         """
-        if self.video_backbone == "videomae":
-            if rgb is None:
-                raise ValueError("rgb_missing")
-            if self.video is None:
-                raise RuntimeError("video_encoder_missing")
-            v = self.video(rgb)
-        elif self.video_backbone == "dual":
-            if flow is None:
-                raise ValueError("flow_missing")
-            if self.video_flow is None:
-                raise RuntimeError("flow_encoder_missing")
-            v_flow = self.video_flow(flow)
-            if rgb is None:
-                raise ValueError("rgb_missing")
-            if self.video_rgb is None:
-                raise RuntimeError("rgb_encoder_missing")
-            v_rgb = self.video_rgb(rgb)
-            v = torch.cat([v_flow, v_rgb], dim=1)
-        else:
-            if flow is None:
-                raise ValueError("flow_missing")
-            if self.video is None:
-                raise RuntimeError("video_encoder_missing")
-            v = self.video(flow)
-
-        if audio_lens is not None:
-            try:
-                a = self.audio(wav, lengths=audio_lens)
-            except TypeError:
-                a = self.audio(wav)
-        else:
-            a = self.audio(wav)
-        p = self.prosody(prosody)
+        v = self._encode_video(flow, rgb)
+        a = self._encode_audio(wav, audio_lens)
+        with self._maybe_no_grad(self._freeze_prosody):
+            p = self.prosody(prosody)
 
         # Modality dropout (non-text) for robustness
         v = self._maybe_drop_modality(v)
         a = self._maybe_drop_modality(a)
         p = self._maybe_drop_modality(p)
-
-        if text_inputs is None:
-            # 允许在无文本场景下运行：使用零向量作为文本模态占位。
-            t = torch.zeros(
-                (v.shape[0], int(self.text.out_dim)),
-                device=v.device,
-                dtype=v.dtype,
-            )
-        else:
-            # 让文本嵌入的 dtype 与其它模态对齐（例如 AMP/混合精度场景）。
-            t = self.text(text_inputs).to(dtype=v.dtype)
-
-        if self.fusion_mode == "gated_text":
-            non_text = torch.cat([v, a, p], dim=1)
-            if self.delta_proj is None or self.gate_proj is None:
-                raise RuntimeError("gated_fusion_missing")
-            delta = self.delta_proj(non_text)
-            gate_logits = self.gate_proj(non_text)
-            if self.gate_temperature <= 0:
-                raise ValueError("gate_temperature_must_be_positive")
-            # 门控位移融合的核心公式：
-            #   gate = sigmoid(gate_logits / T)
-            #   t'   = t + (gate_scale * gate) * (delta_scale * delta)
-            #
-            # 直觉上：
-            # - `delta` 决定“往哪个方向修正文本向量”；
-            # - `gate` 决定“修正多少”；
-            # - `temperature` 控制门的平滑/尖锐程度。
-            gate = torch.sigmoid(gate_logits / float(self.gate_temperature))
-            t = t + (float(self.gate_scale) * gate) * (float(self.delta_scale) * delta)
-            x = t
-        else:
-            x = torch.cat([v, a, p, t], dim=1)
+        t = self._encode_text(text_inputs, batch_size=v.shape[0], device=v.device, dtype=v.dtype)
+        x = self._fuse_modalities(v, a, p, t)
         logits = self.head(x)
         if not bool(return_intensity):
             return logits

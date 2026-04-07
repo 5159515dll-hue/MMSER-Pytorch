@@ -440,6 +440,7 @@ def _load_model(
     str,
     str | None,
     str,
+    int,
     dict[str, Any] | None,
     dict[str, Any],
     dict[str, Any],
@@ -478,6 +479,7 @@ def _load_model(
     task_mode = str(ckpt_args.get("task_mode", "") or "confounded_7way")
     task_speaker_id = _normalize_optional_upper(ckpt_args.get("speaker_id", ""))
     text_policy = str(ckpt_args.get("text_policy", "") or "full")
+    checkpoint_max_text_len = int(ckpt_args.get("max_text_len", 0) or 0)
 
     _raise_or_record_mismatch(
         field="text_model",
@@ -625,6 +627,7 @@ def _load_model(
         task_mode,
         task_speaker_id,
         text_policy,
+        int(checkpoint_max_text_len),
         validity,
         checkpoint_contract,
         checkpoint_paper_grade,
@@ -782,6 +785,7 @@ def main() -> None:
         task_mode,
         task_speaker_id,
         text_policy,
+        checkpoint_max_text_len,
         validity,
         checkpoint_contract,
         checkpoint_paper_grade,
@@ -793,6 +797,11 @@ def main() -> None:
         device=device,
         args=args,
     )
+    resolved_text_max_len = int(args.text_max_len)
+    if resolved_text_max_len <= 0:
+        resolved_text_max_len = int(checkpoint_max_text_len)
+    if resolved_text_max_len <= 0:
+        resolved_text_max_len = 128
     # 后续所有“为什么这次评测不再算 paper-grade”的原因都汇总到这里。
     paper_grade_reasons = list(compatibility_reasons)
     if bool(args.allow_incompatible_checkpoint):
@@ -961,7 +970,7 @@ def main() -> None:
             num_frames=int(args.num_frames),
             rgb_size=int(args.rgb_size),
             text_model=str(args.text_model).strip() or str(model.text.model_name),
-            max_text_len=128,
+            max_text_len=int(resolved_text_max_len),
             need_audio=bool(need_audio),
             need_video=bool(need_video),
             need_text=bool(need_text),
@@ -993,7 +1002,7 @@ def main() -> None:
         # 推理文本 token 同样会先缓存到 manifest item 中，
         # 避免每个 batch 反复调用 tokenizer。
         tokenizer = _load_tokenizer(str(args.text_model).strip() or str(model.text.model_name))
-        cache_manifest_text_tokens(ds.items, tokenizer, max_text_len=128, text_policy=str(text_policy))
+        cache_manifest_text_tokens(ds.items, tokenizer, max_text_len=int(resolved_text_max_len), text_policy=str(text_policy))
 
     resolved_batch_size = resolve_batch_size(
         args.batch_size,
@@ -1072,7 +1081,7 @@ def main() -> None:
                 preprocessor=preprocessor,
                 tokenizer=tokenizer,
                 text_policy=str(text_policy),
-                max_text_len=128,
+                max_text_len=int(resolved_text_max_len),
                 model=model,
                 use_intensity=bool(use_intensity),
                 amp_mode=resolved_amp_mode,
@@ -1104,7 +1113,7 @@ def main() -> None:
                                 preprocessor=preprocessor,
                                 tokenizer=tokenizer,
                                 text_policy=str(text_policy),
-                                max_text_len=128,
+                                max_text_len=int(resolved_text_max_len),
                                 model=model,
                                 use_intensity=bool(use_intensity),
                                 amp_mode=resolved_amp_mode,
@@ -1113,11 +1122,11 @@ def main() -> None:
                     except Exception as item_err:
                         error_count += 1
                         error_types[type(item_err).__name__] += 1
-                        records.append(_format_error_record(item, item_err, text_max_len=int(args.text_max_len)))
+                        records.append(_format_error_record(item, item_err, text_max_len=int(resolved_text_max_len)))
             else:
                 error_count += 1
                 error_types[type(batch_err).__name__] += 1
-                records.append(_format_error_record(batch_items[0], batch_err, text_max_len=int(args.text_max_len)))
+                records.append(_format_error_record(batch_items[0], batch_err, text_max_len=int(resolved_text_max_len)))
 
         if print_every > 0 and len(records) > 0 and (len(records) % print_every) == 0:
             ok_records = [rec for rec in records if rec.get("status") == "ok"]
@@ -1137,7 +1146,7 @@ def main() -> None:
                 )
                 print(line, flush=True)
                 if bool(args.print_text) and str(rec.get("text", "")):
-                    print(f"    text={_truncate_text(str(rec.get('text', '')), int(args.text_max_len))}", flush=True)
+                    print(f"    text={_truncate_text(str(rec.get('text', '')), int(resolved_text_max_len))}", flush=True)
 
     ok_records = [rec for rec in records if rec.get("status") == "ok"]
     if error_count > 0:
