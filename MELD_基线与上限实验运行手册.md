@@ -34,16 +34,26 @@
 
 下面四组实验都共享这一段准备流程。只要同一台服务器已经做过一次，就不需要每次重复。
 
-当前推荐默认使用服务器全局 Python 环境，不再额外创建 `.venv-server` 或 conda 环境。`setup_ubuntu_server.sh` 会在全局环境上补装缺失依赖，并把模型缓存固定到仓库本地目录。
+这版手册不再使用 `autodl-tmp`。仓库、训练 run、推理产物、统计汇总、manifest、音频 sidecar、input cache、模型下载缓存都统一放在 `autodl-fs`。
 
-如果你的仓库代码放在 `/root/autodl-fs/MMSER-Pytorch`，但希望只有训练 run、推理产物和统计汇总写到 `/root/autodl-tmp/output`，而 manifest、音频 sidecar、input cache 这类前处理产物继续保留在仓库内 `outputs/`，就按下面这组变量执行。
-下文所有命令默认共享下面这组变量：
+如果你的仓库代码放在 `/root/autodl-fs/MMSER-Pytorch`，下文所有命令默认共享下面这组变量：
 
 ```bash
 export PROJECT_ROOT=/root/autodl-fs/MMSER-Pytorch
-export RUN_OUTPUT_ROOT=/root/autodl-tmp/output/benchmarks/meld
+export OUTPUT_ROOT=${PROJECT_ROOT}/outputs/benchmarks/meld
+export RUN_OUTPUT_ROOT=${OUTPUT_ROOT}/runs
+export HF_HOME=${PROJECT_ROOT}/.hf-cache
+export HF_HUB_CACHE=${HF_HOME}/hub
+export HUGGINGFACE_HUB_CACHE=${HF_HOME}/hub
+export TRANSFORMERS_CACHE=${HF_HOME}/hub
+export TORCH_HOME=${PROJECT_ROOT}/.torch-cache
 
-mkdir -p "${RUN_OUTPUT_ROOT}" "${RUN_OUTPUT_ROOT}/reports"
+mkdir -p \
+  "${OUTPUT_ROOT}" \
+  "${RUN_OUTPUT_ROOT}" \
+  "${RUN_OUTPUT_ROOT}/reports" \
+  "${HF_HOME}" \
+  "${TORCH_HOME}"
 
 cd "${PROJECT_ROOT}"
 git pull
@@ -53,12 +63,89 @@ export HF_ENDPOINT=https://hf-mirror.com
 # 第一次下载模型时不要开离线模式。
 #unset HF_HUB_OFFLINE
 #unset TRANSFORMERS_OFFLINE
+```
 
+### 环境安装与激活
+
+推荐优先使用仓库自带的一键脚本。它会复用服务器镜像里现成的 `torch` / CUDA 运行时，只补装主线依赖，并把 conda 环境、模型缓存、PyTorch 缓存都固定在仓库目录下，也就是 `autodl-fs`。
+
+#### 方案 A：推荐，一键脚本
+
+适用场景：
+
+- 服务器基础镜像已经自带可用的 `torch`
+- 你不想手动处理 `transformers`、`huggingface_hub`、`sentencepiece` 这类主线依赖
+- 你希望环境和缓存都跟仓库一起固定在 `autodl-fs`
+
+执行命令：
+
+```bash
+cd "${PROJECT_ROOT}"
+
+# 如果你要直接用服务器当前 Python：
 USE_GLOBAL_ENV=1 INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh
+
+# 如果你希望在仓库里创建本地 conda 环境：
+# INSTALL_LEGACY_EXTRAS=0 source setup_ubuntu_server.sh
+
+python - <<'PY'
+import torch
+import huggingface_hub
+import transformers
+print("python_ok")
+print("torch", torch.__version__, torch.version.cuda, torch.cuda.is_available())
+print("huggingface_hub", huggingface_hub.__version__)
+print("transformers", transformers.__version__)
+PY
+```
+
+这一步跑完后，再执行 `python3 download.py`、`train.py`、`batch_inference.py`。
+
+#### 方案 B：手动安装
+
+如果你明确要自己维护环境，也可以手动装，但前提是你当前环境里已经有和服务器 CUDA 兼容的 `torch`。主线依赖至少要补齐下面这些：
+
+```bash
+cd "${PROJECT_ROOT}"
+
+# 这里假设你已经手动激活了自己的 conda / venv 环境，并且 torch 已可用。
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+
+python - <<'PY'
+import torch
+import huggingface_hub
+import transformers
+import sentencepiece
+print("python_ok")
+print("torch", torch.__version__, torch.version.cuda, torch.cuda.is_available())
+print("huggingface_hub", huggingface_hub.__version__)
+print("transformers", transformers.__version__)
+PY
+```
+
+如果这里失败，比如你刚才遇到：
+
+```bash
+ModuleNotFoundError: No module named 'huggingface_hub'
+```
+
+说明当前 Python 环境还没装好主线依赖。先完成上面的安装，再运行 `python3 download.py`。
+
+### 数据准备与模型下载
+
+环境准备完成后，再执行下面这组数据与模型准备命令：
+
+```bash
+
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 
 # 先确认真正存放 MELD MP4 的目录层级。
 find ../MELD.Raw -type f -name '*.mp4' | head
+
+python3 download.py
 
 python3 build_split_manifest.py \
   --dataset-kind meld \
@@ -71,12 +158,12 @@ python3 prepare_dataset_media.py \
   --dataset-kind meld \
   --split-manifest outputs/benchmarks/meld/splits/default_manifest.json \
   --subset all \
+  --sample-rate 16000 \
   --num-workers auto
 
 python3 filter_meld_manifest.py \
   --input outputs/benchmarks/meld/splits/default_manifest.json \
   --output outputs/benchmarks/meld/splits/default_manifest.filtered.json
-python3 download.py
 ```
 
 经过这一步后，正式实验统一使用：
@@ -85,13 +172,13 @@ python3 download.py
 
 说明：
 
-- 当前手册默认使用全局环境模式：`USE_GLOBAL_ENV=1`。只有在你明确想隔离依赖、并且服务器本身没有环境兼容问题时，才考虑脚本里的 conda 路线。
+- 当前手册给了两种完整路径：推荐直接用 `setup_ubuntu_server.sh`，手动安装只作为备选。
 - `prepare_dataset_media.py` 仍然会用到 CPU 和磁盘，因为当前 GPU 主线仍依赖 `audio_path` sidecar。
-- 这一版手册默认把 manifest、音频 sidecar 和 input cache 保留在仓库内 `outputs/`，只把训练 run、推理产物和统计汇总写到 `/root/autodl-tmp/output`。
+- 这一版手册默认把所有资料都放在 `autodl-fs`：运行产物在 `${RUN_OUTPUT_ROOT}`，manifest / 音频 sidecar / input cache 在仓库内 `outputs/`，模型缓存放在 `${HF_HOME}` 与 `${TORCH_HOME}`。
 - 这一步是一次性准备，不属于四组主实验命令的一部分。
 - `filter_meld_manifest.py` 只做本地 manifest 过滤，不会下载任何模型或远程资源。
-- `download.py` 默认把 Hugging Face 模型快照下载到仓库本地的 `.hf-cache/hub/`。同一台机器第二次运行时，会先校验本地缓存的 `config`、`tokenizer` 和 `safetensors` 头是否完整；只有校验通过才直接复用，否则会重新下载损坏或不完整的快照。
-- 当前主线在 `train.py` / `batch_inference.py` 里会优先解析仓库本地 `.hf-cache/hub/` 中已验证的 Hugging Face 快照。只要 `download.py` 已成功跑过，后续正式训练和推理即使并发开多个进程，也不应该再因为 `AutoTokenizer` / `AutoModel` 初始化先去 `HEAD huggingface.co` 而卡住。
+- `download.py` 与当前主线会优先使用 `${HF_HOME}` / `${HF_HUB_CACHE}` 下的 Hugging Face 缓存；只要这些环境变量固定在 `autodl-fs`，后续训练、推理和单独模型下载都会持续复用同一份本地缓存。
+- 如果你还需要额外的 PyTorch/torchvision 预训练权重缓存，也统一落到 `${TORCH_HOME}`，不要再写到 `autodl-tmp` 或默认家目录缓存。
 - 当前仓库已经在 `download.py`、`train.py`、`batch_inference.py` 以及相关 Hugging Face 入口里补了 `torch.utils._pytree` 兼容层，用来兼容只暴露 `_register_pytree_node` 的旧版全局 `torch`。如果你遇到 `register_pytree_node` 缺失报错，先 `git pull` 再重试，不要第一反应就重装整套全局 CUDA/PyTorch 环境。
 - 当前主线会显式关闭 `microsoft/wavlm-large` 这类 Hugging Face 音频编码器在训练态的内部 SpecAugment / time masking。原因有两个：一是它不属于本文档的正式实验变量；二是在部分 `torch + transformers + CUDA` 组合上，它会触发 `masked_spec_embed` 相关的 CUDA 索引断言。若你遇到这类报错，先 `git pull`，不要自行回退到旧代码。
 - 当前 `dual/flow` 分支的 `FlowVideoEncoder` 已改为确定性友好的空间 `AvgPool3d` 版本，不再使用会在 `torch.use_deterministic_algorithms(True)` 下直接报错的 `MaxPool3d` backward。论文级正式结果不要混用这次修改前训练出来的旧 `dual` checkpoint；第四组请在最新代码上从头重跑。
@@ -101,7 +188,9 @@ python3 download.py
 - 训练/推理主线已经不再公开 `--pipeline` / `--cache-mode` 这类旧运行时参数；当前应该直接使用最短的 manifest/gpu_stream 命令。
 - 训练/推理开始后，控制台会额外打印 `gpu_stream_backends`、`gpu_stream_prepare_stats`，训练日志还会带 `train_prepare_s`、`val_prepare_s`，它们用于判断瓶颈是在 CPU ingress 还是模型前向。
 - `--num-workers auto` 不是硬性要求，而是默认推荐值。如果像 `K100_AI` 这类旧内核/特殊驱动服务器在首个 batch 附近出现 `Segmentation fault (core dumped)`，通常就是 worker 子进程和底层音频/视频库不兼容，此时应把该机器上的训练与推理统一固定成 `--num-workers 0`。
-- 再次进入同一台机器上的同一仓库时，仍然直接执行 `USE_GLOBAL_ENV=1 source setup_ubuntu_server.sh` 即可。依赖如果已经装好，脚本会自动跳过重复安装。
+- 再次进入同一台机器上的同一仓库时：
+- 如果你走方案 A，只需要 `cd "${PROJECT_ROOT}"` 后重新 `source setup_ubuntu_server.sh`。
+- 如果你走方案 B，只需要重新激活你自己的运行环境，并恢复上面这组 `PROJECT_ROOT`、`OUTPUT_ROOT`、`RUN_OUTPUT_ROOT`、`HF_HOME`、`HF_HUB_CACHE`、`TORCH_HOME` 等环境变量即可。
 - 如果模型已经下载完成，后续正式训练前可以再加：
 
 ```bash
@@ -243,10 +332,11 @@ python3 shard_input_cache.py \
 
 统一说明：
 
-- 正式实验里统一用 `python3 batch_inference.py --run-dir <run_dir>`，不要再手工拼 `checkpoints/best.pt`
+- 正式实验里统一用 `python3 batch_inference.py --run-dir <run_dir>`，不要再手工拼 checkpoint 路径
 - `batch_inference.py --checkpoint ...` 只保留给低层调试；正式评测不要用它
 - 正式实验里不要使用 `--allow-incompatible-checkpoint`；它只用于调试，且会让输出自动失去论文级资格
 - 训练结果的权威入口是 `<run_dir>/run_manifest.json`
+- 正式论文级 checkpoint 的权威入口是 published attempt 下最佳 bundle 的 `checkpoint.pt`，也就是 `attempts/<attempt_id>/bundles/best_epoch_xxxx/checkpoint.pt`
 - 训练摘要统一看 `attempts/<attempt_id>/published/metrics.json`
 - 验证集最佳 bundle 摘要统一看 `attempts/<attempt_id>/bundles/best_epoch_xxxx/inference_val.metrics.json`
 - 测试集推理摘要统一看 `attempts/<attempt_id>/published/inference_test.metrics.json`
@@ -255,7 +345,7 @@ python3 shard_input_cache.py \
 - 单个 seed 的最好结果只能作为明细，不应直接作为论文表格 headline
 - 正式对外汇报时，应使用多 seed 汇总结果里的 `mean ± std`、`95% CI` 和相邻实验之间的配对显著性检验
 - 如果某次 run 的 `paper_grade.eligible=false`，即使数值更高，也不能放进正式论文表
-- 如果要快速检查某个 run 是否完整，直接执行 `python3 validate_run_artifacts.py --run-dir <run_dir>`
+- 如果要快速检查某个 run 是否已经形成论文级闭环，执行 `python3 validate_run_artifacts.py --run-dir <run_dir>`；通过时至少表示 published attempt、published train metrics、最佳 bundle、`inference_val`、`inference_test`、`paper_grade.eligible`、`manifest_sha256`、`paper_contract` 和 `input_cache_contract`（如使用缓存）已经达到一致性要求
 - 历史平铺目录若要纳入新协议，使用 `python3 migrate_legacy_run_dir.py --run-dir <run_dir>`
 
 ## MELD GPU 主实验以后不要再用的旧命令
@@ -398,6 +488,7 @@ done
 说明：
 
 - `batch_inference.py --run-dir ...` 会先读取该 run 的 `run_manifest.json`，再自动解析 published attempt 的最佳 bundle
+- 正式评测时，真正被消费的 checkpoint 是这个最佳 bundle 里的 `checkpoint.pt`
 - 因此这里不要再额外传 `--video-backbone`、`--audio-model`、`--text-model`、`--flow-backend`、`--flow-size`、`--rgb-size` 这类训练期结构参数
 
 ```bash

@@ -8,7 +8,7 @@ from run_store import validate_run_dir
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate a manifest-driven training run directory.")
+    parser = argparse.ArgumentParser(description="Validate a paper-grade closed-loop manifest-driven run directory.")
     parser.add_argument("--run-dir", type=Path, required=True)
     return parser.parse_args()
 

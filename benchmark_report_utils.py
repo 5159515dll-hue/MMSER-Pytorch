@@ -8,31 +8,28 @@ from pathlib import Path
 from typing import Any
 
 from metrics_utils import holm_bonferroni_adjust, mean_confidence_interval_t, paired_t_test
-from run_store import load_attempt_manifest, resolve_attempt_dir, resolve_published_metrics
+from run_store import (
+    PAPER_GRADE_CONTRACT_KEYS,
+    load_attempt_manifest,
+    normalize_input_cache_contract_identity,
+    normalize_paper_contract_subset,
+    resolve_attempt_dir,
+    resolve_published_inference_metrics,
+    resolve_published_metrics,
+)
 
 PAPER_MULTI_SEED = [13, 17, 23, 42, 3407]
 
 GROUP_INVARIANT_KEYS = (
-    "protocol_version",
-    "manifest_sha256",
-    "dataset_kind",
-    "task_mode",
-    "speaker_id",
-    "text_policy",
-    "claim_scope",
-    "scientific_validity",
     "deterministic_algorithms_enabled",
-    "ablation",
-    "zero_video",
-    "zero_audio",
-    "zero_text",
-    "use_intensity",
-    "video_backbone",
-    "flow_encoder_variant",
     "input_cache_used",
-    "input_cache_protocol",
+    "input_cache_contract_identity",
+    *PAPER_GRADE_CONTRACT_KEYS,
 )
 COMPARISON_INVARIANT_KEYS = (
+    "deterministic_algorithms_enabled",
+    "input_cache_used",
+    "input_cache_contract_identity",
     "protocol_version",
     "manifest_sha256",
     "dataset_kind",
@@ -41,8 +38,14 @@ COMPARISON_INVARIANT_KEYS = (
     "text_policy",
     "claim_scope",
     "scientific_validity",
-    "deterministic_algorithms_enabled",
     "flow_encoder_variant",
+    "text_model",
+    "max_text_len",
+    "sample_rate",
+    "max_audio_sec",
+    "num_frames",
+    "rgb_size",
+    "label_names",
 )
 
 
@@ -71,26 +74,6 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _resolve_inference_metrics_path(attempt_dir: Path, attempt_manifest: dict[str, Any], subset: str) -> Path:
-    published_metrics = attempt_manifest.get("published_inference_metrics", {})
-    metrics_relpath = ""
-    if isinstance(published_metrics, dict):
-        metrics_relpath = str(published_metrics.get(str(subset), "") or "")
-    candidates = []
-    if metrics_relpath:
-        candidates.append(Path(attempt_dir).expanduser() / metrics_relpath)
-    candidates.extend(
-        [
-            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.metrics.json",
-            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.jsonl.metrics.json",
-        ]
-    )
-    for path in candidates:
-        if path.is_file():
-            return path
-    raise FileNotFoundError(f"missing metrics summary for inference_{subset} under {attempt_dir}")
-
-
 def _merge_reasons(*reason_groups: Any) -> list[str]:
     merged: list[str] = []
     for group in reason_groups:
@@ -101,53 +84,49 @@ def _merge_reasons(*reason_groups: Any) -> list[str]:
                     merged.append(text)
     return merged
 
+def _effective_contract(
+    train_metrics: dict[str, Any],
+    val_metrics: dict[str, Any],
+    test_metrics: dict[str, Any],
+    validity: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    train_contract = normalize_paper_contract_subset(train_metrics.get("meta", {}).get("paper_contract", {}))
+    val_contract = normalize_paper_contract_subset(val_metrics.get("paper_contract", {}))
+    test_contract = normalize_paper_contract_subset(test_metrics.get("paper_contract", {}))
+    contract = dict(train_contract)
+    if not any(contract.values()):
+        contract = dict(test_contract)
+    if not str(contract.get("claim_scope", "")).strip():
+        contract["claim_scope"] = str(validity.get("claim_scope", "") or "")
+    if not bool(contract.get("scientific_validity", False)):
+        contract["scientific_validity"] = bool(validity.get("scientific_validity", False))
 
-def _contract_or_default(train_metrics: dict[str, Any], test_metrics: dict[str, Any], validity: dict[str, Any]) -> dict[str, Any]:
-    contract = train_metrics.get("meta", {}).get("paper_contract", {})
-    if not isinstance(contract, dict) or not contract:
-        contract = test_metrics.get("paper_contract", {})
-    if not isinstance(contract, dict):
-        contract = {}
-    train_input_cache_contract = train_metrics.get("meta", {}).get("input_cache_contract", {})
-    if not isinstance(train_input_cache_contract, dict):
-        train_input_cache_contract = {}
-    test_input_cache_contract = test_metrics.get("input_cache_contract", {})
-    if not isinstance(test_input_cache_contract, dict):
-        test_input_cache_contract = {}
-    return {
-        "protocol_version": str(
-            contract.get("protocol_version")
-            or train_metrics.get("paper_grade", {}).get("protocol_version")
-            or test_metrics.get("paper_grade", {}).get("protocol_version")
-            or ""
-        ),
-        "manifest_sha256": str(contract.get("manifest_sha256") or test_metrics.get("manifest_sha256") or ""),
-        "dataset_kind": str(contract.get("dataset_kind") or test_metrics.get("dataset_kind") or ""),
-        "task_mode": str(contract.get("task_mode") or test_metrics.get("task_mode") or ""),
-        "speaker_id": contract.get("speaker_id", test_metrics.get("speaker_id")),
-        "text_policy": str(contract.get("text_policy") or test_metrics.get("text_policy") or ""),
-        "claim_scope": str(contract.get("claim_scope") or validity.get("claim_scope") or ""),
-        "scientific_validity": bool(
-            contract.get("scientific_validity", validity.get("scientific_validity", False))
-        ),
-        "deterministic_algorithms_enabled": train_metrics.get("meta", {})
-        .get("deterministic_policy", {})
-        .get("deterministic_algorithms_enabled"),
-        "ablation": str(contract.get("ablation") or test_metrics.get("ablation") or ""),
-        "zero_video": bool(contract.get("zero_video", test_metrics.get("zero_video", False))),
-        "zero_audio": bool(contract.get("zero_audio", test_metrics.get("zero_audio", False))),
-        "zero_text": bool(contract.get("zero_text", test_metrics.get("zero_text", False))),
-        "use_intensity": bool(contract.get("use_intensity", test_metrics.get("intensity_enabled", False))),
-        "video_backbone": str(contract.get("video_backbone") or ""),
-        "flow_encoder_variant": str(contract.get("flow_encoder_variant") or ""),
-        "input_cache_used": bool(train_metrics.get("meta", {}).get("input_cache") or test_metrics.get("input_cache")),
-        "input_cache_protocol": str(
-            train_input_cache_contract.get("protocol_version")
-            or test_input_cache_contract.get("protocol_version")
-            or ""
-        ),
-        "label_names": list(contract.get("label_names", test_metrics.get("label_names", []))),
-    }
+    train_input_cache_contract = normalize_input_cache_contract_identity(train_metrics.get("meta", {}).get("input_cache_contract", {}))
+    val_input_cache_contract = normalize_input_cache_contract_identity(val_metrics.get("input_cache_contract", {}))
+    test_input_cache_contract = normalize_input_cache_contract_identity(test_metrics.get("input_cache_contract", {}))
+    input_cache_used = bool(train_metrics.get("meta", {}).get("input_cache") or test_metrics.get("input_cache"))
+    input_cache_contract_identity = train_input_cache_contract
+    if input_cache_contract_identity is None:
+        input_cache_contract_identity = test_input_cache_contract
+
+    reasons: list[str] = []
+    if train_contract != val_contract:
+        reasons.append("train_val_paper_contract_mismatch")
+    if train_contract != test_contract:
+        reasons.append("train_test_paper_contract_mismatch")
+    if train_input_cache_contract != val_input_cache_contract:
+        reasons.append("train_val_input_cache_contract_mismatch")
+    if train_input_cache_contract != test_input_cache_contract:
+        reasons.append("train_test_input_cache_contract_mismatch")
+    if input_cache_used and input_cache_contract_identity is None:
+        reasons.append("missing_contract_input_cache_identity")
+
+    contract["deterministic_algorithms_enabled"] = train_metrics.get("meta", {}).get("deterministic_policy", {}).get(
+        "deterministic_algorithms_enabled"
+    )
+    contract["input_cache_used"] = bool(input_cache_used)
+    contract["input_cache_contract_identity"] = input_cache_contract_identity
+    return contract, reasons
 
 
 def load_run_bundle(run_dir: Path) -> dict[str, Any]:
@@ -156,8 +135,8 @@ def load_run_bundle(run_dir: Path) -> dict[str, Any]:
     attempt_manifest = load_attempt_manifest(attempt_dir)
     metrics_path = resolve_published_metrics(attempt_dir)
     train_metrics = _load_json(metrics_path)
-    val_metrics = _load_json(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "val"))
-    test_metrics = _load_json(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "test"))
+    val_metrics = _load_json(resolve_published_inference_metrics(attempt_dir, subset="val"))
+    test_metrics = _load_json(resolve_published_inference_metrics(attempt_dir, subset="test"))
     seed = int(attempt_manifest.get("seed", train_metrics.get("meta", {}).get("args", {}).get("seed", 0)))
     best = train_metrics.get("best", {})
     stop = train_metrics.get("stop", {})
@@ -165,11 +144,17 @@ def load_run_bundle(run_dir: Path) -> dict[str, Any]:
     train_paper = train_metrics.get("paper_grade", {})
     val_paper = val_metrics.get("paper_grade", {})
     test_paper = test_metrics.get("paper_grade", {})
-    contract = _contract_or_default(train_metrics, test_metrics, validity if isinstance(validity, dict) else {})
+    contract, contract_reasons = _effective_contract(
+        train_metrics,
+        val_metrics,
+        test_metrics,
+        validity if isinstance(validity, dict) else {},
+    )
     reasons = _merge_reasons(
         train_paper.get("ineligibility_reasons", []) if isinstance(train_paper, dict) else [],
         val_paper.get("ineligibility_reasons", []) if isinstance(val_paper, dict) else [],
         test_paper.get("ineligibility_reasons", []) if isinstance(test_paper, dict) else [],
+        contract_reasons,
     )
     return {
         "run_dir": str(run_dir),
@@ -192,8 +177,8 @@ def load_run_bundle(run_dir: Path) -> dict[str, Any]:
         "val_macro_f1_reported": float(val_metrics.get("macro_f1_on_ok", 0.0) or 0.0),
         "val_accuracy_reported": float(val_metrics.get("accuracy_on_ok", 0.0) or 0.0),
         "train_metrics_path": str(metrics_path),
-        "val_metrics_path": str(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "val")),
-        "test_metrics_path": str(_resolve_inference_metrics_path(attempt_dir, attempt_manifest, "test")),
+        "val_metrics_path": str(resolve_published_inference_metrics(attempt_dir, subset="val")),
+        "test_metrics_path": str(resolve_published_inference_metrics(attempt_dir, subset="test")),
         "val_checkpoint": str(val_metrics.get("checkpoint", "") or ""),
         "test_checkpoint": str(test_metrics.get("checkpoint", "") or ""),
         "paper_grade_eligible": bool(train_paper.get("eligible", False))
@@ -228,11 +213,24 @@ def _validate_run_bundle(run: dict[str, Any]) -> list[str]:
         "text_policy",
         "claim_scope",
         "flow_encoder_variant",
+        "text_model",
     ):
         if not str(contract.get(key, "")).strip():
             reasons.append(f"missing_contract_{key}")
-    if bool(contract.get("input_cache_used", False)) and not str(contract.get("input_cache_protocol", "")).strip():
-        reasons.append("missing_contract_input_cache_protocol")
+    if int(contract.get("max_text_len", 0) or 0) <= 0:
+        reasons.append("missing_contract_max_text_len")
+    if int(contract.get("sample_rate", 0) or 0) <= 0:
+        reasons.append("missing_contract_sample_rate")
+    if float(contract.get("max_audio_sec", 0.0) or 0.0) <= 0.0:
+        reasons.append("missing_contract_max_audio_sec")
+    if int(contract.get("num_frames", 0) or 0) <= 0:
+        reasons.append("missing_contract_num_frames")
+    if int(contract.get("rgb_size", 0) or 0) <= 0:
+        reasons.append("missing_contract_rgb_size")
+    if not list(contract.get("label_names", []) or []):
+        reasons.append("missing_contract_label_names")
+    if bool(contract.get("input_cache_used", False)) and contract.get("input_cache_contract_identity") is None:
+        reasons.append("missing_contract_input_cache_identity")
     return _merge_reasons(reasons, run.get("paper_grade_reasons", []))
 
 
@@ -454,7 +452,7 @@ def render_markdown_report(
                 f"- scientific_validity: `{contract.get('scientific_validity')}`",
                 f"- flow_encoder_variant: `{contract.get('flow_encoder_variant')}`",
                 f"- input_cache_used: `{contract.get('input_cache_used')}`",
-                f"- input_cache_protocol: `{contract.get('input_cache_protocol')}`",
+                f"- input_cache_contract_identity: `{contract.get('input_cache_contract_identity')}`",
                 f"- test macro_f1: `{macro['mean']:.4f} ± {macro['std']:.4f}`",
                 f"- test macro_f1 95% CI: `[{macro['low']:.4f}, {macro['high']:.4f}]`" if macro["low"] is not None and macro["high"] is not None else "- test macro_f1 95% CI: `n/a`",
                 f"- test accuracy: `{acc['mean']:.4f} ± {acc['std']:.4f}`",

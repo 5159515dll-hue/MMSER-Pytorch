@@ -15,6 +15,30 @@ from typing import Any
 
 
 RUN_STORE_SCHEMA_VERSION = "run_store_v1"
+PAPER_GRADE_CONTRACT_KEYS = (
+    "protocol_version",
+    "manifest_sha256",
+    "dataset_kind",
+    "task_mode",
+    "speaker_id",
+    "text_policy",
+    "claim_scope",
+    "scientific_validity",
+    "ablation",
+    "zero_video",
+    "zero_audio",
+    "zero_text",
+    "use_intensity",
+    "video_backbone",
+    "flow_encoder_variant",
+    "text_model",
+    "max_text_len",
+    "sample_rate",
+    "max_audio_sec",
+    "num_frames",
+    "rgb_size",
+    "label_names",
+)
 ATTEMPT_STATUS_ACTIVE = {"initializing", "running", "finalizing"}
 ATTEMPT_STATUS_TERMINAL = {
     "completed",
@@ -132,6 +156,70 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _normalize_jsonish(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _normalize_jsonish(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, list):
+        return [_normalize_jsonish(item) for item in value]
+    if isinstance(value, tuple):
+        return [_normalize_jsonish(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def normalize_input_cache_contract_identity(contract: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(contract, dict) or not contract:
+        return None
+    return dict(_normalize_jsonish(contract))
+
+
+def normalize_paper_contract_subset(contract: dict[str, Any] | None) -> dict[str, Any]:
+    source = contract if isinstance(contract, dict) else {}
+    normalized: dict[str, Any] = {}
+    for key in PAPER_GRADE_CONTRACT_KEYS:
+        value = source.get(key)
+        if key in {"scientific_validity", "zero_video", "zero_audio", "zero_text", "use_intensity"}:
+            normalized[key] = bool(value)
+        elif key in {"max_text_len", "sample_rate", "num_frames", "rgb_size"}:
+            normalized[key] = int(value or 0)
+        elif key == "max_audio_sec":
+            normalized[key] = float(value or 0.0)
+        elif key == "label_names":
+            normalized[key] = [str(item) for item in (value or [])]
+        elif key == "speaker_id":
+            text = str(value).strip() if value is not None else ""
+            normalized[key] = text or None
+        else:
+            normalized[key] = str(value or "")
+    return normalized
+
+
+def missing_paper_contract_fields(contract: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for key in PAPER_GRADE_CONTRACT_KEYS:
+        value = contract.get(key)
+        if key in {"scientific_validity", "zero_video", "zero_audio", "zero_text", "use_intensity"}:
+            continue
+        if key in {"max_text_len", "sample_rate", "num_frames", "rgb_size"}:
+            if int(value or 0) <= 0:
+                missing.append(key)
+            continue
+        if key == "max_audio_sec":
+            if float(value or 0.0) <= 0.0:
+                missing.append(key)
+            continue
+        if key == "label_names":
+            if not list(value or []):
+                missing.append(key)
+            continue
+        if key == "speaker_id":
+            continue
+        if not str(value or "").strip():
+            missing.append(key)
+    return missing
+
+
 def generate_attempt_id(seed: int | None = None) -> str:
     base = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     suffix = uuid.uuid4().hex[:8]
@@ -208,6 +296,27 @@ def resolve_published_metrics(attempt_dir: Path) -> Path:
     return path
 
 
+def resolve_published_inference_metrics(attempt_dir: Path, *, subset: str) -> Path:
+    manifest = load_attempt_manifest(attempt_dir)
+    published_metrics = manifest.get("published_inference_metrics", {})
+    metrics_relpath = ""
+    if isinstance(published_metrics, dict):
+        metrics_relpath = str(published_metrics.get(str(subset), "") or "")
+    candidates: list[Path] = []
+    if metrics_relpath:
+        candidates.append(Path(attempt_dir).expanduser() / metrics_relpath)
+    candidates.extend(
+        [
+            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.metrics.json",
+            Path(attempt_dir).expanduser() / "published" / f"inference_{subset}.jsonl.metrics.json",
+        ]
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Published inference metrics not found for subset={subset}: {attempt_dir}")
+
+
 def register_published_inference_output(attempt_dir: Path, *, subset: str, output_path: Path) -> None:
     attempt_root = Path(attempt_dir).expanduser()
     manifest_path = attempt_root / "attempt_manifest.json"
@@ -229,27 +338,190 @@ def register_published_inference_output(attempt_dir: Path, *, subset: str, outpu
 
 def validate_run_dir(run_dir: Path) -> dict[str, Any]:
     run_root = Path(run_dir).expanduser()
-    manifest = load_run_manifest(run_root)
     issues: list[str] = []
+    checks: dict[str, Any] = {
+        "run_manifest_exists": False,
+        "published_attempt_resolved": False,
+        "published_attempt_completed": False,
+        "published_train_metrics_exists": False,
+        "best_bundle_exists": False,
+        "best_bundle_checkpoint_exists": False,
+        "best_bundle_val_jsonl_exists": False,
+        "best_bundle_val_metrics_exists": False,
+        "published_test_metrics_exists": False,
+        "paper_grade_all_eligible": False,
+        "manifest_sha256_consistent": False,
+        "paper_contract_consistent": False,
+        "input_cache_contract_consistent": False,
+        "published_bundle_checkpoint_used_for_val_test": False,
+    }
+    run_manifest_file = run_manifest_path(run_root)
+    if not run_manifest_file.is_file():
+        issues.append("run_manifest_missing")
+        return {
+            "run_dir": str(run_root),
+            "schema_version": None,
+            "published_attempt_id": None,
+            "active_attempt_id": None,
+            "attempt_count": 0,
+            "issues": issues,
+            "checks": checks,
+        }
+    checks["run_manifest_exists"] = True
+    try:
+        manifest = load_run_manifest(run_root)
+    except Exception as exc:
+        issues.append(f"run_manifest_invalid:{type(exc).__name__}")
+        return {
+            "run_dir": str(run_root),
+            "schema_version": None,
+            "published_attempt_id": None,
+            "active_attempt_id": None,
+            "attempt_count": 0,
+            "issues": issues,
+            "checks": checks,
+        }
     published_attempt_id = str(manifest.get("published_attempt_id", "") or "")
     active_attempt_id = str(manifest.get("active_attempt_id", "") or "")
     attempts = manifest.get("attempts", [])
     attempt_map = {str(item.get("attempt_id", "")): item for item in attempts if isinstance(item, dict)}
-    if published_attempt_id and published_attempt_id not in attempt_map:
+    if not published_attempt_id:
+        issues.append("published_attempt_missing")
+    elif published_attempt_id not in attempt_map:
         issues.append("published_attempt_missing")
     if active_attempt_id and active_attempt_id not in attempt_map:
         issues.append("active_attempt_missing")
     published_attempt_dir = None
     if published_attempt_id in attempt_map:
         published_attempt_dir = run_root / str(attempt_map[published_attempt_id].get("attempt_relpath", ""))
+        checks["published_attempt_resolved"] = bool(published_attempt_dir.is_dir())
+        if not published_attempt_dir.is_dir():
+            issues.append("published_attempt_dir_missing")
+        attempt_manifest: dict[str, Any] | None = None
+        if published_attempt_dir.is_dir():
+            try:
+                attempt_manifest = load_attempt_manifest(published_attempt_dir)
+            except Exception as exc:
+                issues.append(f"published_attempt_manifest_invalid:{type(exc).__name__}")
+            if attempt_manifest is not None:
+                status = str(attempt_manifest.get("status", "") or "")
+                checks["published_attempt_completed"] = status == "completed"
+                if status != "completed":
+                    issues.append(f"published_attempt_status_invalid:{status or 'missing'}")
         try:
-            resolve_best_bundle(published_attempt_dir)
+            bundle = resolve_best_bundle(published_attempt_dir)
+            checks["best_bundle_exists"] = True
+            bundle_dir = Path(bundle["bundle_dir"]).expanduser()
+            checkpoint_path = Path(bundle["checkpoint_path"]).expanduser()
+            val_jsonl_path = Path(bundle["inference_jsonl_path"]).expanduser()
+            val_metrics_path = Path(bundle["inference_metrics_path"]).expanduser()
+            checks["best_bundle_checkpoint_exists"] = checkpoint_path.is_file()
+            checks["best_bundle_val_jsonl_exists"] = val_jsonl_path.is_file()
+            checks["best_bundle_val_metrics_exists"] = val_metrics_path.is_file()
+            if not checkpoint_path.is_file():
+                issues.append("best_bundle_checkpoint_missing")
+            if not val_jsonl_path.is_file():
+                issues.append("best_bundle_val_jsonl_missing")
+            if not val_metrics_path.is_file():
+                issues.append("best_bundle_val_metrics_missing")
         except Exception as exc:
-            issues.append(f"published_best_bundle_invalid:{type(exc).__name__}")
+            if isinstance(exc, FileNotFoundError):
+                issues.append("published_best_bundle_missing")
+            else:
+                issues.append(f"published_best_bundle_invalid:{type(exc).__name__}")
+            bundle = None
         try:
-            resolve_published_metrics(published_attempt_dir)
+            train_metrics_path = resolve_published_metrics(published_attempt_dir)
+            checks["published_train_metrics_exists"] = True
         except Exception as exc:
-            issues.append(f"published_metrics_invalid:{type(exc).__name__}")
+            if isinstance(exc, FileNotFoundError):
+                issues.append("published_train_metrics_missing")
+            else:
+                issues.append(f"published_train_metrics_invalid:{type(exc).__name__}")
+            train_metrics_path = None
+        try:
+            test_metrics_path = resolve_published_inference_metrics(published_attempt_dir, subset="test")
+            checks["published_test_metrics_exists"] = True
+        except Exception as exc:
+            if isinstance(exc, FileNotFoundError):
+                issues.append("published_test_metrics_missing")
+            else:
+                issues.append(f"published_test_metrics_invalid:{type(exc).__name__}")
+            test_metrics_path = None
+
+        if bundle is not None and train_metrics_path is not None and test_metrics_path is not None:
+            try:
+                train_metrics = _load_json(Path(train_metrics_path))
+                val_metrics = _load_json(Path(bundle["inference_metrics_path"]))
+                test_metrics = _load_json(Path(test_metrics_path))
+            except Exception as exc:
+                issues.append(f"metrics_payload_invalid:{type(exc).__name__}")
+            else:
+                metrics_by_name = {
+                    "train": train_metrics,
+                    "val": val_metrics,
+                    "test": test_metrics,
+                }
+                paper_grade_ok = True
+                for name, payload in metrics_by_name.items():
+                    paper_grade = payload.get("paper_grade")
+                    if not isinstance(paper_grade, dict):
+                        issues.append(f"{name}_paper_grade_missing")
+                        paper_grade_ok = False
+                        continue
+                    if not bool(paper_grade.get("eligible", False)):
+                        issues.append(f"{name}_paper_grade_ineligible")
+                        paper_grade_ok = False
+                checks["paper_grade_all_eligible"] = paper_grade_ok
+
+                train_contract = normalize_paper_contract_subset(train_metrics.get("meta", {}).get("paper_contract", {}))
+                val_contract = normalize_paper_contract_subset(val_metrics.get("paper_contract", {}))
+                test_contract = normalize_paper_contract_subset(test_metrics.get("paper_contract", {}))
+                contract_match = train_contract == val_contract == test_contract
+                checks["paper_contract_consistent"] = contract_match
+                for name, contract_payload in (("train", train_contract), ("val", val_contract), ("test", test_contract)):
+                    for field in missing_paper_contract_fields(contract_payload):
+                        issues.append(f"{name}_paper_contract_missing_{field}")
+                if not contract_match:
+                    if train_contract != val_contract:
+                        issues.append("train_val_paper_contract_mismatch")
+                    if train_contract != test_contract:
+                        issues.append("train_test_paper_contract_mismatch")
+
+                manifest_hashes = {
+                    "train": str(train_metrics.get("meta", {}).get("manifest_sha256", "")),
+                    "val": str(val_metrics.get("manifest_sha256", "")),
+                    "test": str(test_metrics.get("manifest_sha256", "")),
+                }
+                manifest_consistent = (
+                    bool(manifest_hashes["train"])
+                    and manifest_hashes["train"] == manifest_hashes["val"] == manifest_hashes["test"]
+                )
+                checks["manifest_sha256_consistent"] = manifest_consistent
+                if not manifest_consistent:
+                    issues.append("manifest_sha256_mismatch")
+
+                train_cache = normalize_input_cache_contract_identity(train_metrics.get("meta", {}).get("input_cache_contract", {}))
+                val_cache = normalize_input_cache_contract_identity(val_metrics.get("input_cache_contract", {}))
+                test_cache = normalize_input_cache_contract_identity(test_metrics.get("input_cache_contract", {}))
+                cache_consistent = train_cache == val_cache == test_cache
+                checks["input_cache_contract_consistent"] = cache_consistent
+                if not cache_consistent:
+                    if train_cache != val_cache:
+                        issues.append("train_val_input_cache_contract_mismatch")
+                    if train_cache != test_cache:
+                        issues.append("train_test_input_cache_contract_mismatch")
+
+                bundle_checkpoint = Path(bundle["checkpoint_path"]).expanduser()
+                val_checkpoint = Path(str(val_metrics.get("checkpoint", ""))).expanduser()
+                test_checkpoint = Path(str(test_metrics.get("checkpoint", ""))).expanduser()
+                checkpoint_match = val_checkpoint == bundle_checkpoint and test_checkpoint == bundle_checkpoint
+                checks["published_bundle_checkpoint_used_for_val_test"] = checkpoint_match
+                if not checkpoint_match:
+                    if val_checkpoint != bundle_checkpoint:
+                        issues.append("val_checkpoint_not_published_bundle")
+                    if test_checkpoint != bundle_checkpoint:
+                        issues.append("test_checkpoint_not_published_bundle")
     return {
         "run_dir": str(run_root),
         "schema_version": str(manifest.get("schema_version", "")),
@@ -257,6 +529,7 @@ def validate_run_dir(run_dir: Path) -> dict[str, Any]:
         "active_attempt_id": active_attempt_id or None,
         "attempt_count": len(attempts),
         "issues": issues,
+        "checks": checks,
     }
 
 

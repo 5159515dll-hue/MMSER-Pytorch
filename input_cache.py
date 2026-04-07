@@ -135,15 +135,11 @@ def build_input_cache_contract(meta: dict[str, Any]) -> dict[str, Any]:
 
 
 def _hf_model_name_matches(left: str, right: str) -> bool:
-    """尽量温和地比较两个 Hugging Face 模型名是否指向同一模型。"""
+    """严格比较两个 Hugging Face 模型名是否完全一致。"""
 
     left_text = str(left or "").strip()
     right_text = str(right or "").strip()
-    if left_text == right_text:
-        return True
-    if not left_text or not right_text:
-        return False
-    return left_text.split("/")[-1] == right_text.split("/")[-1]
+    return bool(left_text) and bool(right_text) and left_text == right_text
 
 
 def validate_input_cache_contract(
