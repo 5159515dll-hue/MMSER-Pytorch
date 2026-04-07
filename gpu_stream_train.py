@@ -797,6 +797,7 @@ def main() -> None:
         flow_encoder_variant=str(FLOW_VIDEO_ENCODER_VARIANT),
         text_model=str(args.text_model),
         max_text_len=int(args.max_text_len),
+        rgb_size=int(args.rgb_size),
         sample_rate=int(args.sample_rate),
         max_audio_sec=float(args.max_audio_sec),
         num_frames=int(args.num_frames),

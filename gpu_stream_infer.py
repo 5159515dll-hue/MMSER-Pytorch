@@ -243,7 +243,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--num-frames", type=int, default=None)
     p.add_argument("--flow-size", type=int, default=112, help=argparse.SUPPRESS)
-    p.add_argument("--rgb-size", type=int, default=224, help=argparse.SUPPRESS)
+    p.add_argument("--rgb-size", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--sample-rate", type=int, default=None)
     p.add_argument("--max-audio-sec", type=float, default=None)
     p.add_argument("--audio-backend", type=str, default="auto", choices=["auto", "torchaudio", "soundfile"], help=argparse.SUPPRESS)
@@ -368,11 +368,18 @@ def _checkpoint_run_contract(
         if normalized_max_text_len <= 0:
             normalized_max_text_len = 128
         normalized["max_text_len"] = int(normalized_max_text_len)
+        normalized_rgb_size = int(normalized.get("rgb_size", ckpt_args.get("rgb_size", 224)) or 224)
+        if normalized_rgb_size <= 0:
+            normalized_rgb_size = 224
+        normalized["rgb_size"] = int(normalized_rgb_size)
         return normalized
     split_manifest_raw = ckpt.get("split_manifest", "")
     fallback_max_text_len = int(ckpt_args.get("max_text_len", 128) or 128)
     if fallback_max_text_len <= 0:
         fallback_max_text_len = 128
+    fallback_rgb_size = int(ckpt_args.get("rgb_size", 224) or 224)
+    if fallback_rgb_size <= 0:
+        fallback_rgb_size = 224
     return build_run_contract(
         split_manifest=Path(str(split_manifest_raw or ".")),
         manifest_sha256=str(ckpt.get("manifest_sha256", "") or ""),
@@ -391,6 +398,7 @@ def _checkpoint_run_contract(
         flow_encoder_variant=LEGACY_FLOW_VIDEO_ENCODER_VARIANT,
         text_model=str(ckpt_args.get("text_model", "") or "xlm-roberta-large"),
         max_text_len=int(fallback_max_text_len),
+        rgb_size=int(fallback_rgb_size),
         sample_rate=int(ckpt_args.get("sample_rate", 24000) or 24000),
         max_audio_sec=float(ckpt_args.get("max_audio_sec", 6.0) or 6.0),
         num_frames=int(ckpt_args.get("num_frames", 64) or 64),
@@ -806,10 +814,16 @@ def main() -> None:
     contract_max_text_len = int(checkpoint_contract.get("max_text_len", 128) or 128)
     if contract_max_text_len <= 0:
         contract_max_text_len = 128
+    contract_rgb_size = int(checkpoint_contract.get("rgb_size", 224) or 224)
+    if contract_rgb_size <= 0:
+        contract_rgb_size = 224
     resolved_text_model = _normalize_optional_text(args.text_model) or contract_text_model
     resolved_text_max_len = int(args.text_max_len)
     if resolved_text_max_len <= 0:
         resolved_text_max_len = int(contract_max_text_len)
+    resolved_rgb_size = int(args.rgb_size) if args.rgb_size is not None else int(contract_rgb_size)
+    if resolved_rgb_size <= 0:
+        resolved_rgb_size = 224
     # 后续所有“为什么这次评测不再算 paper-grade”的原因都汇总到这里。
     paper_grade_reasons = list(compatibility_reasons)
     if bool(args.allow_incompatible_checkpoint):
@@ -863,6 +877,13 @@ def main() -> None:
         field="max_text_len",
         expected=int(contract_max_text_len),
         actual=int(resolved_text_max_len),
+        reasons=paper_grade_reasons,
+        allow_mismatch=bool(args.allow_incompatible_checkpoint),
+    )
+    _raise_or_record_mismatch(
+        field="rgb_size",
+        expected=int(contract_rgb_size),
+        actual=int(resolved_rgb_size),
         reasons=paper_grade_reasons,
         allow_mismatch=bool(args.allow_incompatible_checkpoint),
     )
@@ -983,7 +1004,7 @@ def main() -> None:
             sample_rate=int(args.sample_rate),
             max_audio_sec=float(args.max_audio_sec),
             num_frames=int(args.num_frames),
-            rgb_size=int(args.rgb_size),
+            rgb_size=int(resolved_rgb_size),
             text_model=str(resolved_text_model),
             max_text_len=int(resolved_text_max_len),
             need_audio=bool(need_audio),
@@ -1066,7 +1087,7 @@ def main() -> None:
             audio_backend_mode=str(args.audio_backend),
             num_frames=int(args.num_frames),
             flow_size=int(args.flow_size),
-            rgb_size=int(args.rgb_size),
+            rgb_size=int(resolved_rgb_size),
             zero_video=bool(args.zero_video),
             zero_audio=bool(args.zero_audio),
             zero_text=bool(args.zero_text),
