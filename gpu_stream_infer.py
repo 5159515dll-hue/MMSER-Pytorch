@@ -363,6 +363,7 @@ def _checkpoint_run_contract(
     if isinstance(contract, dict) and contract:
         normalized = dict(contract)
         normalized.setdefault("flow_encoder_variant", LEGACY_FLOW_VIDEO_ENCODER_VARIANT)
+        normalized.setdefault("fusion_mode", str(ckpt_args.get("fusion_mode", "") or "gated_text"))
         normalized.setdefault("text_model", str(ckpt_args.get("text_model", "") or "xlm-roberta-large"))
         normalized_max_text_len = int(normalized.get("max_text_len", ckpt_args.get("max_text_len", 128)) or 128)
         if normalized_max_text_len <= 0:
@@ -394,6 +395,7 @@ def _checkpoint_run_contract(
         zero_audio=bool(ckpt.get("zero_audio", ckpt_args.get("zero_audio", False))),
         zero_text=bool(ckpt.get("zero_text", ckpt_args.get("zero_text", False))),
         use_intensity=bool(ckpt_args.get("use_intensity", False)),
+        fusion_mode=str(ckpt_args.get("fusion_mode", "gated_text") or "gated_text"),
         video_backbone=str(ckpt_args.get("video_backbone", "dual") or "dual"),
         flow_encoder_variant=LEGACY_FLOW_VIDEO_ENCODER_VARIANT,
         text_model=str(ckpt_args.get("text_model", "") or "xlm-roberta-large"),

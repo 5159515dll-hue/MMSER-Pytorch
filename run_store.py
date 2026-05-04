@@ -29,6 +29,7 @@ PAPER_GRADE_CONTRACT_KEYS = (
     "zero_audio",
     "zero_text",
     "use_intensity",
+    "fusion_mode",
     "video_backbone",
     "flow_encoder_variant",
     "text_model",
@@ -190,6 +191,8 @@ def normalize_paper_contract_subset(contract: dict[str, Any] | None) -> dict[str
         elif key == "speaker_id":
             text = str(value).strip() if value is not None else ""
             normalized[key] = text or None
+        elif key == "fusion_mode":
+            normalized[key] = str(value or "gated_text")
         else:
             normalized[key] = str(value or "")
     return normalized
@@ -214,6 +217,8 @@ def missing_paper_contract_fields(contract: dict[str, Any]) -> list[str]:
                 missing.append(key)
             continue
         if key == "speaker_id":
+            continue
+        if key == "fusion_mode":
             continue
         if not str(value or "").strip():
             missing.append(key)

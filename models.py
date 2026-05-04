@@ -523,6 +523,81 @@ class MbertTextEncoder(nn.Module):
         return out.last_hidden_state[:, 0, :]
 
 
+class CompactDynamicFusion(nn.Module):
+    """Lightweight learned fusion over projected modality embeddings."""
+
+    def __init__(
+        self,
+        modality_dims: dict[str, int],
+        *,
+        compact_dim: int = 256,
+        hidden: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.modalities = ("text", "audio", "rgb", "flow", "prosody")
+        self.compact_dim = int(compact_dim)
+        self.projections = nn.ModuleDict(
+            {
+                name: nn.Sequential(
+                    nn.Linear(int(modality_dims[name]), self.compact_dim),
+                    nn.LayerNorm(self.compact_dim),
+                    nn.GELU(),
+                )
+                for name in self.modalities
+            }
+        )
+        gate_hidden = max(int(hidden), self.compact_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(self.compact_dim * len(self.modalities), gate_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Linear(gate_hidden, len(self.modalities)),
+        )
+        self.mix = nn.Sequential(
+            nn.Linear(self.compact_dim * 2, self.compact_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.LayerNorm(self.compact_dim),
+        )
+        self.out_dim = self.compact_dim
+
+    def forward(self, features: dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
+        projected_by_name: dict[str, torch.Tensor] = {}
+        reference: torch.Tensor | None = None
+        present: list[bool] = []
+        for name in self.modalities:
+            value = features.get(name)
+            is_present = value is not None
+            present.append(is_present)
+            if value is None:
+                continue
+            projected = self.projections[name](value)
+            projected_by_name[name] = projected
+            if reference is None:
+                reference = projected
+
+        if reference is None:
+            raise ValueError("compact_dynamic_requires_at_least_one_modality")
+
+        projected: list[torch.Tensor] = []
+        for name in self.modalities:
+            value = projected_by_name.get(name)
+            if value is None:
+                value = reference.new_zeros((reference.shape[0], self.compact_dim))
+            projected.append(value)
+
+        stack = torch.stack(projected, dim=1)
+        concat = torch.cat(projected, dim=1)
+        gate_logits = self.gate(concat)
+        present_mask = torch.tensor(present, device=gate_logits.device, dtype=torch.bool).unsqueeze(0)
+        gate_logits = gate_logits.masked_fill(~present_mask, torch.finfo(gate_logits.dtype).min)
+        weights = torch.softmax(gate_logits, dim=1).unsqueeze(-1)
+        weighted = (stack * weights).sum(dim=1)
+        mean_context = stack.mean(dim=1)
+        return weighted + self.mix(torch.cat([weighted, mean_context], dim=1))
+
+
 class FusionClassifier(nn.Module):
     """主工程的多模态融合网络。
 
@@ -655,11 +730,17 @@ class FusionClassifier(nn.Module):
                 p.requires_grad = False
 
         if self.video_backbone == "dual":
-            video_dim_final = int(getattr(self.video_flow, "out_dim", video_dim)) + int(
-                getattr(self.video_rgb, "out_dim", video_dim)
-            )
+            flow_dim_final = int(getattr(self.video_flow, "out_dim", video_dim))
+            rgb_dim_final = int(getattr(self.video_rgb, "out_dim", video_dim))
+            video_dim_final = flow_dim_final + rgb_dim_final
+        elif self.video_backbone == "videomae":
+            flow_dim_final = int(video_dim)
+            rgb_dim_final = int(getattr(self.video, "out_dim", video_dim))
+            video_dim_final = rgb_dim_final
         else:
-            video_dim_final = int(getattr(self.video, "out_dim", video_dim))
+            flow_dim_final = int(getattr(self.video, "out_dim", video_dim))
+            rgb_dim_final = int(video_dim)
+            video_dim_final = flow_dim_final
         self.video_out_dim = int(video_dim_final)
         audio_dim_final = int(audio_dim) if audio_dim is not None else int(self.audio.out_dim)
         non_text_dim = int(video_dim_final) + int(audio_dim_final) + int(prosody_dim)
@@ -680,9 +761,27 @@ class FusionClassifier(nn.Module):
                 nn.Linear(hidden, text_dim),
             )
             fusion_in_dim = text_dim
+            self.compact_fusion = None
+        elif self.fusion_mode == "compact_dynamic":
+            self.delta_proj = None
+            self.gate_proj = None
+            self.compact_fusion = CompactDynamicFusion(
+                {
+                    "text": int(self.text.out_dim),
+                    "audio": int(audio_dim_final),
+                    "rgb": int(rgb_dim_final),
+                    "flow": int(flow_dim_final),
+                    "prosody": int(prosody_dim),
+                },
+                compact_dim=256,
+                hidden=hidden,
+                dropout=dropout,
+            )
+            fusion_in_dim = int(self.compact_fusion.out_dim)
         else:
             self.delta_proj = None
             self.gate_proj = None
+            self.compact_fusion = None
             fusion_in_dim = non_text_dim + int(self.text.out_dim)
 
         self.head = nn.Sequential(
@@ -781,6 +880,43 @@ class FusionClassifier(nn.Module):
         with self._maybe_no_grad(self._freeze_flow):
             return self.video(flow)
 
+    def _encode_video_parts(
+        self,
+        flow: Optional[torch.Tensor],
+        rgb: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return separate flow/RGB embeddings for compact_dynamic fusion."""
+
+        if self.video_backbone == "videomae":
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video is None:
+                raise RuntimeError("video_encoder_missing")
+            with self._maybe_no_grad(self._freeze_rgb):
+                return None, self.video(rgb)
+
+        if self.video_backbone == "dual":
+            if flow is None:
+                raise ValueError("flow_missing")
+            if rgb is None:
+                raise ValueError("rgb_missing")
+            if self.video_flow is None:
+                raise RuntimeError("flow_encoder_missing")
+            if self.video_rgb is None:
+                raise RuntimeError("rgb_encoder_missing")
+            with self._maybe_no_grad(self._freeze_flow):
+                v_flow = self.video_flow(flow)
+            with self._maybe_no_grad(self._freeze_rgb):
+                v_rgb = self.video_rgb(rgb)
+            return v_flow, v_rgb
+
+        if flow is None:
+            raise ValueError("flow_missing")
+        if self.video is None:
+            raise RuntimeError("video_encoder_missing")
+        with self._maybe_no_grad(self._freeze_flow):
+            return self.video(flow), None
+
     def _encode_audio(self, wav: torch.Tensor, audio_lens: Optional[torch.Tensor]) -> torch.Tensor:
         """编码音频，并只在支持时传入 `lengths=`。"""
 
@@ -809,8 +945,24 @@ class FusionClassifier(nn.Module):
         a: torch.Tensor,
         p: torch.Tensor,
         t: torch.Tensor,
+        *,
+        v_flow: Optional[torch.Tensor] = None,
+        v_rgb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """执行主线定义的多模态融合。"""
+
+        if self.fusion_mode == "compact_dynamic":
+            if self.compact_fusion is None:
+                raise RuntimeError("compact_dynamic_fusion_missing")
+            return self.compact_fusion(
+                {
+                    "text": t,
+                    "audio": a,
+                    "rgb": v_rgb,
+                    "flow": v_flow,
+                    "prosody": p,
+                }
+            )
 
         if self.fusion_mode != "gated_text":
             return torch.cat([v, a, p, t], dim=1)
@@ -844,17 +996,32 @@ class FusionClassifier(nn.Module):
             text_inputs: tokenizer 输出字典；若为 None，则用零向量代替文本模态。
             return_intensity: 是否同时返回强度回归结果。
         """
-        v = self._encode_video(flow, rgb)
+        v: Optional[torch.Tensor]
+        v_flow: Optional[torch.Tensor] = None
+        v_rgb: Optional[torch.Tensor] = None
+        if self.fusion_mode == "compact_dynamic":
+            v_flow, v_rgb = self._encode_video_parts(flow, rgb)
+            v = v_flow if v_flow is not None else v_rgb
+            if v is None:
+                raise RuntimeError("compact_dynamic_video_reference_missing")
+        else:
+            v = self._encode_video(flow, rgb)
         a = self._encode_audio(wav, audio_lens)
         with self._maybe_no_grad(self._freeze_prosody):
             p = self.prosody(prosody)
 
         # Modality dropout (non-text) for robustness
-        v = self._maybe_drop_modality(v)
+        if self.fusion_mode == "compact_dynamic":
+            if v_flow is not None:
+                v_flow = self._maybe_drop_modality(v_flow)
+            if v_rgb is not None:
+                v_rgb = self._maybe_drop_modality(v_rgb)
+        else:
+            v = self._maybe_drop_modality(v)
         a = self._maybe_drop_modality(a)
         p = self._maybe_drop_modality(p)
         t = self._encode_text(text_inputs, batch_size=v.shape[0], device=v.device, dtype=v.dtype)
-        x = self._fuse_modalities(v, a, p, t)
+        x = self._fuse_modalities(v, a, p, t, v_flow=v_flow, v_rgb=v_rgb)
         logits = self.head(x)
         if not bool(return_intensity):
             return logits

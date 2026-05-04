@@ -288,7 +288,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video-model", type=str, default="MCG-NJU/videomae-large")
     p.add_argument("--audio-model", type=str, default="microsoft/wavlm-large")
     p.add_argument("--audio-model-revision", type=str, default="", help=argparse.SUPPRESS)
-    p.add_argument("--fusion-mode", type=str, default="gated_text", choices=["gated_text", "concat"])
+    p.add_argument("--fusion-mode", type=str, default="gated_text", choices=["gated_text", "concat", "compact_dynamic"])
     p.add_argument("--gate-temperature", type=float, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--gate-scale", type=float, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--delta-scale", type=float, default=1.0, help=argparse.SUPPRESS)
@@ -793,6 +793,7 @@ def main() -> None:
         zero_audio=bool(args.zero_audio),
         zero_text=bool(args.zero_text),
         use_intensity=bool(args.use_intensity),
+        fusion_mode=str(args.fusion_mode),
         video_backbone=str(args.video_backbone),
         flow_encoder_variant=str(FLOW_VIDEO_ENCODER_VARIANT),
         text_model=str(args.text_model),
