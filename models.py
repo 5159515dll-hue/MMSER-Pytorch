@@ -847,10 +847,17 @@ class FusionClassifier(nn.Module):
 
         return torch.no_grad() if enabled else nullcontext()
 
-    def _encode_video(self, flow: Optional[torch.Tensor], rgb: Optional[torch.Tensor]) -> torch.Tensor:
+    def _encode_video(
+        self,
+        flow: Optional[torch.Tensor],
+        rgb: Optional[torch.Tensor],
+        cached_rgb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """根据主线 `video_backbone` 配置编码视频分支。"""
 
         if self.video_backbone == "videomae":
+            if cached_rgb is not None:
+                return cached_rgb.to(dtype=torch.float32)
             if rgb is None:
                 raise ValueError("rgb_missing")
             if self.video is None:
@@ -869,8 +876,11 @@ class FusionClassifier(nn.Module):
                 raise RuntimeError("rgb_encoder_missing")
             with self._maybe_no_grad(self._freeze_flow):
                 v_flow = self.video_flow(flow)
-            with self._maybe_no_grad(self._freeze_rgb):
-                v_rgb = self.video_rgb(rgb)
+            if cached_rgb is not None:
+                v_rgb = cached_rgb.to(device=v_flow.device, dtype=v_flow.dtype)
+            else:
+                with self._maybe_no_grad(self._freeze_rgb):
+                    v_rgb = self.video_rgb(rgb)
             return torch.cat([v_flow, v_rgb], dim=1)
 
         if flow is None:
@@ -884,10 +894,13 @@ class FusionClassifier(nn.Module):
         self,
         flow: Optional[torch.Tensor],
         rgb: Optional[torch.Tensor],
+        cached_rgb: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return separate flow/RGB embeddings for compact_dynamic fusion."""
 
         if self.video_backbone == "videomae":
+            if cached_rgb is not None:
+                return None, cached_rgb.to(dtype=torch.float32)
             if rgb is None:
                 raise ValueError("rgb_missing")
             if self.video is None:
@@ -906,8 +919,11 @@ class FusionClassifier(nn.Module):
                 raise RuntimeError("rgb_encoder_missing")
             with self._maybe_no_grad(self._freeze_flow):
                 v_flow = self.video_flow(flow)
-            with self._maybe_no_grad(self._freeze_rgb):
-                v_rgb = self.video_rgb(rgb)
+            if cached_rgb is not None:
+                v_rgb = cached_rgb.to(device=v_flow.device, dtype=v_flow.dtype)
+            else:
+                with self._maybe_no_grad(self._freeze_rgb):
+                    v_rgb = self.video_rgb(rgb)
             return v_flow, v_rgb
 
         if flow is None:
@@ -917,9 +933,16 @@ class FusionClassifier(nn.Module):
         with self._maybe_no_grad(self._freeze_flow):
             return self.video(flow), None
 
-    def _encode_audio(self, wav: torch.Tensor, audio_lens: Optional[torch.Tensor]) -> torch.Tensor:
+    def _encode_audio(
+        self,
+        wav: torch.Tensor,
+        audio_lens: Optional[torch.Tensor],
+        cached_audio: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """编码音频，并只在支持时传入 `lengths=`。"""
 
+        if cached_audio is not None:
+            return cached_audio.to(device=wav.device, dtype=torch.float32)
         kwargs = {"lengths": audio_lens} if audio_lens is not None and self._audio_supports_lengths else {}
         with self._maybe_no_grad(self._freeze_audio):
             return self.audio(wav, **kwargs)
@@ -931,9 +954,12 @@ class FusionClassifier(nn.Module):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        cached_text: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """编码文本；无文本输入时返回与主线契约一致的零向量占位。"""
 
+        if cached_text is not None:
+            return cached_text.to(device=device, dtype=dtype)
         if text_inputs is None:
             return torch.zeros((batch_size, int(self.text.out_dim)), device=device, dtype=dtype)
         with self._maybe_no_grad(self._freeze_text):
@@ -986,6 +1012,7 @@ class FusionClassifier(nn.Module):
         return_intensity: bool = False,
         rgb: Optional[torch.Tensor] = None,
         audio_lens: Optional[torch.Tensor] = None,
+        cached_embeddings: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """前向传播：融合多模态并输出分类 logits（可选强度回归）。
 
@@ -999,14 +1026,19 @@ class FusionClassifier(nn.Module):
         v: Optional[torch.Tensor]
         v_flow: Optional[torch.Tensor] = None
         v_rgb: Optional[torch.Tensor] = None
+        cached = cached_embeddings or {}
+        cached_text = cached.get("text_emb")
+        cached_audio = cached.get("audio_emb")
+        cached_rgb = cached.get("rgb_emb")
+
         if self.fusion_mode == "compact_dynamic":
-            v_flow, v_rgb = self._encode_video_parts(flow, rgb)
+            v_flow, v_rgb = self._encode_video_parts(flow, rgb, cached_rgb=cached_rgb)
             v = v_flow if v_flow is not None else v_rgb
             if v is None:
                 raise RuntimeError("compact_dynamic_video_reference_missing")
         else:
-            v = self._encode_video(flow, rgb)
-        a = self._encode_audio(wav, audio_lens)
+            v = self._encode_video(flow, rgb, cached_rgb=cached_rgb)
+        a = self._encode_audio(wav, audio_lens, cached_audio=cached_audio)
         with self._maybe_no_grad(self._freeze_prosody):
             p = self.prosody(prosody)
 
@@ -1020,7 +1052,13 @@ class FusionClassifier(nn.Module):
             v = self._maybe_drop_modality(v)
         a = self._maybe_drop_modality(a)
         p = self._maybe_drop_modality(p)
-        t = self._encode_text(text_inputs, batch_size=v.shape[0], device=v.device, dtype=v.dtype)
+        t = self._encode_text(
+            text_inputs,
+            batch_size=v.shape[0],
+            device=v.device,
+            dtype=v.dtype,
+            cached_text=cached_text,
+        )
         x = self._fuse_modalities(v, a, p, t, v_flow=v_flow, v_rgb=v_rgb)
         logits = self.head(x)
         if not bool(return_intensity):

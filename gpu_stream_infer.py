@@ -62,6 +62,11 @@ resolve_text_policy: Any = None
 build_input_cache_contract: Any = None
 load_input_cache_meta: Any = None
 validate_input_cache_contract: Any = None
+EmbeddingCacheReader: Any = None
+build_embedding_cache_contract: Any = None
+load_embedding_cache_meta: Any = None
+validate_embedding_cache_contract: Any = None
+validate_embedding_cache_runtime_allowed: Any = None
 
 
 def _ensure_project_root_on_path() -> None:
@@ -103,6 +108,8 @@ def _lazy_runtime_imports() -> None:
     global detect_runtime, resolve_amp_mode, resolve_batch_size, resolve_prefetch_factor, resolve_worker_count, select_device
     global resolve_text_policy
     global build_input_cache_contract, load_input_cache_meta, validate_input_cache_contract
+    global EmbeddingCacheReader, build_embedding_cache_contract, load_embedding_cache_meta
+    global validate_embedding_cache_contract, validate_embedding_cache_runtime_allowed
     if torch is not None:
         return
 
@@ -163,6 +170,13 @@ def _lazy_runtime_imports() -> None:
         load_input_cache_meta as _load_input_cache_meta,
         validate_input_cache_contract as _validate_input_cache_contract,
     )
+    from embedding_cache import (
+        EmbeddingCacheReader as _EmbeddingCacheReader,
+        build_embedding_cache_contract as _build_embedding_cache_contract,
+        load_embedding_cache_meta as _load_embedding_cache_meta,
+        validate_embedding_cache_contract as _validate_embedding_cache_contract,
+        validate_embedding_cache_runtime_allowed as _validate_embedding_cache_runtime_allowed,
+    )
 
     torch = _torch
     DataLoader = _DataLoader
@@ -209,6 +223,11 @@ def _lazy_runtime_imports() -> None:
     build_input_cache_contract = _build_input_cache_contract
     load_input_cache_meta = _load_input_cache_meta
     validate_input_cache_contract = _validate_input_cache_contract
+    EmbeddingCacheReader = _EmbeddingCacheReader
+    build_embedding_cache_contract = _build_embedding_cache_contract
+    load_embedding_cache_meta = _load_embedding_cache_meta
+    validate_embedding_cache_contract = _validate_embedding_cache_contract
+    validate_embedding_cache_runtime_allowed = _validate_embedding_cache_runtime_allowed
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +251,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, default=None, help="Low-level checkpoint path override for direct/debug inference")
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--input-cache", type=Path, default=None, help="Optional mainline input cache directory built by build_mainline_input_cache.py")
+    p.add_argument("--embedding-cache", type=Path, default=None, help="Optional exploratory frozen-backbone embedding cache directory")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--batch-size", type=str, default="auto")
     p.add_argument("--num-workers", type=str, default="auto")
@@ -465,6 +485,7 @@ def _load_model(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any] | None,
+    dict[str, Any] | None,
     list[str],
 ]:
     """加载 checkpoint，并恢复推理所需的模型与实验契约信息。
@@ -583,7 +604,17 @@ def _load_model(
             validity_summary=validity or {},
             ineligibility_reasons=["missing_checkpoint_paper_grade"],
         )
-    if not bool(checkpoint_paper_grade.get("eligible", False)):
+    checkpoint_ineligible_reasons = {
+        str(reason)
+        for reason in checkpoint_paper_grade.get("ineligibility_reasons", [])
+        if str(reason).strip()
+    }
+    checkpoint_is_embedding_cache_exploratory = (
+        checkpoint_ineligible_reasons
+        and checkpoint_ineligible_reasons.issubset({"embedding_cache_exploratory"})
+        and args.embedding_cache is not None
+    )
+    if not bool(checkpoint_paper_grade.get("eligible", False)) and not checkpoint_is_embedding_cache_exploratory:
         _raise_or_record_mismatch(
             field="checkpoint_paper_grade",
             expected=True,
@@ -637,6 +668,11 @@ def _load_model(
         if isinstance(ckpt, dict) and isinstance(ckpt.get("input_cache_contract"), dict)
         else None
     )
+    checkpoint_embedding_cache_contract = (
+        dict(ckpt.get("embedding_cache_contract"))
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("embedding_cache_contract"), dict)
+        else None
+    )
     return (
         model,
         bool(use_intensity),
@@ -649,6 +685,7 @@ def _load_model(
         checkpoint_paper_grade,
         checkpoint_provenance,
         checkpoint_input_cache_contract,
+        checkpoint_embedding_cache_contract,
         compatibility_reasons,
     )
 
@@ -684,6 +721,7 @@ def _infer_batch(
     model: FusionClassifier,
     use_intensity: bool,
     amp_mode: str,
+    embedding_cache_reader: Any | None = None,
 ) -> list[dict[str, Any]]:
     """对一个 batch 执行前向推理，并返回逐样本记录。"""
 
@@ -692,6 +730,11 @@ def _infer_batch(
     batch = preprocessor.prepare_batch(items, tokenizer=tokenizer, text_policy=text_policy, max_text_len=max_text_len)
     labels = batch["labels"]
     device = next(model.parameters()).device
+    cached_embeddings = (
+        embedding_cache_reader.load_batch(items, device=device)
+        if embedding_cache_reader is not None
+        else None
+    )
     # 推理始终关闭梯度，但仍可根据设备和 AMP 配置使用 autocast。
     with torch.no_grad(), autocast_context(device, amp_mode):
         if model.video_backbone == "videomae":
@@ -706,6 +749,7 @@ def _infer_batch(
             return_intensity=bool(use_intensity),
             rgb=batch.get("rgb", None),
             audio_lens=batch.get("audio_lens", None),
+            cached_embeddings=cached_embeddings,
         )
         if bool(use_intensity):
             logits, pred_intensity = logits_or_pair
@@ -806,6 +850,7 @@ def main() -> None:
         checkpoint_paper_grade,
         checkpoint_provenance,
         checkpoint_input_cache_contract,
+        checkpoint_embedding_cache_contract,
         compatibility_reasons,
     ) = _load_model(
         ckpt_path,
@@ -832,6 +877,22 @@ def main() -> None:
         paper_grade_reasons.append("allow_incompatible_checkpoint_enabled")
     if attempt_dir is None and ckpt_path.name != "best.pt":
         paper_grade_reasons.append("checkpoint_name_mismatch")
+    embedding_cache_dir = args.embedding_cache.expanduser() if args.embedding_cache is not None else None
+    embedding_cache_contract = None
+    embedding_cache_reader = None
+    if embedding_cache_dir is not None:
+        paper_grade_reasons.append("embedding_cache_exploratory")
+        embedding_runtime_reasons = validate_embedding_cache_runtime_allowed(
+            freeze_text=True,
+            freeze_audio=True,
+            freeze_rgb=True,
+            audio_aug=False,
+        )
+        if embedding_runtime_reasons:
+            raise RuntimeError(
+                "Embedding cache is only valid for frozen text/audio/rgb inference: "
+                + ", ".join(embedding_runtime_reasons)
+            )
     # `flow_encoder_variant` 是这条主线里很关键的结构语义字段，
     # 目的是防止不同版本的 flow 分支 checkpoint 被静默混评。
     _raise_or_record_mismatch(
@@ -1035,6 +1096,51 @@ def main() -> None:
         )
     else:
         ds = StreamingManifestDataset(items, ingress=ingress_cfg)
+    if embedding_cache_dir is not None:
+        embedding_meta = load_embedding_cache_meta(embedding_cache_dir)
+        embedding_cache_contract = build_embedding_cache_contract(embedding_meta)
+        if str(model.video_backbone) == "dual":
+            rgb_dim = int(getattr(model.video_rgb, "out_dim", 0))
+        elif str(model.video_backbone) == "videomae":
+            rgb_dim = int(getattr(model.video, "out_dim", 0))
+        else:
+            rgb_dim = int(embedding_cache_contract.get("rgb_dim", 0) or 0)
+        embedding_mismatches = validate_embedding_cache_contract(
+            embedding_cache_contract,
+            manifest_sha256=manifest_hash,
+            dataset_kind=dataset_kind,
+            text_model=str(resolved_text_model),
+            audio_model=str(getattr(model.audio, "model_name", _normalize_optional_text(args.audio_model) or "microsoft/wavlm-large")),
+            audio_model_revision=str(getattr(model.audio, "revision", None) or _normalize_optional_text(args.audio_model_revision) or ""),
+            video_model=str(getattr(model.video, "model_name", None) or getattr(model.video_rgb, "model_name", None) or _normalize_optional_text(args.video_model) or "MCG-NJU/videomae-large"),
+            max_text_len=int(resolved_text_max_len),
+            sample_rate=int(args.sample_rate),
+            max_audio_sec=float(args.max_audio_sec),
+            num_frames=int(args.num_frames),
+            rgb_size=int(resolved_rgb_size),
+            text_dim=int(model.text.out_dim),
+            audio_dim=int(model.audio.out_dim),
+            rgb_dim=rgb_dim,
+            need_text=not bool(args.zero_text),
+            need_audio=not bool(args.zero_audio),
+            need_rgb=(not bool(args.zero_video)) and str(model.video_backbone) in {"videomae", "dual"},
+        )
+        if embedding_mismatches:
+            raise RuntimeError("Embedding cache contract mismatch: " + ", ".join(embedding_mismatches))
+        if isinstance(checkpoint_embedding_cache_contract, dict) and checkpoint_embedding_cache_contract:
+            _raise_or_record_mismatch(
+                field="embedding_cache_contract",
+                expected=checkpoint_embedding_cache_contract,
+                actual=embedding_cache_contract,
+                reasons=paper_grade_reasons,
+                allow_mismatch=bool(args.allow_incompatible_checkpoint),
+            )
+        embedding_cache_reader = EmbeddingCacheReader(
+            embedding_cache_dir,
+            need_text=not bool(args.zero_text),
+            need_audio=not bool(args.zero_audio),
+            need_rgb=(not bool(args.zero_video)) and str(model.video_backbone) in {"videomae", "dual"},
+        )
     tokenizer = None
     if not bool(args.zero_text) and input_cache_contract is None:
         # 推理文本 token 同样会先缓存到 manifest item 中，
@@ -1123,6 +1229,7 @@ def main() -> None:
                 model=model,
                 use_intensity=bool(use_intensity),
                 amp_mode=resolved_amp_mode,
+                embedding_cache_reader=embedding_cache_reader,
             )
             if not backend_logged:
                 print(
@@ -1155,6 +1262,7 @@ def main() -> None:
                                 model=model,
                                 use_intensity=bool(use_intensity),
                                 amp_mode=resolved_amp_mode,
+                                embedding_cache_reader=embedding_cache_reader,
                             )
                         )
                     except Exception as item_err:
@@ -1259,6 +1367,8 @@ def main() -> None:
         "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
         "input_cache_contract": input_cache_contract,
         "input_cache_in_memory": bool(getattr(ds, "in_memory", False)),
+        "embedding_cache": str(embedding_cache_dir) if embedding_cache_dir is not None else None,
+        "embedding_cache_contract": embedding_cache_contract,
         "manifest_sha256": manifest_hash,
         "manifest_summary": manifest_summary,
         "validity": validity,
@@ -1268,6 +1378,7 @@ def main() -> None:
         "checkpoint_paper_grade": checkpoint_paper_grade,
         "checkpoint_provenance": checkpoint_provenance,
         "checkpoint_input_cache_contract": checkpoint_input_cache_contract,
+        "checkpoint_embedding_cache_contract": checkpoint_embedding_cache_contract,
         "paper_grade": paper_grade,
         "run_status": str(run_status),
     }

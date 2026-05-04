@@ -77,6 +77,11 @@ resolve_text_policy: Any = None
 build_input_cache_contract: Any = None
 load_input_cache_meta: Any = None
 validate_input_cache_contract: Any = None
+EmbeddingCacheReader: Any = None
+build_embedding_cache_contract: Any = None
+load_embedding_cache_meta: Any = None
+validate_embedding_cache_contract: Any = None
+validate_embedding_cache_runtime_allowed: Any = None
 
 
 def _ensure_project_root_on_path() -> None:
@@ -125,6 +130,8 @@ def _lazy_runtime_imports() -> None:
     global detect_runtime, resolve_amp_mode, resolve_batch_size, resolve_prefetch_factor, resolve_worker_count, select_device
     global resolve_text_policy
     global build_input_cache_contract, load_input_cache_meta, validate_input_cache_contract
+    global EmbeddingCacheReader, build_embedding_cache_contract, load_embedding_cache_meta
+    global validate_embedding_cache_contract, validate_embedding_cache_runtime_allowed
     # 这里用 `torch is not None` 作为“是否已经完成整批导入”的哨兵值，
     # 防止在一个进程里重复执行整套导入和全局绑定。
     if torch is not None:
@@ -192,6 +199,13 @@ def _lazy_runtime_imports() -> None:
         load_input_cache_meta as _load_input_cache_meta,
         validate_input_cache_contract as _validate_input_cache_contract,
     )
+    from embedding_cache import (
+        EmbeddingCacheReader as _EmbeddingCacheReader,
+        build_embedding_cache_contract as _build_embedding_cache_contract,
+        load_embedding_cache_meta as _load_embedding_cache_meta,
+        validate_embedding_cache_contract as _validate_embedding_cache_contract,
+        validate_embedding_cache_runtime_allowed as _validate_embedding_cache_runtime_allowed,
+    )
 
     torch = _torch
     DataLoader = _DataLoader
@@ -246,6 +260,11 @@ def _lazy_runtime_imports() -> None:
     build_input_cache_contract = _build_input_cache_contract
     load_input_cache_meta = _load_input_cache_meta
     validate_input_cache_contract = _validate_input_cache_contract
+    EmbeddingCacheReader = _EmbeddingCacheReader
+    build_embedding_cache_contract = _build_embedding_cache_contract
+    load_embedding_cache_meta = _load_embedding_cache_meta
+    validate_embedding_cache_contract = _validate_embedding_cache_contract
+    validate_embedding_cache_runtime_allowed = _validate_embedding_cache_runtime_allowed
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,6 +297,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=Path("outputs/motion_prosody"))
     p.add_argument("--benchmark-tag", type=str, default="default")
     p.add_argument("--input-cache", type=Path, default=None, help="Optional mainline input cache directory built by build_mainline_input_cache.py")
+    p.add_argument("--embedding-cache", type=Path, default=None, help="Optional exploratory frozen-backbone embedding cache directory")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--freeze-audio", action="store_true")
     p.add_argument("--freeze-video", action="store_true")
@@ -508,6 +528,7 @@ def _run_phase(
     scaler: Any | None,
     prosody_cfg: ProsodyConfig,
     aug_cfg: AudioAugConfig,
+    embedding_cache_reader: Any | None = None,
 ) -> dict[str, Any]:
     """执行一个训练或验证 phase，并返回该 phase 的汇总统计。
 
@@ -574,6 +595,11 @@ def _run_phase(
         rgb = batch.get("rgb", None)
         text_inputs = batch.get("text_inputs", None)
         labels = batch["labels"]
+        cached_embeddings = (
+            embedding_cache_reader.load_batch(batch_items, device=device)
+            if embedding_cache_reader is not None
+            else None
+        )
 
         # 训练态的音频增强只影响当前 batch；如果增强改变了波形，
         # 且用户允许，就要重新提取 prosody，保证韵律特征与增强后的音频一致。
@@ -596,6 +622,7 @@ def _run_phase(
                     return_intensity=True,
                     rgb=rgb,
                     audio_lens=audio_lens,
+                    cached_embeddings=cached_embeddings,
                 )
             else:
                 pred_intensity = None
@@ -606,6 +633,7 @@ def _run_phase(
                     text_inputs=text_inputs,
                     rgb=rgb,
                     audio_lens=audio_lens,
+                    cached_embeddings=cached_embeddings,
                 )
 
             _assert_finite_tensor("logits", logits, phase=phase)
@@ -777,6 +805,22 @@ def main() -> None:
         paper_grade_reasons.append("deterministic_algorithms_disabled")
     if bool(deterministic_policy.get("cudnn_enabled", False)) and bool(deterministic_policy.get("cudnn_benchmark", False)):
         paper_grade_reasons.append("cudnn_benchmark_enabled")
+    embedding_cache_dir = args.embedding_cache.expanduser() if args.embedding_cache is not None else None
+    embedding_cache_contract = None
+    embedding_cache_reader = None
+    if embedding_cache_dir is not None:
+        paper_grade_reasons.append("embedding_cache_exploratory")
+        embedding_cache_runtime_reasons = validate_embedding_cache_runtime_allowed(
+            freeze_text=bool(args.freeze_text),
+            freeze_audio=bool(args.freeze_audio),
+            freeze_rgb=bool(args.freeze_video or args.freeze_rgb),
+            audio_aug=bool(args.audio_aug),
+        )
+        if embedding_cache_runtime_reasons:
+            raise RuntimeError(
+                "Embedding cache requires frozen text/audio/rgb backbones and audio_aug=false: "
+                + ", ".join(embedding_cache_runtime_reasons)
+            )
     # `paper_contract` 是训练与推理共享的“不可变实验契约”，
     # 之后的推理会拿 checkpoint 里的这份契约和当前命令/manifest 做逐项比对。
     run_contract = build_run_contract(
@@ -984,6 +1028,47 @@ def main() -> None:
     with _startup_stage(f"move model to device: {device}"):
         model = model.to(device)
     setattr(model, "_label_names", list(label_names))
+    if embedding_cache_dir is not None:
+        with _startup_stage(f"validate embedding cache contract: {embedding_cache_dir}"):
+            embedding_cache_meta = load_embedding_cache_meta(embedding_cache_dir)
+            embedding_cache_contract = build_embedding_cache_contract(embedding_cache_meta)
+            if str(args.video_backbone) == "dual":
+                rgb_dim = int(getattr(model.video_rgb, "out_dim", 0))
+            elif str(args.video_backbone) == "videomae":
+                rgb_dim = int(getattr(model.video, "out_dim", 0))
+            else:
+                rgb_dim = int(embedding_cache_contract.get("rgb_dim", 0) or 0)
+            embedding_cache_mismatches = validate_embedding_cache_contract(
+                embedding_cache_contract,
+                manifest_sha256=manifest_hash,
+                dataset_kind=dataset_kind,
+                text_model=str(args.text_model),
+                audio_model=str(args.audio_model),
+                audio_model_revision=(str(args.audio_model_revision).strip() or None),
+                video_model=str(args.video_model),
+                max_text_len=int(args.max_text_len),
+                sample_rate=int(args.sample_rate),
+                max_audio_sec=float(args.max_audio_sec),
+                num_frames=int(args.num_frames),
+                rgb_size=int(args.rgb_size),
+                text_dim=int(model.text.out_dim),
+                audio_dim=int(model.audio.out_dim),
+                rgb_dim=rgb_dim,
+                need_text=not bool(args.zero_text),
+                need_audio=not bool(args.zero_audio),
+                need_rgb=(not bool(args.zero_video)) and str(args.video_backbone) in {"videomae", "dual"},
+            )
+            if embedding_cache_mismatches:
+                raise RuntimeError(
+                    "Embedding cache contract mismatch: "
+                    + ", ".join(str(reason) for reason in embedding_cache_mismatches)
+                )
+            embedding_cache_reader = EmbeddingCacheReader(
+                embedding_cache_dir,
+                need_text=not bool(args.zero_text),
+                need_audio=not bool(args.zero_audio),
+                need_rgb=(not bool(args.zero_video)) and str(args.video_backbone) in {"videomae", "dual"},
+            )
 
     with _startup_stage("initialize optimizer + scheduler + preprocessors"):
         opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -1035,10 +1120,11 @@ def main() -> None:
                 "pin_memory": bool(device.type == "cuda"),
                 "pipeline": "gpu_stream",
                 "amp_mode": resolved_amp_mode,
-                "lr_scheduler": str(args.lr_scheduler),
-                "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
-                "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
-            },
+            "lr_scheduler": str(args.lr_scheduler),
+            "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
+            "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+            "embedding_cache": str(embedding_cache_dir) if embedding_cache_dir is not None else None,
+        },
             ensure_ascii=False,
             indent=2,
         ),
@@ -1132,6 +1218,7 @@ def main() -> None:
                     scaler=scaler,
                     prosody_cfg=prosody_cfg,
                     aug_cfg=aug_cfg,
+                    embedding_cache_reader=embedding_cache_reader,
                 )
                 val_stats = _run_phase(
                     phase=f"Epoch {epoch}/{args.epochs} [val]",
@@ -1147,6 +1234,7 @@ def main() -> None:
                     scaler=None,
                     prosody_cfg=prosody_cfg,
                     aug_cfg=aug_cfg,
+                    embedding_cache_reader=embedding_cache_reader,
                 )
             except NumericStabilityError as exc:
                 run_status = "failed_numeric"
@@ -1259,6 +1347,7 @@ def main() -> None:
                         "pipeline": "gpu_stream",
                         "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
                         "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+                        "embedding_cache": str(embedding_cache_dir) if embedding_cache_dir is not None else None,
                     },
                     "benchmark_tag": str(args.benchmark_tag),
                     "dataset_kind": dataset_kind,
@@ -1271,6 +1360,7 @@ def main() -> None:
                     "best_val_summary": best_val_summary,
                     "paper_contract": run_contract,
                     "input_cache_contract": input_cache_contract,
+                    "embedding_cache_contract": embedding_cache_contract,
                     "provenance": run_provenance,
                     "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
                     "run_status": str(run_status),
@@ -1305,6 +1395,7 @@ def main() -> None:
                     "pipeline": "gpu_stream",
                     "paper_contract": run_contract,
                     "input_cache_contract": input_cache_contract,
+                    "embedding_cache_contract": embedding_cache_contract,
                     "provenance": run_provenance,
                     "paper_grade": build_paper_grade(validity_summary=validity_summary, ineligibility_reasons=paper_grade_reasons),
                     "run_status": str(run_status),
@@ -1438,6 +1529,7 @@ def main() -> None:
                     "pipeline": "gpu_stream",
                     "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
                     "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+                    "embedding_cache": str(embedding_cache_dir) if embedding_cache_dir is not None else None,
                 },
                 "stop": {
                     "epoch": int(final_epoch),
@@ -1447,6 +1539,7 @@ def main() -> None:
                 },
                 "paper_contract": run_contract,
                 "input_cache_contract": input_cache_contract,
+                "embedding_cache_contract": embedding_cache_contract,
                 "provenance": run_provenance,
                 "paper_grade": paper_grade,
                 "run_status": str(run_status),
@@ -1481,6 +1574,8 @@ def main() -> None:
             "input_cache": str(input_cache_dir) if input_cache_dir is not None else None,
             "input_cache_contract": input_cache_contract,
             "input_cache_in_memory": bool(getattr(train_ds, "in_memory", False) and getattr(val_ds, "in_memory", False)),
+            "embedding_cache": str(embedding_cache_dir) if embedding_cache_dir is not None else None,
+            "embedding_cache_contract": embedding_cache_contract,
             "manifest_summary": manifest_summary,
             "paper_protocol_version": str(run_contract.get("protocol_version")),
             "deterministic_policy": deterministic_policy,
